@@ -11,3 +11,11 @@ test/sim_build
 test/__pycache__/
 test/results.xml
 test/gate_level_netlist.v
+tt
+test/unit/sim_build
+test/unit/*.result.xml
+test/unit/__pycache__/
+test/common/__pycache__/
+formal/*/
+__pycache__/
+.pytest_cache/

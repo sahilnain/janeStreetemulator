@@ -1,0 +1,21 @@
+# pe_sync: q == d delayed by exactly 2 cycles; reset forces RESET_VAL.
+# Proved by k-induction for a 1-bit and a 5-bit synchroniser.
+[tasks]
+w1
+w5
+
+[options]
+mode prove
+depth 6
+
+[engines]
+smtbmc yices
+
+[script]
+read -formal pe_sync.v
+w1: chparam -set W 1 pe_sync
+w5: chparam -set W 5 -set RESET_VAL 22 pe_sync
+prep -top pe_sync
+
+[files]
+../src/io/pe_sync.v

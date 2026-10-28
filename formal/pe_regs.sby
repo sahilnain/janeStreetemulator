@@ -1,0 +1,21 @@
+# pe_regs: IMEM write protection, strobes/pulses only for their address,
+# no config change without a write, writes only affect their register,
+# imem_err and IMEM_ADDR behaviour, irq equation.
+[tasks]
+default
+c3_p16_iw32
+
+[options]
+mode prove
+depth 4
+
+[engines]
+smtbmc yices
+
+[script]
+read -formal -DPE_REGS_TOP pe_regs.v
+c3_p16_iw32: chparam -set NUM_CTX 3 -set NUM_PINS 16 -set IW 32 -set IMEM_DEPTH 256 pe_regs
+prep -top pe_regs
+
+[files]
+../src/host/pe_regs.v

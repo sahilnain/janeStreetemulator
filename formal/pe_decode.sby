@@ -1,0 +1,22 @@
+# pe_decode (combinational): op flags one-hot, reserved opcodes -> illegal,
+# n in 1..16, fields from the documented bit positions. Exhaustive over all
+# instruction words.
+[tasks]
+iw24
+iw32
+
+[options]
+mode prove
+depth 1
+
+[engines]
+smtbmc yices
+
+[script]
+read -formal pe_decode.v
+iw24: chparam -set IW 24 -set AW 6 pe_decode
+iw32: chparam -set IW 32 -set AW 8 pe_decode
+prep -top pe_decode
+
+[files]
+../src/core/pe_decode.v

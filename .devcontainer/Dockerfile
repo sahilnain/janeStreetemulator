@@ -27,3 +27,16 @@ RUN umask 022 && \
 
 # Install LibreLane
 RUN /ttsetup/venv/bin/pip install librelane==3.0.0.dev44
+
+# Formal verification (Protocol Emulator): YosysHQ OSS CAD Suite, pinned release.
+# Provides yosys, SymbiYosys (sby) and the solvers (yices, boolector, bitwuzla, z3).
+# Its bin/ goes LAST on PATH, so the apt iverilog/verilator used by the cocotb
+# tests stay first; yosys/sby/solvers only exist here.
+ARG OSS_CAD_SUITE_DATE=2026-10-01
+RUN umask 022 && \
+    curl -fL https://github.com/YosysHQ/oss-cad-suite-build/releases/download/${OSS_CAD_SUITE_DATE}/oss-cad-suite-linux-x64-$(echo ${OSS_CAD_SUITE_DATE} | tr -d -).tgz | \
+    tar zxf - -C /opt
+ENV PATH=${PATH}:/opt/oss-cad-suite/bin
+
+# Model-vs-RTL equivalence proofs (model/equiv): Z3 Python bindings.
+RUN /ttsetup/venv/bin/pip install z3-solver==4.15.4.0

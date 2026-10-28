@@ -1,12 +1,21 @@
 # Makefile
 # See https://docs.cocotb.org/en/stable/quickstart.html for more info
+#
+# Top-level tests for tt_um_sahil_protoemu (test.py through tb.v).
+#   make             RTL simulation
+#   make GATES=yes   gate-level simulation (after the GDS flow)
+# Unit tests for each module live in unit/ (run: cd unit && pytest).
 
 # defaults
 SIM ?= icarus
 FST ?= -fst # Use more efficient FST format
 TOPLEVEL_LANG ?= verilog
 SRC_DIR = $(PWD)/../src
-PROJECT_SOURCES = project.v
+PROJECT_SOURCES = tt_um_sahil_protoemu.v \
+                  host/pe_host_if.v host/pe_regs.v \
+                  mem/pe_imem.v mem/pe_fifo.v \
+                  io/pe_sync.v io/pe_pins.v \
+                  core/pe_core.v core/pe_ctx.v core/pe_decode.v core/pe_exec.v core/pe_vote.v
 
 ifneq ($(GATES),yes)
 
@@ -37,7 +46,7 @@ VERILOG_SOURCES += $(PWD)/tb.v
 TOPLEVEL = tb
 
 # List test modules to run, separated by commas and without the .py suffix:
-COCOTB_TEST_MODULES = test
+COCOTB_TEST_MODULES = test,test_lockstep
 
 # include cocotb's make rules to take care of the simulator setup
 include $(shell cocotb-config --makefiles)/Makefile.sim

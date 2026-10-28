@@ -1,0 +1,24 @@
+# pe_host_if: one ack per strobe, bounded response, register strobes only on
+# the right nibble, address/data-out change only on their ops, under the
+# host protocol assumption. Includes pe_sync's properties.
+[tasks]
+prf
+cvr
+
+[options]
+prf: mode prove
+prf: depth 8
+cvr: mode cover
+cvr: depth 20
+
+[engines]
+smtbmc yices
+
+[script]
+read -formal -DPE_HOST_IF_TOP pe_host_if.v
+read -formal pe_sync.v
+prep -top pe_host_if
+
+[files]
+../src/host/pe_host_if.v
+../src/io/pe_sync.v

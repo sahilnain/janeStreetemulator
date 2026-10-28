@@ -1,0 +1,38 @@
+# tt_um_sahil_protoemu: the whole chip with every module's properties, all
+# internal contracts asserted (only the host-bus protocol on the pins is
+# assumed). Chip-level (unbounded): reserved outputs stay 0; pins are only
+# written by running contexts; IMEM never written while running; no pin
+# drives until a context has been started. The cover task finds traces
+# that start a context and drive a pin using only the host-bus pins.
+[tasks]
+prf
+cvr
+
+[options]
+prf: mode prove
+prf: depth 14
+cvr: mode cover
+cvr: depth 40
+
+[engines]
+smtbmc yices
+
+[script]
+read -formal tt_um_sahil_protoemu.v
+read -formal pe_host_if.v pe_regs.v pe_imem.v pe_fifo.v pe_sync.v pe_pins.v
+read -formal pe_core.v pe_ctx.v pe_decode.v pe_exec.v pe_vote.v
+prep -top tt_um_sahil_protoemu
+
+[files]
+../src/tt_um_sahil_protoemu.v
+../src/host/pe_host_if.v
+../src/host/pe_regs.v
+../src/mem/pe_imem.v
+../src/mem/pe_fifo.v
+../src/io/pe_sync.v
+../src/io/pe_pins.v
+../src/core/pe_core.v
+../src/core/pe_ctx.v
+../src/core/pe_decode.v
+../src/core/pe_exec.v
+../src/core/pe_vote.v

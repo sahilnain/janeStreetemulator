@@ -1,0 +1,34 @@
+# pe_vote: cycle-exact sample/done timing for ALL N, S, k (k-induction),
+# busy/done protocol, config frozen while running, and the majority result
+# for all-ones / all-zeros centre windows. The *_majority tasks add an
+# independent sample counter and prove bit_out is EXACTLY the majority of
+# the centre samples for every pin waveform (reduced widths: uses / and %).
+# The cover task shows a full vote completing with both results.
+[tasks]
+small prf
+default prf
+small_majority prf maj
+mid_majority prf maj
+cover cvr
+
+[options]
+prf: mode prove
+prf: depth 8
+cvr: mode cover
+cvr: depth 40
+
+[engines]
+smtbmc yices
+
+[script]
+~maj: read -formal -DPE_VOTE_TOP pe_vote.v
+maj: read -formal -DPE_VOTE_TOP -DPE_VOTE_MAJORITY pe_vote.v
+small_majority: chparam -set NUM_PINS 4 -set N_W 3 -set S_W 3 pe_vote
+mid_majority: chparam -set NUM_PINS 4 -set N_W 4 -set S_W 3 pe_vote
+small: chparam -set NUM_PINS 4 -set N_W 3 -set S_W 3 pe_vote
+default: chparam -set NUM_PINS 8 -set N_W 4 -set S_W 12 pe_vote
+cover: chparam -set NUM_PINS 4 -set N_W 4 -set S_W 2 pe_vote
+prep -top pe_vote
+
+[files]
+../src/core/pe_vote.v
