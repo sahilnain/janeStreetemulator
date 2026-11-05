@@ -14,12 +14,13 @@ testbench is the master (i2c.I2cMaster).
 
 Tests
 -----
-1. test_master_write_read   B = 125 (378 kHz): write pointer + 3 bytes, then pointer
+1. test_master_write_read   B = 126 (375 kHz): write pointer + 3 bytes, then pointer
                             write + repeated START + read 3 (ACK, ACK, NACK).
                             Bus checks: START/STOP counts, SDA never
-                            changes in the same cycle SCL falls (hold >= 1).
-2. test_master_speeds       B = 500, 50, 14. The SCL period is B + 2 (blocks.md 3.3, STRETCH):
-                            96 kHz, 923 kHz, 3 MHz.
+                            changes in the same cycle SCL falls (hold >= 1), and every
+                            limit of the I2C standard for this speed.
+2. test_master_speeds       each I2C speed at its fastest B, with the SCL period B + 2 (blocks.md
+                            3.3, STRETCH): 100 kHz, 375 kHz, 960 kHz, with all limits checked.
 3. test_master_addr_nack    no device at the address -> status 1, STOP sent.
 4. test_master_data_nack    the device NACKs the 2nd data byte -> status 2.
 5. test_master_stretch      the device stretches SCL after the address ACK
@@ -29,6 +30,8 @@ Tests
                             START); the last byte is NACKed.
 8. test_slave_wrong_addr    another address is NACKed and ignored; the next
                             transfer to the chip works.
+9. test_timing_check        error on purpose: B = 125 and too fast a speed for a mode are
+                            reported by the checker, so a pass above means something.
 """
 
 import random
@@ -47,7 +50,7 @@ from cocotb.triggers import ClockCycles  # noqa: E402
 SCL, SDA = 6, 7
 
 
-async def master_setup(dut, B=125, **dev_kw):
+async def master_setup(dut, B=126, **dev_kw):
     chip = Chip(dut)
     await chip.reset()
     await chip.bus.write(R.PIN_OD, 0xC0)
@@ -93,6 +96,7 @@ async def write_read(chip, dev, ptr=0x20):
 async def test_master_write_read(dut):
     chip, dev = await master_setup(dut)
     await write_read(chip, dev)
+    assert not (v := i2c.check_timing(chip.samples, SCL, SDA, "FM")), v
     assert dev.starts == 3 and dev.stops == 2, (dev.starts, dev.stops)   # 2nd: START + rep. START
     assert dev.min_hold is not None and dev.min_hold >= 1, f"SDA hold {dev.min_hold}"
     assert [k for k, _ in dev.log] == ["w"] * 4 + ["w"] + ["r"] * 3
@@ -101,10 +105,11 @@ async def test_master_write_read(dut):
 
 @cocotb.test()
 async def test_master_speeds(dut):
-    for B in (500, 50, 14):  # noqa
+    for mode, B in (("SM", 478), ("FM", 126), ("FM+", 48)):
         chip, dev = await master_setup(dut, B=B)
         await write_read(chip, dev, ptr=B & 0xFF)
         await chip.bus.write(R.RUN, 0)
+        assert not (v := i2c.check_timing(chip.samples, SCL, SDA, mode)), f"{mode}: {v}"
 
 
 @cocotb.test()
@@ -162,6 +167,8 @@ async def test_slave_read(dut):
     acks, got = await m.read(0x42, 4, ptr=0x30)
     assert acks == [True, True, True], acks
     assert got == data, got
+    # the chip drives SDA here, and the testbench SCL: only the data setup is the chip's
+    assert not (v := i2c.check_timing(chip.samples, SCL, SDA, "SM", only=("su_dat",))), v
 
 
 @cocotb.test()
@@ -174,3 +181,13 @@ async def test_slave_wrong_addr(dut):
     await ClockCycles(dut.clk, 50)
     await chip.bus.write(R.RUN, 0)
     assert await chip.bus.dmem_read(0x05, 1) == [0x99]
+
+
+@cocotb.test()
+async def test_timing_check(dut):
+    for mode, B, name in (("FM", 125, "low"), ("SM", 400, "fscl"), ("FM+", 40, "low")):
+        chip, dev = await master_setup(dut, B=B)
+        await write_read(chip, dev, ptr=0x20)
+        await chip.bus.write(R.RUN, 0)
+        v = i2c.check_timing(chip.samples, SCL, SDA, mode)
+        assert any(x.startswith(name) for x in v), f"{mode} B={B} should break {name}: {v}"

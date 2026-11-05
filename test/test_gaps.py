@@ -22,16 +22,17 @@ SPI
 8. test_spi_slave_words      slave with 9, 12, 15, 16 bits, all modes, both directions.
 I2C
 9. test_i2c_10bit_master     10-bit write, then repeated-START read; the wrong address is NACKed.
-10. test_i2c_hs_master       the master code at F/S speed, then the data bytes at hs_B = 14 (3 MHz).
+10. test_i2c_hs_master       the master code at F/S speed, then the data bytes at hs_B = 16 (2.67 MHz).
 11. test_i2c_arbitration     a rival master on the bus: the chip loses at a bit, stops driving at once
                              and reports 3 with no STOP; or it wins and finishes; it waits for a free bus.
 12. test_i2c_10bit_slave     the chip answers a 10-bit address, write and read; others are ignored.
 13. test_i2c_slave_stretch   SCL is held low after each ACK while the firmware is busy.
-14. test_i2c_general_call    address 0 is acknowledged, data at I2C_GC_MEM, with an IRQ.
+14. test_i2c_stretch_setup    the chip's release of SCL sets the rising edge: SDA is ready 250 ns before.
+15. test_i2c_general_call    address 0 is acknowledged, data at I2C_GC_MEM, with an IRQ.
 USB
-15. test_usb_device_suspend  CSTAT.ETX shows idle J; a SOF clears it; a resume does not disturb the
+16. test_usb_device_suspend  CSTAT.ETX shows idle J; a SOF clears it; a resume does not disturb the
                              device, and the next transaction works.
-16. test_usb_host_resume     the host's K for UH_N * 256 cycles, then an EOP, then a transaction.
+17. test_usb_host_resume     the host's K for UH_N * 256 cycles, then an EOP, then a transaction.
 """
 
 import random
@@ -299,7 +300,7 @@ async def i2c_req(chip, addr, wdata=(), nread=0, hi=None):
 async def test_i2c_10bit_master(dut):
     A = 0x2A5
     dev = i2c.I2cSlave(SCL, SDA, addr10=A)
-    chip = await i2c_master_chip(dut, dev, B=125, addr10=True)
+    chip = await i2c_master_chip(dut, dev, B=126, addr10=True)
     data = [random.getrandbits(8) for _ in range(3)]
     st, _ = await i2c_req(chip, A & 0xFF, [0x20] + data, hi=A >> 8)
     assert st == 0 and dev.mem[0x20:0x23] == data, (st, dev.mem[0x20:0x23])
@@ -311,13 +312,14 @@ async def test_i2c_10bit_master(dut):
     assert st == 1, "second address byte is wrong: NACK"
     st, _ = await i2c_req(chip, A & 0xFF, [0x00], hi=(A >> 8) ^ 1)
     assert st == 1, "first address byte is wrong: NACK"
+    assert not (v := i2c.check_timing(chip.samples, SCL, SDA, "FM")), v
     await chip.bus.write(R.RUN, 0)
 
 
 @cocotb.test()
 async def test_i2c_hs_master(dut):
     dev = i2c.I2cSlave(SCL, SDA, 0x50)
-    chip = await i2c_master_chip(dut, dev, B=125, hs_B=14, sdly=2)
+    chip = await i2c_master_chip(dut, dev, B=126, hs_B=16, sdly=2)
     data = [random.getrandbits(8) for _ in range(4)]
     t0 = len(chip.samples)
     st, _ = await i2c_req(chip, 0x50, [0x10] + data)
@@ -329,7 +331,11 @@ async def test_i2c_hs_master(dut):
     rises = [i for i in range(1, len(tr)) if tr[i] and not tr[i - 1]]
     gaps = [y - x for x, y in zip(rises, rises[1:])]
     assert max(gaps[:7]) >= 120, f"master code: {gaps[:7]}"
-    assert min(gaps[9:15]) <= 22, f"data at HS speed (14 + 2 of stretch check): {gaps[9:15]}"
+    assert min(gaps[9:15]) == 18, f"data at HS speed (16 + 2 of stretch check): {gaps[9:15]}"
+    # the master code is under the F/S limits, and all that follows it under the HS limits
+    s = i2c.starts(chip.samples[t0:], SCL, SDA)
+    assert not (v := i2c.check_timing(chip.samples[t0:t0 + s[1] - 1], SCL, SDA, "FM")), f"master code: {v}"
+    assert not (v := i2c.check_timing(chip.samples[t0 + s[1] - 1:], SCL, SDA, "HS")), f"HS: {v}"
     st, got = await i2c_req(chip, 0x50, [0x10], 4)
     assert st == 0 and got == data, (st, got)
     await chip.bus.write(R.RUN, 0)
@@ -388,6 +394,7 @@ async def test_i2c_arbitration(dut):
     chip.devices.append(Rival(0xFF))
     st, _ = await i2c_req(chip, 0x28, [0x20, 0x5A])
     assert st == 0 and dev.mem[0x20] == 0x5A, (st, dev.mem[0x20])
+    assert not (v := i2c.check_timing(chip.samples, SCL, SDA, "FM+")), v
     await chip.bus.write(R.RUN, 0)
 
     # The bus is busy when the request comes: the chip waits for it to be free
@@ -468,6 +475,18 @@ async def test_i2c_slave_stretch(dut):
     await ClockCycles(dut.clk, 500)
     await chip.bus.write(R.RUN, 0)
     assert await chip.bus.dmem_read(0x10, 2) == [0xA5, 0x5A]
+
+
+@cocotb.test()
+async def test_i2c_stretch_setup(dut):
+    # hold is longer than the master's low phase, so the chip's release starts the next clock
+    chip, m = await i2c_slave_chip(dut, h=60, addr=0x42, hold=60)
+    data = [0x00, 0x7F, 0x00]                    # bit 7 is 0, so SDA falls when the byte starts
+    await chip.bus.dmem_write(0x30, data)
+    acks, got = await m.read(0x42, 3, ptr=0x30)
+    assert all(acks) and got == data, (acks, got)
+    assert not (v := i2c.check_timing(chip.samples, SCL, SDA, "SM", only=("su_dat",))), v
+    await chip.bus.write(R.RUN, 0)
 
 
 @cocotb.test()

@@ -28,6 +28,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent / "common"))
 
 import cocotb  # noqa: E402
+import i2c  # noqa: E402
 import pe_fw  # noqa: E402
 import pe_host as R  # noqa: E402
 import usb  # noqa: E402
@@ -173,17 +174,18 @@ async def i2c_request(a, addr, wdata=(), nread=0):
 
 
 async def i2c_write_read(dut, role):
-    a, b = await i2c_setup(dut, role, 125)
+    a, b = await i2c_setup(dut, role, 126)
     data = [random.getrandbits(8) for _ in range(4)]
     assert await i2c_request(a, 0x42, [0x20] + data) == 0, "write: status"
     assert await i2c_request(a, 0x42, [0x20], 4) == 0, "read: status"
     assert await a.bus.dmem_read(0x80, 4) == data, "master reads back what it wrote through the slave"
     await b.bus.write(R.RUN, 0)
     assert await b.bus.dmem_read(0x20, 4) == data, "slave memory"
+    assert not (v := i2c.check_timing(a.samples, SCL, SDA, "FM")), v
 
 
 async def i2c_wrong_addr(dut, role):
-    a, _ = await i2c_setup(dut, role, 125)
+    a, _ = await i2c_setup(dut, role, 126)
     assert await i2c_request(a, 0x43, [0x00]) == 1, "nobody answers: address NACK"
     assert await i2c_request(a, 0x42, [0x01, 0x5A]) == 0, "the slave still answers its own address"
 
@@ -196,7 +198,7 @@ async def i2c_10bit(dut, role):
     await b.bus.write(R.PIN_OD, 0xC0)
     await b.bus.load_program(pe_fw.i2c_slave(scl=SCL, sda=SDA, addr10=A, general_call=True).words())
     await b.bus.owners(R.owner_map(p7=R.OWN_TX))
-    await a.bus.load_program(pe_fw.i2c_master(B=125, scl=SCL, sda=SDA, addr10=True).words())
+    await a.bus.load_program(pe_fw.i2c_master(B=126, scl=SCL, sda=SDA, addr10=True).words())
     await a.bus.owners(R.owner_map(p6=R.OWN_TX, p7=R.OWN_RX))
     await b.bus.start()
     await a.bus.start()

@@ -17,9 +17,75 @@ The bus is open drain: every cycle the line the chip sees is
 * `I2cMaster(scl, sda)`: the testbench as master (tests the chip as slave):
   async `write(addr, data)`, `read(addr, n)` with ACK/NACK, START/STOP,
   half period `h` cycles. Returns the ACK bits seen.
+* `check_timing(samples, scl, sda, mode)`: measures a bus trace against the limits of the I2C
+  standard (UM10204) for SM, FM, FM+ or HS, and returns what breaks them. Edges are ideal here, so
+  a real bus also needs a margin for its rise time.
 """
 
 from cocotb.triggers import FallingEdge
+
+
+CYCLE_NS = 1000 / 48
+# fscl in kHz, the others in ns. HS has no bus-free limit, as it returns to F/S mode for that.
+LIMITS = {
+    "SM": dict(fscl=100, low=4700, high=4000, hd_sta=4000, su_sta=4700, su_sto=4000, buf=4700, su_dat=250),
+    "FM": dict(fscl=400, low=1300, high=600, hd_sta=600, su_sta=600, su_sto=600, buf=1300, su_dat=100),
+    "FM+": dict(fscl=1000, low=500, high=260, hd_sta=260, su_sta=260, su_sto=260, buf=500, su_dat=50),
+    "HS": dict(fscl=3400, low=160, high=60, hd_sta=160, su_sta=160, su_sto=160, buf=0, su_dat=10),
+}
+
+
+def starts(samples, scl, sda):
+    """Indices at which a START or repeated START happens."""
+    return [t for t in range(1, len(samples))
+            if (samples[t - 1] >> scl) & 1 and (samples[t] >> scl) & 1
+            and (samples[t - 1] >> sda) & 1 and not (samples[t] >> sda) & 1]
+
+
+def check_timing(samples, scl, sda, mode, only=None):
+    """The limits of `mode` broken by this trace, worst value of each, from the first START on.
+    `only`: the names in LIMITS to check, when the other side is not the one being tested."""
+    lim = LIMITS[mode]
+    worst = {}
+
+    def need(name, cycles):
+        ns = cycles * CYCLE_NS
+        if ns < lim[name] and (name not in worst or ns < worst[name]):
+            worst[name] = ns
+
+    rise = fall = sda_t = start = stop = None
+    for t in range(1, len(samples)):
+        pc, c = (samples[t - 1] >> scl) & 1, (samples[t] >> scl) & 1
+        pd, d = (samples[t - 1] >> sda) & 1, (samples[t] >> sda) & 1
+        if pc and c and pd and not d:                       # START
+            if stop is not None and (rise is None or rise < stop):
+                need("buf", t - stop)
+            elif rise is not None:
+                need("su_sta", t - rise)
+            start, stop = t, None
+        elif pc and c and not pd and d and start is not None:   # STOP
+            if rise is not None:
+                need("su_sto", t - rise)
+            stop = t
+        elif pd != d and not c:
+            sda_t = t
+        if start is None:
+            continue
+        if not pc and c:                                    # SCL rises
+            if fall is not None:
+                need("low", t - fall)
+            if sda_t is not None and fall is not None and sda_t >= fall:
+                need("su_dat", t - sda_t)
+            if rise is not None and 48000 / (t - rise) > lim["fscl"]:
+                worst["fscl"] = max(worst.get("fscl", 0), 48000 / (t - rise))
+            rise = t
+        elif pc and not c:                                  # SCL falls
+            if rise is not None:
+                need("high", t - rise)
+            if start is not None and (fall is None or fall < start):
+                need("hd_sta", t - start)
+            fall = t
+    return [f"{k} {v:.0f}, limit {lim[k]}" for k, v in worst.items() if only is None or k in only]
 
 
 class I2cSlave:

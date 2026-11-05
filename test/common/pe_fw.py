@@ -430,7 +430,7 @@ def spi_slave_words(bits=12, cpol=0, cpha=0, msb=1, sck=2, mosi=3, miso=4, cs=5)
 
 
 # ------------------------------------------------------------------ I2C
-def i2c_master(B=125, scl=6, sda=7, odly=None, sdly=2, addr10=False, arb=False, hs_B=None, master_code=0x08):
+def i2c_master(B=126, scl=6, sda=7, odly=None, sdly=2, addr10=False, arb=False, hs_B=None, master_code=0x08):
     """I2C master, DMEM-driven. Request: dmem[0] = 7-bit address, dmem[1] = n_write, dmem[2] =
     n_read, dmem[3..] = write data. The firmware sends START, address+W and the write bytes (if
     any), then, if n_read > 0, a repeated START, address+R and reads n_read bytes (ACK all but
@@ -438,7 +438,10 @@ def i2c_master(B=125, scl=6, sda=7, odly=None, sdly=2, addr10=False, arb=False, 
     1 address NACK / 2 data NACK / 3 arbitration lost; then host IRQ.
     SCL: TX unit clock (STRETCH); SDA: RX unit (drive for writes, sample for reads). Both pins
     open drain (host PIN_OD). Owners: SCL -> TX, SDA -> RX. START/STOP/ACK clocks are driven by
-    the controller while the units are idle. Q = B/4 is the quarter period of those phases.
+    the controller while the units are idle. Those phases use H = B/2, the same as a data bit, so
+    every SCL low and high phase is at least floor(B/2) cycles, and each setup and hold time around
+    START and STOP is too. Q = B/4 is only the short hold after SCL falls. The SCL period is B + 2.
+    B for the I2C limits (i2c.check_timing): 478 = 100 kHz, 126 = 375 kHz, 48 = 960 kHz, hs_B 16 = 2.67 MHz.
     Options, chosen when the firmware is built:
     addr10   dmem[0x7E] holds address bits 9:8, dmem[0] bits 7:0 (10-bit addressing).
     arb      multi-master: waits for a free bus and checks every bit it sends. A master that
@@ -448,6 +451,7 @@ def i2c_master(B=125, scl=6, sda=7, odly=None, sdly=2, addr10=False, arb=False, 
     hs_B     HS mode: the master code at B (F/S speed), which nobody acknowledges, then a repeated
              START, and all data bytes at hs_B. ACK clocks stay at F/S length, which is legal."""
     assert not (arb and hs_B), "HS mode has one master after the master code"
+    H = max(1, B // 2)
     Q = max(1, B // 4)
     if odly is None:
         odly = min(15, max(1, (hs_B or B) // 8))
@@ -467,7 +471,7 @@ def i2c_master(B=125, scl=6, sda=7, odly=None, sdly=2, addr10=False, arb=False, 
         a.mov(0, 0x7E).ld(0, 0).shl(0, 8).or_(4, I.R(0))           # r4 = the 10-bit address
     a.mov(3, 0x80).mov(6, 0)
     if arb:
-        a.L("free").jpin(scl, 0, "free").jpin(sda, 0, "free").delay(Q)
+        a.L("free").jpin(scl, 0, "free").jpin(sda, 0, "free").delay(H)
         a.jpin(scl, 0, "free").jpin(sda, 0, "free")
     if hs_B:
         a.ucfg(I.TX, I.TX_BIT, B)
@@ -516,16 +520,16 @@ def i2c_master(B=125, scl=6, sda=7, odly=None, sdly=2, addr10=False, arb=False, 
     a.host_irq()
     a.jmp("idle")
     # START (also repeated START): SDA falls while SCL is high
-    a.L("start").set(sda, I.SRC_1).delay(Q).set(scl, I.SRC_1).wait(scl, 1)
-    a.delay(Q).set(sda, I.SRC_0).delay(Q).set(scl, I.SRC_0).delay(Q).ret()
+    a.L("start").set(sda, I.SRC_1).delay(H).set(scl, I.SRC_1).wait(scl, 1)
+    a.delay(H).set(sda, I.SRC_0).delay(H).set(scl, I.SRC_0).delay(Q).ret()
     # STOP: SDA rises while SCL is high
-    a.L("stop").set(sda, I.SRC_0).delay(Q).set(scl, I.SRC_1).wait(scl, 1)
-    a.delay(Q).set(sda, I.SRC_1).delay(Q).ret()
+    a.L("stop").set(sda, I.SRC_0).delay(H).set(scl, I.SRC_1).wait(scl, 1)
+    a.delay(H).set(sda, I.SRC_1).delay(H).ret()
     # write r0; r5 = 0 ACK / 1 NACK / 2 arbitration lost
     if arb:
         a.L("wbyte").shl(0, 8).mov(5, 8)
-        a.L("wb").shl(0, 1).set(sda, I.SRC_C).delay(Q)         # C = the bit to send
-        a.set(scl, I.SRC_1).wait(scl, 1).delay(Q)
+        a.L("wb").shl(0, 1).set(sda, I.SRC_C).delay(H - Q)     # C = the bit to send; low = H with the Q below
+        a.set(scl, I.SRC_1).wait(scl, 1).delay(H)
         a.jmp("wbk", I.NC).jpin(sda, 0, "wlost")               # sent 1, read 0: lost
         a.L("wbk").set(scl, I.SRC_0).delay(Q).djnz(5, "wb")
     else:
@@ -533,8 +537,8 @@ def i2c_master(B=125, scl=6, sda=7, odly=None, sdly=2, addr10=False, arb=False, 
         a.ustart(I.M_BOTH, I.R(0))
         a.uwait(I.M_BOTH)
         a.urd(5, I.RX, I.RX_DATA)                               # readback (clears RXRDY)
-    a.set(sda, I.SRC_1).delay(Q)                                # release SDA for the ACK
-    a.set(scl, I.SRC_1).wait(scl, 1).delay(Q)
+    a.set(sda, I.SRC_1).delay(H)                                # release SDA for the ACK
+    a.set(scl, I.SRC_1).wait(scl, 1).delay(H)
     a.mov(5, 0).jpin(sda, 0, "wa").mov(5, 1)
     a.L("wa").set(scl, I.SRC_0).delay(Q).ret()
     if arb:
@@ -546,7 +550,7 @@ def i2c_master(B=125, scl=6, sda=7, odly=None, sdly=2, addr10=False, arb=False, 
     a.uwait(I.M_BOTH)
     a.urd(0, I.RX, I.RX_DATA)
     a.cmp(5, 1).set(sda, I.SRC_NC)                             # Z... use C: r5 < 1 -> C=1 -> drive 0
-    a.delay(Q).set(scl, I.SRC_1).wait(scl, 1).delay(Q)
+    a.delay(H).set(scl, I.SRC_1).wait(scl, 1).delay(H)
     a.set(scl, I.SRC_0).delay(Q).set(sda, I.SRC_1).ret()
     return a
 
@@ -614,6 +618,7 @@ def i2c_slave(addr=0x42, scl=6, sda=7, addr10=None, general_call=False, hold=0):
         a.L("gc").call("ack").mov(3, I2C_GC_MEM).mov(2, 0).host_irq().jmp("wr")
     a.L("rd").ld(0, 3, inc=1)
     a.ustart(I.M_TX, I.R(0))                                    # bit 7 now, then on SCL falls
+    a.delay(12)                                                 # data setup: 250 ns, the longest limit
     a.set(scl, I.SRC_1)                                         # the data is ready: release
     a.uwait(I.M_TX)
     a.set(sda, I.SRC_1)                                         # release for the master ACK
