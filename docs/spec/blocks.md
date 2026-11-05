@@ -354,7 +354,7 @@ The functional behaviour seen from the host bus is the same as v1. The tests kee
 **UART break (`pe_fw.uart_ex`).** A frame of all zeros with a bad stop bit counts in dmem[2] and raises the controller IRQ. ERX needs a new edge, so a long break counts once. A doorbell sends a break of dmem[3] bit times between frames. With an odd B (115200 baud at 48 MHz is B = 417), the start bit is B + 1 cycles, and every other edge stays on the bit grid.
 
 **SPI, more forms.**
-- `spi_master_stream`: no pause between bytes, using TX and RX CHAIN. Any B up to 9 bytes (they fit the FIFO and the shift register); longer streams need B ≥ 3, since one refill pass takes up to 22 cycles.
+- `spi_master_stream`: no pause between bytes, using TX and RX CHAIN. Any B up to 9 bytes (they fit the FIFO and the shift register); longer streams need B ≥ 4, since a pass that refills TXF and empties RXF takes 26 cycles. At B = 3, RXF slowly fills: 80 bytes pass, but by 100 it overruns, a reply is lost, and the firmware waits for it forever.
 - `spi_master_3wire`, `spi_slave_3wire`: one data pin. The master writes, releases the pin, then reads, within one CS frame. For the slave the first byte is a command with MSB = 1 for a read; it takes the pin only after the master's last clock edge plus 10 cycles. SCK half period ≥ 16 cycles.
 - `spi_slave_words`: words of 1–16 bits, as two FIFO bytes each, low first. SCK half period ≥ 12 cycles.
 - Every slave prepares the next word before its first clock, so at CS high that word has already left the FIFO and is lost. Load one extra word, or none if only reading.

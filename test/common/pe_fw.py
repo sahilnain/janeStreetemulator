@@ -293,7 +293,9 @@ def spi_master_stream(B=4, cpol=0, cpha=0, msb=1, sdly=3, sck=2, mosi=3, miso=4,
     """SPI master with no gap between bytes (TX and RX CHAIN), DMEM-driven: dmem[0] = n,
     dmem[1..n] = data; the replies go to dmem[0x80..], dmem[0x7F] = 0 ok, 1 the firmware
     fell behind and SCK paused. Up to 9 bytes run at any B, since they fit the FIFO and
-    the shift register; longer streams need 8 B >= 22 cycles (B >= 3). Owners: SCK, MOSI -> TX unit."""
+    the shift register; longer streams need B >= 4. A pass that refills TXF and empties RXF takes
+    26 cycles, so at B = 3 RXF slowly fills: 80 bytes pass, but by 100 it overruns, a reply is
+    lost, and the firmware waits for it forever. Owners: SCK, MOSI -> TX unit."""
     a = Asm()
     a.ucfg(I.TX, I.TX_PINS, I.tx_pins(mosi, 1, sck, 1))
     a.ucfg(I.TX, I.TX_BIT, B)
