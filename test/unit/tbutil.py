@@ -8,7 +8,7 @@ What this file does
 * `P`: the module's parameters for this run. The pytest runner
   (test_unit.py) passes them as JSON in the PE_PARAMS env var, so a test
   knows which config it is checking.
-* `start(dut)`: starts a 50 MHz clock and applies reset.
+* `start(dut)`: starts a 48 MHz clock and applies reset.
 * Every test is declared @cocotb.test(timeout_time=5, timeout_unit="ms"):
   a hung test (for example, waiting forever for a FIFO byte) FAILS instead of
   blocking the run.
@@ -37,7 +37,7 @@ def param(name, default):
 
 
 async def start(dut, rst_cycles=3, rst_name="rst"):
-    cocotb.start_soon(Clock(dut.clk, 20, unit="ns").start())
+    cocotb.start_soon(Clock(dut.clk, 20834, unit="ps").start())
     if rst_name:
         getattr(dut, rst_name).value = 1
     for _ in range(rst_cycles):

@@ -13,9 +13,10 @@ TOPLEVEL_LANG ?= verilog
 SRC_DIR = $(PWD)/../src
 PROJECT_SOURCES = tt_um_sahil_protoemu.v \
                   host/pe_host_if.v host/pe_regs.v \
-                  mem/pe_imem.v mem/pe_fifo.v \
+                  mem/pe_imem.v mem/pe_fifo.v mem/pe_dmem.v \
                   io/pe_sync.v io/pe_pins.v \
-                  core/pe_core.v core/pe_ctx.v core/pe_decode.v core/pe_exec.v core/pe_vote.v
+                  core/pe_ctrl.v core/pe_decode.v core/pe_vote.v \
+                  unit/pe_txu.v unit/pe_rxu.v unit/pe_det.v unit/pe_crc.v
 
 ifneq ($(GATES),yes)
 
@@ -41,12 +42,13 @@ endif
 # Allow sharing configuration between design and testbench via `include`:
 COMPILE_ARGS 		+= -I$(SRC_DIR)
 
-# Include the testbench sources:
-VERILOG_SOURCES += $(PWD)/tb.v
-TOPLEVEL = tb
+# Include the testbench sources (TB=tb_dual: two emulators, test_dual.py):
+TB ?= tb
+VERILOG_SOURCES += $(PWD)/$(TB).v
+TOPLEVEL = $(TB)
 
 # List test modules to run, separated by commas and without the .py suffix:
-COCOTB_TEST_MODULES = test,test_lockstep
+COCOTB_TEST_MODULES ?= test,test_uart,test_spi,test_i2c,test_modes,test_usb,test_fabric,test_gaps,test_lockstep,test_cross
 
 # include cocotb's make rules to take care of the simulator setup
 include $(shell cocotb-config --makefiles)/Makefile.sim

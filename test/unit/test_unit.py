@@ -10,12 +10,17 @@ or more parameter sets, then runs the matching cocotb testbench
 that the RTL really is parameterizable.
 
 Run (inside the tt-dev container, from test/unit):
-    pytest -v                 # everything
+    pytest -v                 # everything (Icarus)
     pytest -v -k pe_fifo      # one module
-Build output goes to test/unit/sim_build/<module>_<config>/.
+Code coverage (needs Verilator >= 5.036, image tt-dev-cov):
+    SIM=verilator COV=1 pytest -v
+    then: python3 coverage_report.py   (merges sim_build/*/coverage.dat)
+Build output goes to test/unit/sim_build/<sim>/<module>_<config>/.
 """
 
 import json
+import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -25,7 +30,6 @@ from cocotb_tools.runner import get_results, get_runner
 HERE = Path(__file__).resolve().parent
 SRC = HERE.parents[1] / "src"
 RTL = sorted(str(p) for p in SRC.rglob("*.v"))
-HARNESS = [str(HERE / "hdl" / "pe_core_tb.v")]
 COMMON = str(HERE.parent / "common")
 
 # Shared helpers (pe_isa, pe_fw, uart) must be importable inside the simulator.
@@ -36,45 +40,59 @@ sys.path.insert(0, COMMON)
 CASES = [
     ("pe_sync", "w1", dict(W=1), []),
     ("pe_sync", "w5_rst", dict(W=5, RESET_VAL=0b10110), []),
-    ("pe_fifo", "d4", dict(W=8, DEPTH=4), []),
+    ("pe_fifo", "d8", dict(W=8, DEPTH=8), []),
     ("pe_fifo", "d3", dict(W=8, DEPTH=3), []),
     ("pe_fifo", "d1_w5", dict(W=5, DEPTH=1), []),
-    ("pe_imem", "flop", dict(IW=24, DEPTH=64, IMPL=0), []),
-    ("pe_imem", "latch", dict(IW=24, DEPTH=16, IMPL=1), []),
-    ("pe_imem", "flop_w32", dict(IW=32, DEPTH=8, IMPL=0), []),
-    ("pe_pins", "p8_c2", dict(NUM_PINS=8, NUM_CTX=2), []),
-    ("pe_pins", "p16_c3", dict(NUM_PINS=16, NUM_CTX=3), []),
-    ("pe_pins", "p4_c1", dict(NUM_PINS=4, NUM_CTX=1), []),
-    ("pe_vote", "default", dict(NUM_PINS=8, N_W=4, S_W=12), []),
+    ("pe_imem", "flop_w32", dict(IW=32, DEPTH=64, IMPL=0), []),
+    ("pe_imem", "latch_w32", dict(IW=32, DEPTH=16, IMPL=1), []),
+    ("pe_dmem", "d256", dict(DEPTH=256), []),
+    ("pe_dmem", "d64", dict(DEPTH=64), []),
+    ("pe_pins", "p8", dict(NUM_PINS=8), []),
+    ("pe_pins", "p16", dict(NUM_PINS=16), []),
+    ("pe_vote", "default", dict(NUM_PINS=8, N_W=4, S_W=16), []),
     ("pe_vote", "p16_n5", dict(NUM_PINS=16, N_W=5, S_W=6), []),
-    ("pe_decode", "iw24", dict(IW=24, AW=6), []),
-    ("pe_decode", "iw32_aw8", dict(IW=32, AW=8), []),
-    ("pe_ctx", "default", dict(AW=6, SR_W=16, CTR_W=16, STALL_W=17), []),
-    ("pe_ctx", "small", dict(AW=4, SR_W=10, CTR_W=12, STALL_W=17), []),
-    ("pe_exec", "default", dict(AW=6, NUM_PINS=8, SR_W=16, DATA_W=8, CTR_W=16), []),
-    ("pe_exec", "p16_sr12", dict(AW=8, NUM_PINS=16, SR_W=12, DATA_W=6, CTR_W=12), []),
-    ("pe_core_tb", "c2", dict(NUM_CTX=2, VOTE_CTX_MASK=3), HARNESS),
-    ("pe_core_tb", "c3_p16", dict(NUM_CTX=3, NUM_PINS=16, VOTE_CTX_MASK=6, IMEM_DEPTH=128), HARNESS),
-    ("pe_core_tb", "c1", dict(NUM_CTX=1, VOTE_CTX_MASK=1), HARNESS),
+    ("pe_decode", "aw6", dict(AW=6), []),
+    ("pe_decode", "aw10", dict(AW=10), []),
+    ("pe_txu", "p8", dict(NUM_PINS=8), []),
+    ("pe_txu", "p16", dict(NUM_PINS=16), []),
+    ("pe_rxu", "p8", dict(NUM_PINS=8), []),
+    ("pe_rxu", "p16", dict(NUM_PINS=16), []),
+    ("pe_det", "etx", dict(KIND=0, NUM_PINS=8), []),
+    ("pe_det", "erx", dict(KIND=1, NUM_PINS=8), []),
+    ("pe_det", "erx_p16", dict(KIND=1, NUM_PINS=16), []),
+    ("pe_crc", "default", dict(), []),
+    ("pe_ctrl", "default", dict(IMEM_DEPTH=64, NUM_PINS=8, STACK_DEPTH=4), []),
+    ("pe_ctrl", "d1024_p16_s2", dict(IMEM_DEPTH=1024, NUM_PINS=16, STACK_DEPTH=2), []),
     ("pe_host_if", "default", dict(), []),
-    ("pe_regs", "default", dict(), []),
-    ("pe_regs", "c3_p16_iw32", dict(NUM_CTX=3, NUM_PINS=16, IW=32, IMEM_DEPTH=256), []),
+    ("pe_regs", "default", dict(IMEM_DEPTH=64, NUM_PINS=8, FIFO_CW=4), []),
+    ("pe_regs", "d1024_p16", dict(IMEM_DEPTH=1024, NUM_PINS=16, FIFO_CW=3), []),
 ]
+
+SIM = os.environ.get("SIM", "icarus")
+COV = os.environ.get("COV", "0") == "1"
 
 
 @pytest.mark.parametrize("module,cfg,params,extra", CASES, ids=[f"{c[0]}-{c[1]}" for c in CASES])
 def test_module(module, cfg, params, extra):
-    runner = get_runner("icarus")
-    build_dir = HERE / "sim_build" / f"{module}_{cfg}"
+    runner = get_runner(SIM)
+    build_dir = HERE / "sim_build" / SIM / f"{module}_{cfg}"
+    build_args = []
+    if SIM == "verilator":
+        build_args = ["-Wno-fatal", "-Wno-lint", "-Wno-style", "--timing"]
+        if COV:
+            build_args += ["--coverage-line", "--coverage-toggle", "--coverage-user"]
     runner.build(
         sources=RTL + extra,
         hdl_toplevel=module,
         parameters=params,
         build_dir=build_dir,
+        build_args=build_args,
         always=True,
         timescale=("1ns", "1ps"),
     )
     tb = "tb_" + module.removesuffix("_tb")
+    cov = HERE / "coverage.dat"
+    cov.unlink(missing_ok=True)
     results = runner.test(
         hdl_toplevel=module,
         test_module=tb,
@@ -83,6 +101,8 @@ def test_module(module, cfg, params, extra):
         extra_env={"PE_PARAMS": json.dumps(params)},
         timescale=("1ns", "1ps"),
     )
+    if cov.exists():
+        shutil.move(str(cov), str(build_dir / "coverage.dat"))
     total, failed = get_results(results)
     assert total > 0, "no tests ran"
     assert failed == 0, f"{failed}/{total} cocotb tests failed"
