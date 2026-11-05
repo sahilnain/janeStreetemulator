@@ -291,11 +291,12 @@ def spi_slave(cpol=0, cpha=0, msb=1, bits=0, sck=2, mosi=3, miso=4, cs=5):
 
 def spi_master_stream(B=4, cpol=0, cpha=0, msb=1, sdly=3, sck=2, mosi=3, miso=4, cs=5):
     """SPI master with no gap between bytes (TX and RX CHAIN), DMEM-driven: dmem[0] = n,
-    dmem[1..n] = data; the replies go to dmem[0x80..], dmem[0x7F] = 0 ok, 1 the firmware
-    fell behind and SCK paused. Up to 9 bytes run at any B, since they fit the FIFO and
-    the shift register; longer streams need B >= 4. A pass that refills TXF and empties RXF takes
-    26 cycles, so at B = 3 RXF slowly fills: 80 bytes pass, but by 100 it overruns, a reply is
-    lost, and the firmware waits for it forever. Owners: SCK, MOSI -> TX unit."""
+    dmem[1..n] = data; the replies go to dmem[0x80..]. dmem[0x7F] = 0 ok, 1 the firmware fell
+    behind and SCK paused, 2 a reply was lost (RXF overran, or the host took a byte from it).
+    A pass that refills TXF and empties RXF takes 18 cycles, so any length runs with no pause
+    at B >= 3; at B = 2 only short streams do. Whatever happens, the firmware ends and raises the
+    IRQ: once TX is idle it does not wait for a reply that is not there.
+    Owners: SCK, MOSI -> TX unit."""
     a = Asm()
     a.ucfg(I.TX, I.TX_PINS, I.tx_pins(mosi, 1, sck, 1))
     a.ucfg(I.TX, I.TX_BIT, B)
@@ -313,13 +314,22 @@ def spi_master_stream(B=4, cpol=0, cpha=0, msb=1, sdly=3, sck=2, mosi=3, miso=4,
     a.L("pre").ld(0, 1, inc=1).fput(0, I.FIFO_TX).sub(2, 1).jmp("go", I.Z)
     a.jmp("go", I.TXF_FULL).jmp("pre")
     a.L("go").set(cs, I.SRC_0, dly=1).ustart(I.M_BOTH)
+    a.cmp(2, 0).jmp("drain", I.Z)
+    # While bytes are left to send, the last reply cannot have come: no test of r5 or r2 here
     a.L("run").fget(4, I.FIFO_RX, nb=1).jmp("no_rx", I.C)
-    a.st(4, 3, inc=1).sub(5, 1).jmp("end", I.Z)
-    a.L("no_rx").cmp(2, 0).jmp("run", I.Z)
-    a.jmp("late", I.TXU_IDLE).jmp("run", I.TXF_FULL)
-    a.ld(0, 1, inc=1).fput(0, I.FIFO_TX).sub(2, 1).jmp("run")
+    a.st(4, 3, inc=1).sub(5, 1)
+    a.L("no_rx").jmp("late", I.TXU_IDLE).jmp("run", I.TXF_FULL)
+    a.ld(0, 1, inc=1).fput(0, I.FIFO_TX).djnz(2, "run").jmp("drain")
     a.L("late").mov(6, 1)                                       # TX ended early: start it again
-    a.ld(0, 1, inc=1).fput(0, I.FIFO_TX).sub(2, 1).ustart(I.M_TX).jmp("run")
+    a.ld(0, 1, inc=1).fput(0, I.FIFO_TX).ustart(I.M_TX).djnz(2, "run")
+    # All sent: take the replies that are left
+    a.L("drain").fget(4, I.FIFO_RX, nb=1).jmp("dry", I.C)
+    a.st(4, 3, inc=1).sub(5, 1).jmp("end", I.Z).jmp("drain")
+    a.L("dry").jmp("drain", I.TXU_BUSY)
+    # TX is idle: a last reply is at most SDLY away, and after that none will come
+    a.delay(20).fget(4, I.FIFO_RX, nb=1).jmp("lost", I.C)
+    a.st(4, 3, inc=1).sub(5, 1).jmp("end", I.Z).jmp("dry")
+    a.L("lost").mov(6, 2)
     a.L("end").uwait(I.M_TX).ustop(I.M_RX)
     a.set(cs, I.SRC_1)
     a.mov(1, 0x7F).st(6, 1)

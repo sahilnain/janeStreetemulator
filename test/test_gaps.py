@@ -16,7 +16,10 @@ UART
 3. test_uart_break_tx        a doorbell sends a break of n bit times, and frames still work after it.
 SPI
 4. test_spi_stream           CHAIN master: 40 bytes at B = 4 in all modes, SCK with no pause.
-5. test_spi_stream_fast      9 bytes at B = 2 (24 MHz), SCK with no pause.
+5. test_spi_stream_fast      9 bytes at B = 2 (24 MHz), SCK with no pause; 126 bytes at B = 3 (16 MHz)
+                             in all modes, no pause; 126 bytes at B = 2, where SCK may pause, data intact.
+   test_spi_stream_lost      error on purpose: the firmware is stopped mid-stream and RXF overruns.
+                             It reports status 2 and raises the IRQ, instead of hanging.
 6. test_spi_3wire_master     one data pin: write, then read, against a Spi3Slave; no contention.
 7. test_spi_3wire_slave      one data pin: a testbench master writes and reads, all modes.
 8. test_spi_slave_words      slave with 9, 12, 15, 16 bits, all modes, both directions.
@@ -191,6 +194,41 @@ async def test_spi_stream(dut):
 async def test_spi_stream_fast(dut):
     for mode in range(4):
         await stream(dut, 2, 9, mode)
+        await stream(dut, 3, 126, mode)
+    # 126 bytes at 24 MHz: the firmware cannot keep up all the way, so SCK may pause, but no byte is lost
+    chip = await fresh(dut, pe_fw.spi_master_stream(B=2).words(), R.owner_map(p2=R.OWN_TX, p3=R.OWN_TX))
+    up = [random.getrandbits(8) for _ in range(126)]
+    dev = spi.SpiSlave(SCK, MOSI, MISO, CS, tx=list(up))
+    chip.devices.append(dev)
+    await chip.bus.start()
+    await ClockCycles(dut.clk, 40)
+    down = [random.getrandbits(8) for _ in range(126)]
+    await chip.bus.dmem_write(0, [126] + down)
+    await chip.bus.write(R.DOORBELL, 0)
+    await wait_irq(chip, "stream B=2")
+    st = (await chip.bus.dmem_read(0x7F, 1))[0]
+    assert st in (0, 1), f"status {st}"
+    dut._log.info(f"stream B=2, 126 bytes: status {st}")
+    assert dev.rx == down and await chip.bus.dmem_read(0x80, 126) == up
+    await chip.bus.write(R.RUN, 0)
+
+
+@cocotb.test()
+async def test_spi_stream_lost(dut):
+    chip = await fresh(dut, pe_fw.spi_master_stream(B=4).words(), R.owner_map(p2=R.OWN_TX, p3=R.OWN_TX))
+    chip.devices.append(spi.SpiSlave(SCK, MOSI, MISO, CS, tx=[0x5A] * 30))
+    await chip.bus.start()
+    await ClockCycles(dut.clk, 40)
+    await chip.bus.dmem_write(0, [30] + [0xA5] * 30)
+    await chip.bus.write(R.DOORBELL, 0)
+    await ClockCycles(dut.clk, 200)
+    await chip.bus.write(R.RUN, 0)                     # TX and RX run on: RXF takes 8, the next is dropped
+    await ClockCycles(dut.clk, 12 * 8 * 4)
+    assert await chip.bus.read(R.STATUS) & 0x20, "RXF overran"
+    await chip.bus.write(R.RUN, 1)
+    await wait_irq(chip, "a lost reply must not hang the firmware")
+    assert await chip.bus.dmem_read(0x7F, 1) == [2], "status: reply lost"
+    await chip.bus.write(R.RUN, 0)
 
 
 async def no_contention(dut, dev, pin):
