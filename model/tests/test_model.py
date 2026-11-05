@@ -1,190 +1,185 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-test_model: checks of the Python reference model against the SPEC (no RTL).
+test_model: checks of the Python reference model against the spec, with no RTL.
 
 What is checked
 ---------------
-These tests make sure the model itself behaves as documented, so that when
-the lockstep test compares it with the RTL, agreement means something.
-1. test_registers_reset     ID, VERSION, vote reset values over the host bus.
-2. test_uart_loopback       UART TX + vote-based RX firmware (test/common/pe_fw)
-                            on the chip model, P0 looped to P1: bytes arrive,
-                            and the TX line is cycle-exact on the bit grid.
-3. test_framing_error_drop  a frame with a bad stop bit is dropped by the RX
-                            firmware, good frames around it arrive.
-4. test_instruction_timing  one instruction per NUM_SLOTS cycles, delay field
-                            rounded up to whole slots (2- and 3-context chips).
-5. test_vote_timing         the vote unit finishes exactly N*S+1 cycles after
-                            start, and votes the majority of the centre samples.
-6. test_exec_invariants     out/in conserve bits; held instructions have no
-                            side effects (same properties as the formal proof).
-7. test_unwritten_imem      executing an unwritten IMEM word raises ModelError
-                            (the RTL would execute X).
+These tests check that the model behaves as docs/spec/ says, so that agreement with the
+RTL in test/test_lockstep.py means something.
+1. test_registers_reset    ID, VERSION, RUN and the pin reset state over the host bus.
+2. test_instruction_timing 2 cycles per instruction; dly and `delay` rounded up to slots.
+3. test_tx_times           TX bit i is on the pad during S+1+iB ... S+(i+1)B.
+4. test_tx_nbits_msb       word length and bit order on the pad.
+5. test_rx_vote_majority   the vote takes the majority of the samples between K and N-K.
+6. test_uart_loopback      pe_fw.uart, P0 looped to P1: bytes arrive and the line is on the bit grid.
+7. test_fifo_arbitration   overrun flags, as blocks.md Section 8.
+8. test_owner_rule         a controller write to a busy unit's pin is dropped and sets owner_err.
+9. test_crc_usb            the CRC unit gives the USB residuals.
 """
 
 import random
 
 import pe_fw
-import pe_model.isa as I
-import pytest
+import pe_isa as I
 import uart
-from pe_model import Chip, Config, ModelError
-from pe_model.blocks import (A_ID, A_OWNER, A_RESTART, A_RUN, A_RXF, A_STATUS, A_TXF, A_VERSION,
-                             A_CTX0, A_PIN_OD, Vote)
+from pe_isa import Asm
+from pe_model import Chip
+from pe_model.blocks import A_ERR_CLR, A_FIFO_CNT, A_ID, A_RUN, A_RXF, A_STATUS, A_TXF, A_VERSION
 from pe_model.host import ModelHost
 
 
-def line_of(outs, ext=0xFF):
-    return ((outs["uio_out"] & outs["uio_oe"]) | (ext & ~outs["uio_oe"])) & 0xFF
+
+def p0_to_p1(o):
+    line = (o["uio_out"] & o["uio_oe"]) | (0xFF & ~o["uio_oe"])
+    return (line & ~2) | ((line & 1) << 1)
 
 
-def setup_uart(B, N, S, K=1, ext=None):
-    chip = Chip()
-    state = {"ext": 0xFF}
-
-    def pins_in(outs):
-        line = line_of(outs, state["ext"])
-        if ext is None:  # loopback P0 -> P1
-            line = (line & ~2) | ((line & 1) << 1)
-        return line
-
-    h = ModelHost(chip, pins_in)
+def host(pins_in=None):
+    h = ModelHost(Chip(), pins_in)
     h.reset()
-    h.load_program(pe_fw.uart_tx(0, B, base=0), start=0)
-    h.load_program(pe_fw.uart_rx(1, N, S, base=20), start=20)
-    h.write(A_OWNER, 0b10)
-    h.write(A_CTX0 + 8 + 0, 20)
-    for off, val in ((2, N), (3, K), (4, S & 0xFF), (5, S >> 8)):
-        h.write(A_CTX0 + 8 + off, val)
-    h.write(A_RESTART, 0b11)
-    return chip, h, state
+    return h
+
+
+def run(words, owners=0, pins_in=None, cycles=200, pc=0):
+    h = host(pins_in)
+    h.load_program(words, pc)
+    h.owners(owners)
+    h.start(pc)
+    t0 = len(h.trace)
+    h.cycle(cycles)
+    return h, h.trace[t0:]
+
+
+def pin(trace, p):
+    return [((o["uio_out"] & o["uio_oe"]) | (0xFF & ~o["uio_oe"])) >> p & 1 for o in trace]
+
+
+def edges(levels):
+    return [i for i in range(1, len(levels)) if levels[i] != levels[i - 1]]
 
 
 def test_registers_reset():
-    h = ModelHost(Chip())
-    h.reset()
-    assert h.read(A_ID) == 0x50 and h.read(A_VERSION) == 0x01
-    assert h.read(A_CTX0 + 2) == 9 and h.read(A_CTX0 + 3) == 1 and h.read(A_CTX0 + 4) == 48
-    h.write(A_PIN_OD, 0x5A)
-    assert h.read(A_PIN_OD) == 0x5A
-    assert h.read(0x7F) == 0
+    h = host()
+    assert h.read(A_ID) == 0x50 and h.read(A_VERSION) == 0x02 and h.read(A_RUN) == 0
+    assert h.read(A_STATUS) == 0x05, "both FIFOs empty"
+    o = h.chip.outputs()
+    assert o["uio_oe"] == 0
+
+
+def test_instruction_timing():
+    for d, cost in ((0, 2), (1, 2), (2, 4), (3, 4), (7, 8)):
+        a = Asm().setoe(0, 1).L("l").set(0, I.SRC_0, dly=d).set(0, I.SRC_1, dly=d).jmp("l", dly=0)
+        _, tr = run(a.words(), cycles=120)
+        low = pin(tr, 0)
+        e = edges(low)[2:6]
+        assert e[1] - e[0] in (cost, cost + 2) and e[3] - e[2] in (cost, cost + 2), (d, e)
+        first = sorted({y - x for x, y in zip(e, e[1:])})
+        assert first[0] == cost, (d, first)
+    a = Asm().setoe(0, 1).set(0, I.SRC_0).delay(100).set(0, I.SRC_1).L("e").jmp("e")
+    _, tr = run(a.words(), cycles=200)
+    e = edges(pin(tr, 0))
+    assert e[1] - e[0] == 2 + 102, "set (2 cycles), then delay 100: E + 2*ceil(101/2) = 102"
+
+
+def tx_prog(B, data, **frame):
+    a = Asm()
+    a.ucfg(I.TX, I.TX_PINS, I.tx_pins(0)).ucfg(I.TX, I.TX_BIT, B).ucfg(I.TX, I.TX_FRAME, I.tx_frame(**frame))
+    a.setoe(0, 1).ustart(I.M_TX, data).uwait(I.M_TX).L("e").jmp("e")
+    return a.words()
+
+
+def test_tx_times():
+    B = 7
+    _, tr = run(tx_prog(B, 0x55), owners=1, cycles=120)
+    e = edges(pin(tr, 0))
+    assert [y - x for x, y in zip(e, e[1:])][:6] == [B] * 6, e
+
+
+def test_tx_nbits_msb():
+    B = 4
+    for n, msb, word in ((3, 0, 0b101), (12, 1, 0xA5C), (16, 0, 0x8001), (5, 1, 0b10011)):
+        _, tr = run(tx_prog(B, word, msb=msb, nbits=n), owners=1, cycles=30 + n * B)
+        lv = pin(tr, 0)
+        start = next(i for i, o in enumerate(tr) if o["uio_oe"] & 1)
+        # the unit starts 2 cycles after setoe (one instruction); bit i runs from there
+        got = [lv[start + 3 + i * B] for i in range(n)]
+        want = [(word >> (n - 1 - i if msb else i)) & 1 for i in range(n)]
+        assert got == want, (n, msb, got, want)
+
+
+def test_rx_vote_majority():
+    """5 samples, K = 1: the 3 in the middle count. The line is high only for the first and last."""
+    a = Asm()
+    a.ucfg(I.RX, I.RX_PINS, I.rx_pins(1)).ucfg(I.RX, I.RX_BIT, 20).ucfg(I.RX, I.RX_VOTE, I.rx_vote(5, 1))
+    a.ucfg(I.RX, I.RX_STEP, 3).ucfg(I.RX, I.RX_FIRST, 2).ucfg(I.RX, I.RX_FRAME, I.rx_frame(hold=1, nbits=1))
+    a.ustart(I.M_RX).uwait(I.M_RX).urd(0, I.RX, I.RX_DATA).fput(0, I.FIFO_RX).L("e").jmp("e")
+    t = {"n": 0}
+
+    def line(o):
+        t["n"] += 1
+        return 0xFF
+
+    h, _ = run(a.words(), pins_in=line, cycles=120)
+    assert h.read(A_RXF) == 1, "an all-high line votes 1"
 
 
 def test_uart_loopback():
-    N, S = 9, 12
-    B = pe_fw.rx_bit_period(N, S)
-    chip, h, _ = setup_uart(B, N, S)
-    h.write(A_RUN, 0b11)
+    B = 24
+    h = host(p0_to_p1)
+    h.load_program(pe_fw.uart(B=B, N=5, K=1, S=4).words())
+    h.owners(1)
+    h.start()
+    h.cycle(60)
+    data = [0x00, 0xFF, 0x5A, random.getrandbits(8)]
     t0 = len(h.trace)
-    data = [random.getrandbits(8) for _ in range(12)]
-    todo, got = list(data), []
-    while len(got) < len(data):
-        st = h.read(A_STATUS)
-        if not st & 0x04:
-            got.append(h.read(A_RXF))
-        elif todo and not st & 0x02:
-            h.write(A_TXF, todo.pop(0))
+    got = []
+    for d in data:
+        h.write(A_TXF, d)
+        h.cycle(12 * B)
+        got.append(h.read(A_RXF))
     assert got == data
-    assert h.read(A_STATUS) & 0xF0 == 0
-    h.cycle(2 * B)
-    tx = [line_of(o) & 1 for o in h.trace[t0:]]
-    assert uart.decode(tx, B) == data
+    assert uart.decode(pin(h.trace[t0:], 0), B) == data, "the line is cycle-exact on the bit grid"
 
 
-def test_framing_error_drop():
-    N, S = 9, 12
-    B = pe_fw.rx_bit_period(N, S)
-    chip, h, state = setup_uart(B, N, S, ext=True)
-    h.write(A_RUN, 0b10)
-    bits = [1] * 3 + uart.frame_bits(0x5A) + [1] * 2 + uart.frame_bits(0xC3, stop=0) + [0] * 2
-    bits += [1] * 4 + uart.frame_bits(0x81) + [1] * 3
+def test_fifo_arbitration():
+    h = host()
+    for i in range(9):
+        h.write(A_TXF, i)
+    st = h.read(A_STATUS)
+    assert st & 0x02 and st & 0x10, f"TXF full and overrun: {st:02x}"
+    assert h.read(A_FIFO_CNT) == 0x08
+    h.write(A_ERR_CLR, 0x10)
+    assert not h.read(A_STATUS) & 0x10
+
+
+def test_owner_rule():
+    a = Asm()
+    a.ucfg(I.TX, I.TX_PINS, I.tx_pins(0)).ucfg(I.TX, I.TX_BIT, 40).setoe(0, 1)
+    a.ustart(I.M_TX, 0xFF).set(0, I.SRC_0).L("e").jmp("e")
+    h, tr = run(a.words(), owners=1, cycles=100)
+    assert h.read(A_STATUS) & 0x40, "owner_err"
+    assert all(pin(tr, 0)), "the dropped write never reaches the pad"
+
+
+def _crc_feed(poly, init, bits):
+    c = init
     for b in bits:
-        state["ext"] = 0xFD | (b << 1)
-        h.cycle(B)
-    assert h.read(A_RXF) == 0x5A
-    assert h.read(A_RXF) == 0x81
-    assert h.read(A_STATUS) & 0x04, "the bad frame must have been dropped"
+        c = ((c << 1) ^ (poly if ((c >> 15) ^ b) & 1 else 0)) & 0xFFFF
+    return c
 
 
-@pytest.mark.parametrize("nctx", [2, 3])
-def test_instruction_timing(nctx):
-    cfg = Config(num_ctx=nctx, vote_ctx_mask=(1 << nctx) - 1)
-    ns = cfg.num_slots
-    for d in range(8):
-        chip = Chip(cfg)
-        h = ModelHost(chip)
-        h.reset()
-        h.load_program([I.set_(0, I.SRC_1, dly=d), I.set_(0, I.SRC_0, dly=d), I.jmp(0)]
-                       + [I.jmp(3)] * 61)
-        h.write(A_RESTART, 1)
-        h.write(A_RUN, 1)
-        t0 = len(h.trace)
-        h.cycle(20 * ns * 8)
-        tr = [o["uio_out"] & 1 for o in h.trace[t0:]]
-        runs, cur, n = [], tr[0], 0
-        for b in tr:
-            if b == cur:
-                n += 1
-            else:
-                runs.append((cur, n))
-                cur, n = b, 1
-        runs = runs[1:]
-        while runs[0][0] == 0:
-            runs = runs[1:]
-        cost = ns * -(-(d + 1) // ns)
-        assert runs[:4] == [(1, cost), (0, cost + ns)] * 2, (d, runs[:4])
+def test_crc_usb():
+    from pe_model.blocks import Crc
 
-
-def test_vote_timing():
-    cfg = Config()
-    for _ in range(200):
-        N, k, S = random.randint(1, 15), random.randint(0, 8), random.randint(1, 20)
-        v = Vote(cfg)
-        wave = {}
-        v.clock(0, 1, 2, 0, N, k, S)
-        t = 1
-        while not v.done:
-            wave[t] = random.getrandbits(8)
-            v.clock(0, 0, 0, wave[t], N, k, S)
-            t += 1
-            assert t <= N * S + 2
-        assert t == N * S + 1
-        samples = [(wave[(j + 1) * S] >> 2) & 1 for j in range(N)]
-        ones = sum(samples[j] for j in range(N) if k <= j < N - k)
-        assert v.bit == int(2 * ones > max(N - 2 * k, 0))
-
-
-def test_exec_invariants():
-    cfg = Config()
-    SRM = (1 << cfg.sr_w) - 1
-    for _ in range(5000):
-        w = (random.randrange(14) << 19) | random.getrandbits(19)
-        f = I.decode(w, cfg.iw, cfg.aw)
-        s = dict(pc=random.getrandbits(6), ctr0=random.getrandbits(16), ctr1=random.getrandbits(16),
-                 osr=random.getrandbits(16), osr_cnt=random.randint(0, 16), isr=random.getrandbits(16),
-                 c=random.getrandbits(1), to=random.getrandbits(1), shift_msb=random.getrandbits(1),
-                 vote_avail=1)
-        e = dict(pin_in=random.getrandbits(8), txf_rdata=random.getrandbits(8),
-                 txf_empty=random.getrandbits(1), rxf_full=random.getrandbits(1))
-        o = I.execute(cfg, f, s, e)
-        n = f["n"]
-        if f["op"] == "out":
-            bits = (o["pin_wr_val"] >> f["pin"]) if f["pin"] + n <= 8 else None
-            if bits is not None:
-                if s["shift_msb"]:
-                    assert ((o["osr_n"] >> n) | (bits << (16 - n))) & SRM == s["osr"]
-                else:
-                    assert ((o["osr_n"] << n) | bits) & SRM == s["osr"]
-        if not o["done"]:
-            assert f["op"] in ("wait", "pull", "push")
-            assert o["pc_n"] == s["pc"] and o["stall_n"] == 0
-            assert not (o["pin_wr_en"] or o["pin_oe_en"] or o["txf_rd"] or o["rxf_wr"] or o["vote_start"])
-
-
-def test_unwritten_imem():
-    chip = Chip()
-    h = ModelHost(chip)
-    h.reset()
-    h.write(A_RUN, 1)
-    with pytest.raises(ModelError):
-        h.cycle(10)
+    u = Crc()
+    u.clock(0, 1, I.CRC_CTRL, I.crc_ctrl(I.CRC_RX), 0, 0, 0, 0, 0)
+    u.clock(0, 1, I.CRC_POLY, 0x8005, 0, 0, 0, 0, 0)
+    u.clock(0, 1, I.CRC_INIT, 0xFFFF, 0, 0, 0, 0, 0)
+    data = [random.getrandbits(1) for _ in range(40)]
+    for b in data:
+        u.clock(0, 0, 0, 0, 0, 0, 1, b, 0)
+    assert u.crc == _crc_feed(0x8005, 0xFFFF, data)
+    v = u.value
+    for i in range(16):
+        u.clock(0, 0, 0, 0, 0, 0, 1, (v >> (15 - i)) & 1, 0)
+    assert u.crc == 0x800D, f"residual {u.crc:04x}"

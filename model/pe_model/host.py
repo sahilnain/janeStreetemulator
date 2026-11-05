@@ -11,7 +11,7 @@ value for each cycle (for loopbacks or driven lines); every sampled cycle of
 the outputs is appended to `trace`.
 """
 
-from .blocks import A_IMADDR, A_IMDATA
+from .blocks import A_IMADDR, A_IMADDR_H, A_IMDATA, A_OWNER, A_RESTART, A_RUN, A_START_PC
 
 OP_ADDR, OP_WRITE, OP_READ, OP_SYNC = range(4)
 
@@ -58,8 +58,19 @@ class ModelHost:
         return (self.op(OP_READ) << 4) | self.op(OP_READ)
 
     def load_program(self, words, start=0):
-        nb = self.chip.cfg.nb
-        self.write(A_IMADDR, start)
+        self.write(A_IMADDR, start & 0xFF)
+        self.write(A_IMADDR_H, start >> 8)
         for w in words:
-            for b in range(nb):
+            for b in range(4):
                 self.write(A_IMDATA + b, (w >> (8 * b)) & 0xFF)
+
+    def owners(self, v):
+        for b in range(4):
+            self.write(A_OWNER + b, (v >> (8 * b)) & 0xFF)
+
+    def start(self, pc=0):
+        self.write(A_RUN, 0)
+        self.write(A_START_PC, pc & 0xFF)
+        self.write(A_START_PC + 1, pc >> 8)
+        self.write(A_RESTART, 1)
+        self.write(A_RUN, 1)

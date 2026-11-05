@@ -1,18 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-blocks: cycle-accurate models of the leaf/host blocks.
+blocks: cycle-accurate models of the leaf and host blocks.
 
 What this file does
 -------------------
-One class per RTL module (pe_fifo, pe_imem, pe_pins, pe_vote, pe_ctx,
-pe_host_if, pe_regs). Each class holds that module's registers and has:
-  * properties / methods for its combinational outputs (from current state,
-    plus inputs where the RTL has a combinational path), and
-  * clock(...): the next state at a rising edge, computed ONLY from the
-    current state and the values passed in (so the chip model can compute
-    every combinational signal first and then clock all blocks).
-`None` means "unknown" (the RTL would hold X): unwritten FIFO entries and
-IMEM words. Reset is synchronous and active high, like the RTL.
+One class per RTL module: pe_fifo, pe_imem, pe_dmem, pe_pins + pe_sync, pe_vote,
+pe_crc, pe_host_if, pe_regs. Each holds that module's registers and has:
+  * properties or methods for its combinational outputs, and
+  * clock(...): the next state at a rising edge, computed only from the current
+    state and the values passed in, so the chip model can compute every
+    combinational signal first and then clock all blocks.
+`None` means "unknown" (the RTL would hold X): unwritten memory words. Reset is
+synchronous and active high, as in the RTL.
 """
 
 from .config import Config
@@ -20,11 +19,6 @@ from .config import Config
 
 def bits(v, w):
     return v & ((1 << w) - 1)
-
-
-def is_zero(x, w):
-    """1 if x == 0 else 0, for 0 <= x < 2**w, without branching."""
-    return ((x - 1) >> w) & 1
 
 
 # ------------------------------------------------------------------- FIFO
@@ -75,15 +69,34 @@ class Imem:
         self.iw = iw
 
     def clock(self, we, waddr, wdata, raddr):
-        self.rdata = self.mem[raddr]  # read-before-write
-        if we:
+        # read-before-write; past the end an address reads 0 (nop) and a write does nothing
+        self.rdata = self.mem[raddr] if raddr < len(self.mem) else 0
+        if we and waddr < len(self.mem):
             self.mem[waddr] = bits(wdata, self.iw)
+
+
+# --------------------------------------------------------------- DMEM
+class Dmem:
+    """Combinational read, one write per cycle, no reset. The host has priority."""
+
+    def __init__(self, depth):
+        self.depth = depth
+        self.mem = [None] * depth
+
+    def rdata(self, addr):
+        return self.mem[addr % self.depth]
+
+    def clock(self, we, addr, wdata):
+        if we:
+            self.mem[addr % self.depth] = wdata & 0xFF
 
 
 # --------------------------------------------------------------- pins
 class Pins:
+    """pe_pins and its pe_sync (docs/spec/blocks.md Section 7)."""
+
     def __init__(self, cfg: Config):
-        self.cfg = cfg
+        self.n = cfg.num_pins
         self.m = (1 << cfg.num_pins) - 1
         self.out_r, self.oe_r, self.owner_err = self.m, 0, 0
         self.s1 = self.s2 = 0
@@ -98,28 +111,42 @@ class Pins:
     def pad_oe(self, od):
         return ((od & ~self.out_r) | (~od & self.oe_r)) & self.m
 
-    def own_mask(self, owner, ctx):
-        """Bit i set if pin i belongs to `ctx`. Branch-free (no per-pin `if`),
-        so the symbolic equivalence proof does not fork once per pin."""
-        w = self.cfg.ctx_w
-        return sum(is_zero(bits(owner >> (i * w), w) ^ ctx, w) << i for i in range(self.cfg.num_pins))
-
-    def clock(self, rst, wr_en, wr_ctx, wr_mask, wr_val, oe_en, oe_mask, oe_val, owner, clr, pad_in):
+    def clock(self, rst, c, t, r, tx_busy, rx_busy, owner, clr, pad_in):
+        """c, t, r: (wm, wv, om, ov) of the CTRL, TXP and RXP ports."""
         if rst:
             self.out_r, self.oe_r, self.owner_err = self.m, 0, 0
             self.s1 = self.s2 = 0
             return
-        own = self.own_mask(owner, wr_ctx)
-        wh = (wr_mask & own) if wr_en else 0
-        oh = (oe_mask & own) if oe_en else 0
-        denied = (wr_en and (wr_mask & ~own & self.m)) or (oe_en and (oe_mask & ~own & self.m))
-        self.out_r = (self.out_r & ~wh) | (wr_val & wh)
-        self.oe_r = (self.oe_r & ~oh) | (oe_val & oh)
+        own_t = own_r = ok_c = 0
+        for i in range(self.n):
+            o = (owner >> (2 * i)) & 3
+            b = 1 << i
+            if o == 1:
+                own_t |= b
+                if not tx_busy:
+                    ok_c |= b
+            elif o == 2:
+                own_r |= b
+                if not rx_busy:
+                    ok_c |= b
+            else:
+                ok_c |= b
+        t_wh, t_oh = t[0] & own_t, t[2] & own_t
+        r_wh = r[0] & own_r
+        c_wh = c[0] & ok_c & ~t_wh & ~r_wh
+        c_oh = c[2] & ok_c & ~t_oh
+        wr_hit = t_wh | r_wh | c_wh
+        wr_val = (t[1] & t_wh) | (r[1] & r_wh) | (c[1] & c_wh)
+        oe_hit = t_oh | c_oh
+        oe_val = (t[3] & t_oh) | (c[3] & c_oh)
+        denied = (t[0] & ~own_t) or (t[2] & ~own_t) or (r[0] & ~own_r) or (c[0] & ~ok_c) or (c[2] & ~ok_c)
+        self.out_r = ((self.out_r & ~wr_hit) | wr_val) & self.m
+        self.oe_r = ((self.oe_r & ~oe_hit) | oe_val) & self.m
         if denied:
             self.owner_err = 1
         elif clr:
             self.owner_err = 0
-        self.s1, self.s2 = bits(pad_in, self.cfg.num_pins), self.s1
+        self.s1, self.s2 = pad_in & self.m, self.s1
 
 
 # --------------------------------------------------------------- vote
@@ -163,45 +190,46 @@ class Vote:
         self.done = done
 
 
-# ------------------------------------------------------------ context
-STATE = ("pc", "ctr0", "ctr1", "osr", "osr_cnt", "isr", "c", "to")
+# ---------------------------------------------------------------- CRC
+class Crc:
+    """pe_crc (docs/spec/blocks.md Section 5a)."""
 
+    def __init__(self):
+        self.src = self.app = self.c_skip = self.poly = 0
+        self.crc = self.skip = self.sent = 0
 
-class Context:
-    def __init__(self, cfg: Config):
-        self.cfg = cfg
-        self.reset()
+    @property
+    def app_ok(self):
+        return int(self.app and not self.sent)
 
-    def reset(self):
-        for k in STATE:
-            setattr(self, k, 0)
-        self.stall = 0
+    @property
+    def value(self):
+        """The word TX sends: ~CRC."""
+        return ~self.crc & 0xFFFF
 
-    def ready(self, run, vote_busy):
-        return int(bool(run) and self.stall == 0 and not vote_busy)
+    def read(self, idx):
+        return self.crc if idx == 0 else (self.sent if idx == 1 else 0)
 
-    def state(self):
-        return {k: getattr(self, k) for k in STATE}
-
-    def clock(self, rst, restart, start_pc, shift_msb, we, nxt, vote_done, vote_bit):
+    def clock(self, rst, cfg_we, cfg_idx, cfg_data, tx_v, tx_bit, rx_v, rx_bit, sent_set):
         if rst:
-            self.reset()
+            self.__init__()
             return
-        if restart:
-            self.reset()
-            self.pc = start_pc
-            self.stall = 1
-            return
-        sr = self.cfg.sr_w
-        isr_vote = bits((self.isr << 1) | vote_bit, sr) if shift_msb else (vote_bit << (sr - 1)) | (self.isr >> 1)
-        if we:
-            for k in STATE:
-                setattr(self, k, nxt[k + "_n"])
-            self.stall = nxt["stall_n"]
-        elif self.stall:
-            self.stall -= 1
-        if vote_done:
-            self.isr, self.c = isr_vote, vote_bit
+        if sent_set:
+            self.sent = 1
+        v = (self.src == 1 and tx_v) or (self.src == 2 and rx_v)
+        b = tx_bit if self.src == 1 else rx_bit
+        if v:
+            if self.skip:
+                self.skip -= 1
+            else:
+                self.crc = ((self.crc << 1) ^ (self.poly if ((self.crc >> 15) ^ b) & 1 else 0)) & 0xFFFF
+        if cfg_we:
+            if cfg_idx == 0:
+                self.src, self.app, self.c_skip = cfg_data & 3, (cfg_data >> 2) & 1, cfg_data >> 8
+            elif cfg_idx == 1:
+                self.poly = cfg_data
+            elif cfg_idx == 2:
+                self.crc, self.skip, self.sent = cfg_data, self.c_skip, 0
 
 
 # ---------------------------------------------------------- host interface
@@ -252,72 +280,56 @@ class HostIf:
 
 # ------------------------------------------------------------ registers
 A_ID, A_VERSION, A_RUN, A_RESTART, A_STATUS, A_ERR_CLR, A_IRQ_EN, A_FIFO_CNT = range(8)
-A_TXF, A_RXF, A_IMADDR, A_PIN_IN = 0x08, 0x09, 0x0A, 0x0B
-A_IMDATA, A_PIN_OD, A_OWNER, A_CTX0 = 0x10, 0x14, 0x18, 0x20
-
-
-def write_vec(vec, width, base, addr, wdata):
-    """Byte-addressed packed vector at `base` (byte i at base+i), like the
-    per-bit loops in pe_regs.v."""
-    i = addr - base
-    if 0 <= i and 8 * i < width:
-        for b in range(8 * i, min(8 * i + 8, width)):
-            vec = (vec & ~(1 << b)) | (((wdata >> (b - 8 * i)) & 1) << b)
-    return vec
-
-
-def read_vec(vec, width, base, addr):
-    i = addr - base
-    if 0 <= i and 8 * i < width:
-        return (vec >> (8 * i)) & ((1 << min(8, width - 8 * i)) - 1)
-    return None
+A_TXF, A_RXF, A_IMADDR, A_PIN_IN, A_PIN_IN_H, A_IMADDR_H, A_STATUS2, A_DOORBELL = range(8, 16)
+A_IMDATA, A_PIN_OD, A_OWNER, A_START_PC, A_PC, A_CSTAT = 0x10, 0x14, 0x18, 0x20, 0x22, 0x24
+A_DMADDR, A_DMDATA = 0x28, 0x29
 
 
 class Regs:
+    """pe_regs (docs/spec/blocks.md Section 9)."""
+
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.reset()
 
     def reset(self):
-        c = self.cfg
-        self.run = self.msb = 0
-        self.start_pc = [0] * c.num_ctx
-        self.vote_n = [bits(c.vote_n_rst, c.vote_n_w)] * c.num_ctx
-        self.vote_k = [bits(c.vote_k_rst, c.vote_n_w)] * c.num_ctx
-        self.vote_s = [bits(c.vote_s_rst, c.vote_s_w)] * c.num_ctx
-        self.owner = self.od = 0
+        self.run = self.start_pc = self.owner = self.od = 0
         self.imaddr = self.stage = self.irq_en = self.imem_err = 0
+        self.st2 = self.dm_addr = 0
 
-    def comb(self, h, st):
-        """h: host comb (r_addr, r_wdata, r_we, r_re); st: status inputs.
-        Returns the register file's combinational outputs."""
-        c = self.cfg
+    def comb(self, h):
+        """h: the host interface's combinational outputs."""
         a, wd, we, re = h["r_addr"], h["r_wdata"], h["r_we"], h["r_re"]
-        any_run = int(self.run != 0)
-        commit = we and a == A_IMDATA + c.nb - 1
-        last = 8 * (c.nb - 1)
-        im_wdata = (self.stage & ((1 << last) - 1)) | (bits(wd, c.iw - last) << last)
-        any_err = st["txf_overrun"] | st["rxf_overrun"] | st["owner_err"] | self.imem_err
-        irq = int(bool((self.irq_en & 1 and not st["rxf_empty"]) or (self.irq_en & 2 and not st["txf_full"])
-                       or (self.irq_en & 4 and any_err)))
         errclr = we and a == A_ERR_CLR
+        commit = we and a == A_IMDATA + 3
+        dm_acc = (we or re) and a == A_DMDATA
         return dict(
-            r_rdata=self.read(a, st), irq=irq,
-            im_we=int(bool(commit and not any_run)), im_commit=int(bool(commit)), im_waddr=self.imaddr,
-            im_wdata=im_wdata,
-            txf_wr=int(bool(we and a == A_TXF)), txf_wdata=bits(wd, c.data_w),
+            im_commit=int(bool(commit)), im_we=int(bool(commit and not self.run)), im_waddr=self.imaddr,
+            im_wdata=(wd << 24) | self.stage,
+            txf_wr=int(bool(we and a == A_TXF)), txf_wdata=wd,
             rxf_rd=int(bool(re and a == A_RXF)),
             txf_clr=int(bool(errclr and wd & 0x10)), rxf_clr=int(bool(errclr and wd & 0x20)),
             owner_clr=int(bool(errclr and wd & 0x40)),
-            restart=bits(wd, c.num_ctx) if (we and a == A_RESTART) else 0,
+            restart=int(bool(we and a == A_RESTART and wd & 1)),
+            db_set=int(bool(we and a == A_DOORBELL)),
+            rx_ovr_clr=int(bool(we and a == A_STATUS2 and wd & 4)),
+            dm_acc=int(bool(dm_acc)), dm_we=int(bool(we and a == A_DMDATA)), dm_addr=self.dm_addr, dm_wdata=wd,
         )
 
+    def status2(self, rx_overrun):
+        return (self.st2 & 0x03) | (rx_overrun << 2) | (self.st2 & 0x18)
+
+    def irq(self, st):
+        any_err = (st["txf_overrun"] or st["rxf_overrun"] or st["owner_err"] or self.imem_err
+                   or (self.status2(st["rx_overrun"]) & 0xF))
+        return int(bool((self.irq_en & 1 and not st["rxf_empty"]) or (self.irq_en & 2 and not st["txf_full"])
+                        or (self.irq_en & 4 and any_err) or (self.irq_en & 8 and self.st2 & 0x10)))
+
     def read(self, a, st):
-        c = self.cfg
         if a == A_ID:
-            return c.chip_id
+            return self.cfg.chip_id
         if a == A_VERSION:
-            return c.version
+            return self.cfg.version
         if a == A_RUN:
             return self.run
         if a == A_STATUS:
@@ -327,70 +339,75 @@ class Regs:
         if a == A_IRQ_EN:
             return self.irq_en
         if a == A_FIFO_CNT:
-            cw4 = min(c.fifo_cw, 4)
-            return bits(st["txf_count"], cw4) | bits(st["rxf_count"], cw4) << 4
+            return (st["txf_count"] & 0xF) | (st["rxf_count"] & 0xF) << 4
         if a == A_RXF:
             return st["rxf_rdata"]
         if a == A_IMADDR:
-            return self.imaddr
-        for vec, w, base in ((st["pin_in"], c.num_pins, A_PIN_IN), (self.od, c.num_pins, A_PIN_OD),
-                             (self.owner, c.num_pins * c.ctx_w, A_OWNER)):
-            r = read_vec(vec, w, base, a)
-            if r is not None:
-                return r
-        for k in range(c.num_ctx):
-            off = a - (A_CTX0 + 8 * k)
-            if off == 0:
-                return self.start_pc[k]
-            if off == 1:
-                return (self.msb >> k) & 1
-            if off == 2:
-                return self.vote_n[k]
-            if off == 3:
-                return self.vote_k[k]
-            if off in (4, 5):
-                return read_vec(self.vote_s[k], c.vote_s_w, A_CTX0 + 8 * k + 4, a) or 0
-            if off == 6:
-                return st["ctx_pc"][k]
-            if off == 7:
-                return (st["ready"][k] | st["vote_busy"][k] << 1 | st["c"][k] << 2 | st["to"][k] << 3
-                        | ((self.run >> k) & 1) << 4)
+            return self.imaddr & 0xFF
+        if a == A_IMADDR_H:
+            return self.imaddr >> 8
+        if a == A_PIN_IN:
+            return st["pin_in"] & 0xFF
+        if a == A_PIN_IN_H:
+            return st["pin_in"] >> 8
+        if a == A_STATUS2:
+            return self.status2(st["rx_overrun"])
+        if A_PIN_OD <= a <= A_PIN_OD + 1:
+            return (self.od >> (8 * (a - A_PIN_OD))) & 0xFF
+        if A_OWNER <= a <= A_OWNER + 3:
+            return (self.owner >> (8 * (a - A_OWNER))) & 0xFF
+        if A_START_PC <= a <= A_START_PC + 1:
+            return (self.start_pc >> (8 * (a - A_START_PC))) & 0xFF
+        if A_PC <= a <= A_PC + 1:
+            return (st["pc"] >> (8 * (a - A_PC))) & 0xFF
+        if a == A_CSTAT:
+            return (self.run | st["blocked"] << 1 | st["z"] << 2 | st["c"] << 3 | st["to"] << 4
+                    | st["etx"] << 5 | st["erx"] << 6 | st["db"] << 7)
+        if a == A_DMADDR:
+            return self.dm_addr
+        if a == A_DMDATA:
+            return st["dm_rdata"]
         return 0
 
-    def clock(self, rst, h, rc):
-        """h: host comb, rc: this block's comb outputs (computed this cycle)."""
+    def clock(self, rst, h, rc, ill, stk, underrun, ctrl_irq):
         if rst:
             self.reset()
             return
         c = self.cfg
         a, wd, we = h["r_addr"], h["r_wdata"], h["r_we"]
-        any_run = self.run != 0
+        run = self.run
         if we:
             if a == A_RUN:
-                self.run = bits(wd, c.num_ctx)
-            if a == A_IRQ_EN:
-                self.irq_en = wd & 7
-            self.stage = write_vec(self.stage, c.iw, A_IMDATA, a, wd)
-            self.od = write_vec(self.od, c.num_pins, A_PIN_OD, a, wd)
-            self.owner = write_vec(self.owner, c.num_pins * c.ctx_w, A_OWNER, a, wd)
-            for k in range(c.num_ctx):
-                off = a - (A_CTX0 + 8 * k)
-                if off == 0:
-                    self.start_pc[k] = bits(wd, c.aw)
-                elif off == 1:
-                    self.msb = (self.msb & ~(1 << k)) | ((wd & 1) << k)
-                elif off == 2:
-                    self.vote_n = self.vote_n[:k] + [bits(wd, c.vote_n_w)] + self.vote_n[k + 1:]
-                elif off == 3:
-                    self.vote_k = self.vote_k[:k] + [bits(wd, c.vote_n_w)] + self.vote_k[k + 1:]
-                elif off in (4, 5):
-                    v = write_vec(self.vote_s[k], c.vote_s_w, A_CTX0 + 8 * k + 4, a, wd)
-                    self.vote_s = self.vote_s[:k] + [v] + self.vote_s[k + 1:]
+                self.run = wd & 1
+            elif a == A_IRQ_EN:
+                self.irq_en = wd & 0xF
+            elif A_IMDATA <= a < A_IMDATA + 3:
+                sh = 8 * (a - A_IMDATA)
+                self.stage = (self.stage & ~(0xFF << sh)) | (wd << sh)
+            elif A_PIN_OD <= a <= A_PIN_OD + 1:
+                sh = 8 * (a - A_PIN_OD)
+                self.od = bits((self.od & ~(0xFF << sh)) | (wd << sh), c.num_pins)
+            elif A_OWNER <= a <= A_OWNER + 3:
+                sh = 8 * (a - A_OWNER)
+                self.owner = bits((self.owner & ~(0xFF << sh)) | (wd << sh), 2 * c.num_pins)
+            elif A_START_PC <= a <= A_START_PC + 1:
+                sh = 8 * (a - A_START_PC)
+                self.start_pc = bits((self.start_pc & ~(0xFF << sh)) | (wd << sh), c.aw)
         if we and a == A_IMADDR:
-            self.imaddr = bits(wd, c.aw)
+            self.imaddr = bits((self.imaddr & ~0xFF) | wd, c.aw)
+        elif we and a == A_IMADDR_H:
+            self.imaddr = bits((self.imaddr & 0xFF) | (wd << 8), c.aw)
         elif rc["im_we"]:
             self.imaddr = bits(self.imaddr + 1, c.aw)
-        if rc["im_commit"] and any_run:
+        if rc["im_commit"] and run:
             self.imem_err = 1
         elif we and a == A_ERR_CLR and wd & 0x80:
             self.imem_err = 0
+        wc = wd if (we and a == A_STATUS2) else 0
+        st2 = self.st2
+        self.st2 = ((ill | (st2 & 1 & ~wc)) & 1) | ((stk << 1 | (st2 & 2 & ~wc)) & 2) \
+            | ((underrun << 3 | (st2 & 8 & ~wc)) & 8) | ((ctrl_irq << 4 | (st2 & 0x10 & ~wc)) & 0x10)
+        if we and a == A_DMADDR:
+            self.dm_addr = wd
+        elif rc["dm_acc"]:
+            self.dm_addr = (self.dm_addr + 1) & 0xFF

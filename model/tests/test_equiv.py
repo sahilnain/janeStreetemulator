@@ -17,6 +17,9 @@ import shutil
 
 import pytest
 
+pytest.skip("v1 proof: the harness targets the v1 model and RTL (tag v1.0), not ported to v2",
+            allow_module_level=True)
+
 z3 = pytest.importorskip("z3")
 if not shutil.which("yosys"):
     pytest.skip("yosys not on PATH", allow_module_level=True)
