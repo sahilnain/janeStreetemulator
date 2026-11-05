@@ -37,14 +37,23 @@ module pe_imem #(
 
   reg [IW-1:0] mem[0:DEPTH-1];
 
+  // AW can address more words than DEPTH (160 words, 8 bits). An address past the end reads
+  // as 0 (nop) and a write there does nothing, so a runaway pc behaves the same on every chip.
+  /* verilator lint_off UNSIGNED */
+  /* verilator lint_off CMPCONST */
+  wire rd_in = (raddr < DEPTH);
+  wire wr_in = (waddr < DEPTH);
+  /* verilator lint_on CMPCONST */
+  /* verilator lint_on UNSIGNED */
+
   always @(posedge clk) begin
-    rdata <= mem[raddr];
+    rdata <= rd_in ? mem[raddr] : {IW{1'b0}};
   end
 
   generate
     if (IMPL == 0) begin : g_flop
       always @(posedge clk) begin
-        if (we) mem[waddr] <= wdata;
+        if (we && wr_in) mem[waddr] <= wdata;
       end
     end else begin : g_latch
       reg          we_q;
@@ -78,6 +87,7 @@ module pe_imem #(
       always @(posedge clk) if (f_past_valid) assert (mem[f_addr] == f_val);
       always @(posedge clk)
         if (f_past_valid && $past(raddr) == f_addr) assert (rdata == $past(f_val));
+      always @(posedge clk) if (f_past_valid && $past(raddr) >= DEPTH) assert (rdata == {IW{1'b0}});
 `endif
 
       genvar i;
@@ -113,6 +123,7 @@ module pe_imem #(
       always @(*) assert (mem[f_addr] == f_val);
       always @(posedge clk)
         if (f_past_valid && $past(raddr) == f_addr) assert (rdata == $past(f_val));
+      always @(posedge clk) if (f_past_valid && $past(raddr) >= DEPTH) assert (rdata == {IW{1'b0}});
     end
   endgenerate
 `endif

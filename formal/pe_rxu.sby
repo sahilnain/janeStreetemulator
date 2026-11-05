@@ -1,0 +1,28 @@
+# pe_rxu: window times for ALL B / FIRST, the received byte is exactly the
+# sampled bits in order for every source, no stale events, drive order,
+# RXRDY / overrun rules. Includes pe_vote's own properties.
+[tasks]
+p8 prf
+p16 prf
+cvr cvr
+
+[options]
+prf: mode prove
+prf: depth 4
+cvr: mode cover
+cvr: depth 60
+
+[engines]
+smtbmc yices
+
+[script]
+read -formal -DPE_RXU_TOP pe_rxu.v
+read -formal pe_vote.v
+p8: chparam -set NUM_PINS 8 pe_rxu
+p16: chparam -set NUM_PINS 16 pe_rxu
+cvr: chparam -set NUM_PINS 8 pe_rxu
+prep -top pe_rxu
+
+[files]
+../src/unit/pe_rxu.v
+../src/core/pe_vote.v

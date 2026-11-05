@@ -1,12 +1,12 @@
 # pe_fifo: count/pointer invariants, overrun semantics, and data integrity
 # (a solver-chosen write is tracked through the FIFO and must come out
-# unchanged and in order). Proved for DEPTH 4, 3 (not a power of 2) and 1.
+# unchanged and in order). Proved for DEPTH 8, 3 (not a power of 2) and 1.
 # The *_cover task shows the FIFO really fills, overruns and drains.
 [tasks]
-d4 prf
+d8 prf
 d3 prf
 d1 prf
-d4_cover cvr
+d8_cover cvr
 
 [options]
 prf: mode prove
@@ -19,8 +19,8 @@ smtbmc yices
 
 [script]
 read -formal -DPE_FIFO_TOP pe_fifo.v
-d4: chparam -set DEPTH 4 -set W 8 pe_fifo
-d4_cover: chparam -set DEPTH 4 -set W 8 pe_fifo
+d8: chparam -set DEPTH 8 -set W 8 pe_fifo
+d8_cover: chparam -set DEPTH 8 -set W 8 pe_fifo
 d3: chparam -set DEPTH 3 -set W 4 pe_fifo
 d1: chparam -set DEPTH 1 -set W 4 pe_fifo
 prep -top pe_fifo

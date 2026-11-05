@@ -1,0 +1,20 @@
+# pe_crc: register update for any POLY, SKIP, INIT load, sent flag.
+[tasks]
+prf
+cvr
+
+[options]
+prf: mode prove
+prf: depth 3
+cvr: mode cover
+cvr: depth 20
+
+[engines]
+smtbmc yices
+
+[script]
+read -formal -DPE_CRC_TOP pe_crc.v
+prep -top pe_crc
+
+[files]
+../src/unit/pe_crc.v

@@ -1,9 +1,8 @@
-# pe_decode (combinational): op flags one-hot, reserved opcodes -> illegal,
-# n in 1..16, fields from the documented bit positions. Exhaustive over all
-# instruction words.
+# pe_decode (combinational): every field is the documented slice, and exactly
+# the reserved opcodes are illegal. Exhaustive over all 32-bit words.
 [tasks]
-iw24
-iw32
+aw6
+aw10
 
 [options]
 mode prove
@@ -14,8 +13,8 @@ smtbmc yices
 
 [script]
 read -formal pe_decode.v
-iw24: chparam -set IW 24 -set AW 6 pe_decode
-iw32: chparam -set IW 32 -set AW 8 pe_decode
+aw6: chparam -set AW 6 pe_decode
+aw10: chparam -set AW 10 pe_decode
 prep -top pe_decode
 
 [files]

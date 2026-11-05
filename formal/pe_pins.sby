@@ -1,10 +1,10 @@
-# pe_pins: open-drain pins never drive high; a pin only changes on a write
-# by its owner; owner_err semantics; reset state. Includes pe_sync's own
-# properties for the input synchronisers.
+# pe_pins: open-drain never drives high; a pin only changes on a hit of an allowed
+# port; at most one port per pin; busy rule; owner_err semantics; reset state.
+# Includes pe_sync's own properties.
 [tasks]
-p8_c2
-p16_c3
-p4_c1
+p8
+p16
+p4
 
 [options]
 mode prove
@@ -16,9 +16,9 @@ smtbmc yices
 [script]
 read -formal -DPE_PINS_TOP pe_pins.v
 read -formal pe_sync.v
-p8_c2: chparam -set NUM_PINS 8 -set NUM_CTX 2 pe_pins
-p16_c3: chparam -set NUM_PINS 16 -set NUM_CTX 3 pe_pins
-p4_c1: chparam -set NUM_PINS 4 -set NUM_CTX 1 pe_pins
+p8: chparam -set NUM_PINS 8 pe_pins
+p16: chparam -set NUM_PINS 16 pe_pins
+p4: chparam -set NUM_PINS 4 pe_pins
 prep -top pe_pins
 
 [files]

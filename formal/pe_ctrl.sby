@@ -1,0 +1,29 @@
+# pe_ctrl: for ANY program and environment: no effect without an issue, issue
+# spacing, blocked instructions have no side effects, FIFO / DMEM / start rules,
+# reserved opcodes, stack overflow / underflow and LIFO order, register file
+# integrity, stall counting, restart.
+[tasks]
+default prf
+d1024_p16_s2 prf
+cvr cvr
+
+[options]
+prf: mode prove
+prf: depth 4
+cvr: mode cover
+cvr: depth 12
+
+[engines]
+smtbmc yices
+
+[script]
+read -formal -DPE_CTRL_TOP pe_ctrl.v
+read -formal pe_decode.v
+default: chparam -set IMEM_DEPTH 64 -set NUM_PINS 8 -set STACK_DEPTH 4 pe_ctrl
+d1024_p16_s2: chparam -set IMEM_DEPTH 1024 -set NUM_PINS 16 -set STACK_DEPTH 2 pe_ctrl
+cvr: chparam -set IMEM_DEPTH 64 -set NUM_PINS 8 -set STACK_DEPTH 2 pe_ctrl
+prep -top pe_ctrl
+
+[files]
+../src/core/pe_ctrl.v
+../src/core/pe_decode.v

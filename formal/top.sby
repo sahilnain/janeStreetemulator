@@ -1,26 +1,25 @@
 # tt_um_sahil_protoemu: the whole chip with every module's properties, all
 # internal contracts asserted (only the host-bus protocol on the pins is
-# assumed). Chip-level (unbounded): reserved outputs stay 0; pins are only
-# written by running contexts; IMEM never written while running; no pin
-# drives until a context has been started. The cover task finds traces
-# that start a context and drive a pin using only the host-bus pins.
+# assumed). See the header of the formal block in the top level.
 [tasks]
 prf
 cvr
 
 [options]
 prf: mode prove
-prf: depth 14
+prf: depth 6
 cvr: mode cover
 cvr: depth 40
 
 [engines]
-smtbmc yices
+prf: smtbmc bitwuzla
+cvr: smtbmc yices
 
 [script]
+read -define PE_CHIP_FORMAL
 read -formal tt_um_sahil_protoemu.v
-read -formal pe_host_if.v pe_regs.v pe_imem.v pe_fifo.v pe_sync.v pe_pins.v
-read -formal pe_core.v pe_ctx.v pe_decode.v pe_exec.v pe_vote.v
+read -formal pe_host_if.v pe_regs.v pe_imem.v pe_dmem.v pe_fifo.v pe_sync.v pe_pins.v
+read -formal pe_ctrl.v pe_decode.v pe_vote.v pe_txu.v pe_rxu.v pe_det.v pe_crc.v
 prep -top tt_um_sahil_protoemu
 
 [files]
@@ -28,11 +27,14 @@ prep -top tt_um_sahil_protoemu
 ../src/host/pe_host_if.v
 ../src/host/pe_regs.v
 ../src/mem/pe_imem.v
+../src/mem/pe_dmem.v
 ../src/mem/pe_fifo.v
 ../src/io/pe_sync.v
 ../src/io/pe_pins.v
-../src/core/pe_core.v
-../src/core/pe_ctx.v
+../src/core/pe_ctrl.v
 ../src/core/pe_decode.v
-../src/core/pe_exec.v
 ../src/core/pe_vote.v
+../src/unit/pe_txu.v
+../src/unit/pe_rxu.v
+../src/unit/pe_det.v
+../src/unit/pe_crc.v

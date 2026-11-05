@@ -26,7 +26,7 @@ maj: read -formal -DPE_VOTE_TOP -DPE_VOTE_MAJORITY pe_vote.v
 small_majority: chparam -set NUM_PINS 4 -set N_W 3 -set S_W 3 pe_vote
 mid_majority: chparam -set NUM_PINS 4 -set N_W 4 -set S_W 3 pe_vote
 small: chparam -set NUM_PINS 4 -set N_W 3 -set S_W 3 pe_vote
-default: chparam -set NUM_PINS 8 -set N_W 4 -set S_W 12 pe_vote
+default: chparam -set NUM_PINS 8 -set N_W 4 -set S_W 16 pe_vote
 cover: chparam -set NUM_PINS 4 -set N_W 4 -set S_W 2 pe_vote
 prep -top pe_vote
 

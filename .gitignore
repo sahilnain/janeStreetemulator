@@ -19,3 +19,5 @@ test/common/__pycache__/
 formal/*/
 __pycache__/
 .pytest_cache/
+test/cov/
+test/coverage.dat

@@ -4,10 +4,11 @@
 # a free signal toggling every solver step, so latch open/close timing is
 # modelled exactly (depth counts half-cycles there).
 [tasks]
-d64
+d128
 d16_w32
+d160
 latch_d16 latch
-latch_d64 latch
+latch_d128 latch
 
 [options]
 mode prove
@@ -20,10 +21,11 @@ smtbmc yices
 
 [script]
 read -formal pe_imem.v
-d64: chparam -set IW 24 -set DEPTH 64 -set IMPL 0 pe_imem
+d128: chparam -set IW 32 -set DEPTH 128 -set IMPL 0 pe_imem
 d16_w32: chparam -set IW 32 -set DEPTH 16 -set IMPL 0 pe_imem
-latch_d16: chparam -set IW 24 -set DEPTH 16 -set IMPL 1 pe_imem
-latch_d64: chparam -set IW 24 -set DEPTH 64 -set IMPL 1 pe_imem
+d160: chparam -set IW 32 -set DEPTH 160 -set IMPL 0 pe_imem
+latch_d16: chparam -set IW 32 -set DEPTH 16 -set IMPL 1 pe_imem
+latch_d128: chparam -set IW 32 -set DEPTH 128 -set IMPL 1 pe_imem
 prep -top pe_imem
 
 [files]

@@ -1,0 +1,29 @@
+# pe_det: fires exactly in the DUR-th qualifying cycle (ALL DUR), edge modes need
+# a real edge after arming, drive / check timing, arm-pending and AUTOARM rules.
+[tasks]
+etx prf
+erx prf
+erx_p16 prf
+cvr_etx cvr
+cvr_erx cvr
+
+[options]
+prf: mode prove
+prf: depth 4
+cvr: mode cover
+cvr: depth 30
+
+[engines]
+smtbmc yices
+
+[script]
+read -formal -DPE_DET_TOP pe_det.v
+etx: chparam -set KIND 0 -set NUM_PINS 8 pe_det
+erx: chparam -set KIND 1 -set NUM_PINS 8 pe_det
+erx_p16: chparam -set KIND 1 -set NUM_PINS 16 pe_det
+cvr_etx: chparam -set KIND 0 -set NUM_PINS 8 pe_det
+cvr_erx: chparam -set KIND 1 -set NUM_PINS 8 pe_det
+prep -top pe_det
+
+[files]
+../src/unit/pe_det.v

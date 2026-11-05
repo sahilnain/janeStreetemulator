@@ -1,0 +1,21 @@
+# pe_dmem: host priority, controller write dropped in a host cycle, data integrity
+# at a solver-chosen address (unbounded).
+[tasks]
+d256
+d64
+
+[options]
+mode prove
+depth 3
+
+[engines]
+smtbmc yices
+
+[script]
+read -formal pe_dmem.v
+d256: chparam -set DEPTH 256 pe_dmem
+d64: chparam -set DEPTH 64 pe_dmem
+prep -top pe_dmem
+
+[files]
+../src/mem/pe_dmem.v

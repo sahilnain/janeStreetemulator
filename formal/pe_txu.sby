@@ -1,0 +1,27 @@
+# pe_txu: cycle-exact timing for ALL B (D = S + 8B, ticks), bit order for all
+# modes, external clock and LEAD (SPI slave CPHA 1), stretch hold, busy protocol.
+[tasks]
+p8 prf
+p16 prf
+cvr cvr
+
+[options]
+prf: mode prove
+prf: depth 4
+cvr: mode cover
+cvr: depth 40
+
+[engines]
+p8: smtbmc bitwuzla
+p16: smtbmc yices
+cvr: smtbmc yices
+
+[script]
+read -formal -DPE_TXU_TOP pe_txu.v
+p8: chparam -set NUM_PINS 8 pe_txu
+p16: chparam -set NUM_PINS 16 pe_txu
+cvr: chparam -set NUM_PINS 8 pe_txu
+prep -top pe_txu
+
+[files]
+../src/unit/pe_txu.v
