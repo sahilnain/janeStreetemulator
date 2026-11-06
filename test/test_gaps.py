@@ -32,6 +32,9 @@ I2C
 13. test_i2c_slave_stretch   SCL is held low after each ACK while the firmware is busy.
 14. test_i2c_stretch_setup    the chip's release of SCL sets the rising edge: SDA is ready 250 ns before.
 15. test_i2c_general_call    address 0 is acknowledged, data at I2C_GC_MEM, with an IRQ.
+    test_i2c_filter_spikes   PIN_FILT rejects spikes of up to 3 cycles on SCL and SDA; without it they break.
+    test_i2c_bus_clear       SDA low at a request: clocks until released, a STOP, then the request.
+    test_i2c_bus_clear_gives_up  still low after nine clocks: status 4; the next request works.
 USB
 16. test_usb_device_suspend  CSTAT.ETX shows idle J; a SOF clears it; a resume does not disturb the
                              device, and the next transaction works.
@@ -597,3 +600,113 @@ async def test_usb_host_resume(dut):
         assert not int(dut.uio_oe.value) & ((1 << jp) | (1 << kp)), "released after the resume"
         await chip.bus.write(R.RUN, 0)
 
+
+
+# ---------------------------------------------------------------- I2C input filter and bus clear
+class SdaHolder:
+    """Holds SDA low; lets go on the SCL fall after n clocks. n = None: until `release` is set."""
+
+    def __init__(self, n=None):
+        self.n, self.release, self.seen, self.prev, self.held = n, False, 0, 1, True
+
+    def step(self, line, t):
+        c = (line >> SCL) & 1
+        self.seen += c and not self.prev
+        if self.release or (self.n is not None and self.prev and not c and self.seen >= self.n):
+            self.held = False
+        self.prev = c
+        return line & ~(1 << SDA) if self.held else line
+
+
+class Spikes:
+    """Flips a pin at the chip input only: a pulse of `width` cycles at random times."""
+
+    def __init__(self, pin, width, seed=5):
+        self.pin, self.width, self.left, self.next = pin, width, 0, 0
+        self.r = random.Random(seed)
+
+    def step(self, line, t):
+        if t >= self.next:
+            self.left, self.next = self.width, t + self.r.randint(self.width + 2, self.width + 10)
+        if self.left:
+            self.left -= 1
+            return line ^ (1 << self.pin)
+        return line
+
+
+def scl_rises(chip, t0):
+    tr = chip.trace(SCL, t0)
+    return sum(1 for x, y in zip(tr, tr[1:]) if y and not x)
+
+
+@cocotb.test()
+async def test_i2c_filter_spikes(dut):
+    """With PIN_FILT on, spikes of up to 3 cycles on either line change nothing.
+    With it off, spikes on SDA corrupt what the controller reads."""
+    for pin in (SCL, SDA):
+        for width in (1, 2, 3):
+            dev = i2c.I2cSlave(SCL, SDA, 0x50)
+            chip = await i2c_master_chip(dut, dev, B=126)
+            await chip.bus.write(R.PIN_FILT, 0xC0)
+            assert await chip.bus.read(R.PIN_FILT) == 0xC0
+            chip.devices.append(Spikes(pin, width))
+            data = [random.getrandbits(8) for _ in range(3)]
+            st, _ = await i2c_req(chip, 0x50, [0x10] + data)
+            assert st == 0 and dev.mem[0x10:0x13] == data, (pin, width, st, dev.mem[0x10:0x13])
+            st, got = await i2c_req(chip, 0x50, [0x10], 3)
+            assert st == 0 and got == data, (pin, width, st, got)
+            await chip.bus.write(R.RUN, 0)
+    # negative control: the same spikes on the same firmware, with the filter off. It is the read
+    # that shows it: a controller drives SCL itself, but it has to sample SDA from the target.
+    for width in (1, 2, 3):
+        dev = i2c.I2cSlave(SCL, SDA, 0x50)
+        chip = await i2c_master_chip(dut, dev, B=126)
+        data = [0x5A, 0xA5, 0x3C]
+        st, _ = await i2c_req(chip, 0x50, [0x10] + data)
+        assert st == 0 and dev.mem[0x10:0x13] == data, (width, st)
+        chip.devices.append(Spikes(SDA, width))
+        bad = False
+        try:
+            st, got = await i2c_req(chip, 0x50, [0x10], 3)
+            bad = st != 0 or got != data
+            dut._log.info(f"unfiltered, SDA spikes of {width}: status {st}, read {got}")
+        except AssertionError as e:
+            bad = True
+            dut._log.info(f"unfiltered, SDA spikes of {width}: {e}")
+        assert bad, f"{width}-cycle spikes must break an unfiltered input, or the test above shows nothing"
+        await chip.bus.write(R.RUN, 0)
+
+
+@cocotb.test()
+async def test_i2c_bus_clear(dut):
+    """UM10204 3.1.16: SDA low at a request: clocks until it is released, a STOP, then the request."""
+    for arb in (False, True):
+        for n in (0, 4, 8):
+            dev = i2c.I2cSlave(SCL, SDA, 0x50)
+            chip = await i2c_master_chip(dut, dev, B=126, arb=arb, stuck=300)
+            chip.devices.append(SdaHolder(n))
+            t0 = len(chip.samples)
+            st, _ = await i2c_req(chip, 0x50, [0x10, 0xA5])
+            assert st == 0 and dev.mem[0x10] == 0xA5, (arb, n, st, dev.mem[0x10])
+            # the clear clocks, the rise of its STOP, three bytes, the rise of the last STOP
+            assert scl_rises(chip, t0) == n + 1 + 1 + 27 + 1, (arb, n, scl_rises(chip, t0))
+            await chip.bus.write(R.RUN, 0)
+
+
+@cocotb.test()
+async def test_i2c_bus_clear_gives_up(dut):
+    """Still low after nine clocks: status 4, no START. The next request works once SDA is free."""
+    for arb in (False, True):
+        dev = i2c.I2cSlave(SCL, SDA, 0x50)
+        hold = SdaHolder()
+        chip = await i2c_master_chip(dut, dev, B=126, arb=arb, stuck=300)
+        chip.devices.append(hold)
+        t0 = len(chip.samples)
+        st, _ = await i2c_req(chip, 0x50, [0x10, 0xA5])
+        assert st == 4 and scl_rises(chip, t0) == 9, (arb, st, scl_rises(chip, t0))
+        assert dev.mem[0x10] == 0
+        hold.release = True
+        await ClockCycles(dut.clk, 100)
+        st, _ = await i2c_req(chip, 0x50, [0x10, 0xA5])
+        assert st == 0 and dev.mem[0x10] == 0xA5, (arb, st, dev.mem[0x10])
+        await chip.bus.write(R.RUN, 0)

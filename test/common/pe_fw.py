@@ -455,12 +455,18 @@ def spi_slave_words(bits=12, cpol=0, cpha=0, msb=1, sck=2, mosi=3, miso=4, cs=5)
 
 
 # ------------------------------------------------------------------ I2C
-def i2c_master(B=126, scl=6, sda=7, odly=None, sdly=2, addr10=False, arb=False, hs_B=None, master_code=0x08):
+def i2c_master(B=126, scl=6, sda=7, odly=None, sdly=2, addr10=False, arb=False, hs_B=None, master_code=0x08,
+               stuck=0xFFFF):
     """I2C master, DMEM-driven. Request: dmem[0] = 7-bit address, dmem[1] = n_write, dmem[2] =
     n_read, dmem[3..] = write data. The firmware sends START, address+W and the write bytes (if
     any), then, if n_read > 0, a repeated START, address+R and reads n_read bytes (ACK all but
     the last, NACK the last), then STOP. Result: dmem[0x80..] = read bytes, dmem[0x7F] = 0 ok /
-    1 address NACK / 2 data NACK / 3 arbitration lost; then host IRQ.
+    1 address NACK / 2 data NACK / 3 arbitration lost / 4 SDA stuck low; then host IRQ.
+    Bus clear (UM10204 3.1.16): if SDA is low when a request starts, the master sends up to nine
+    clock pulses. When SDA is released it sends a STOP and goes on with the request. If SDA is
+    still low after nine, it reports 4; the bus then needs a device reset or a power cycle.
+    SCL stuck low is not cleared (the standard gives the master no way to do so): the master
+    waits, as for clock stretching, until the host restarts it.
     SCL: TX unit clock (STRETCH); SDA: RX unit (drive for writes, sample for reads). Both pins
     open drain (host PIN_OD). Owners: SCL -> TX, SDA -> RX. START/STOP/ACK clocks are driven by
     the controller while the units are idle. Those phases use H = B/2, the same as a data bit, so
@@ -473,6 +479,8 @@ def i2c_master(B=126, scl=6, sda=7, odly=None, sdly=2, addr10=False, arb=False, 
              reads 0 after sending 1 has lost: it releases both lines at once, sends no
              STOP and reports 3. Written bits are clocked by firmware, not by the units, because
              a unit would keep driving the rest of its byte: B >= 48.
+             SDA low may be another master's transfer, so bus clear starts only if SDA low and SCL
+             high last, with no change, for `stuck` passes of a 3-instruction loop (about 8 ms).
     hs_B     HS mode: the master code at B (F/S speed), which nobody acknowledges, then a repeated
              START, and all data bytes at hs_B. ACK clocks stay at F/S length, which is legal."""
     assert not (arb and hs_B), "HS mode has one master after the master code"
@@ -481,13 +489,14 @@ def i2c_master(B=126, scl=6, sda=7, odly=None, sdly=2, addr10=False, arb=False, 
     if odly is None:
         odly = min(15, max(1, (hs_B or B) // 8))
     a = Asm()
-    a.ucfg(I.TX, I.TX_PINS, I.tx_pins(0, den=0, cpin=scl, cen=1))
-    a.ucfg(I.TX, I.TX_BIT, B)
-    a.ucfg(I.TX, I.TX_FRAME, 1)
-    a.ucfg(I.TX, I.TX_CLK, I.tx_clk(0, 0, stretch=1))
-    a.ucfg(I.RX, I.RX_FRAME, I.rx_frame(msb=1, hold=1))
-    a.ucfg(I.RX, I.RX_TICK, I.rx_tick(I.SRC_TXTICK, sdly=sdly))
-    a.ucfg(I.RX, I.RX_ODLY, odly)
+    if not arb:                                                 # with arb, firmware clocks every bit
+        a.ucfg(I.TX, I.TX_PINS, I.tx_pins(0, den=0, cpin=scl, cen=1))
+        a.ucfg(I.TX, I.TX_BIT, B)
+        a.ucfg(I.TX, I.TX_FRAME, 1)
+        a.ucfg(I.TX, I.TX_CLK, I.tx_clk(0, 0, stretch=1))
+        a.ucfg(I.RX, I.RX_FRAME, I.rx_frame(msb=1, hold=1))
+        a.ucfg(I.RX, I.RX_TICK, I.rx_tick(I.SRC_TXTICK, sdly=sdly))
+        a.ucfg(I.RX, I.RX_ODLY, odly)
     a.set(scl, I.SRC_1).set(sda, I.SRC_1)
     if arb:
         # The bus is busy from a START to its STOP, whatever the lines show in between (3.1.8).
@@ -496,8 +505,8 @@ def i2c_master(B=126, scl=6, sda=7, odly=None, sdly=2, addr10=False, arb=False, 
         a.ucfg(I.ERX_U, I.D_DUR, 1)
         a.evt(I.DET_RX, I.EV_ARM).mov(6, 0)
         a.L("idle").jmp("bev", I.ERX).jmp("idle", I.NDB)
-        a.cmp(6, 0).jmp("idle", I.NZ)
-        a.jpin(scl, 0, "idle").jpin(sda, 0, "idle").delay(H)     # bus free time
+        a.jpin(sda, 0, "low").cmp(6, 0).jmp("idle", I.NZ)
+        a.jpin(scl, 0, "idle").delay(H)                          # bus free time
         a.jmp("idle", I.ERX)
     else:
         a.L("idle").jmp("idle", I.NDB)
@@ -505,7 +514,9 @@ def i2c_master(B=126, scl=6, sda=7, odly=None, sdly=2, addr10=False, arb=False, 
     a.mov(1, 0).ld(4, 1, inc=1).ld(2, 1, inc=1).ld(7, 1, inc=1)    # addr, n_w, n_r
     if addr10:
         a.mov(0, 0x7E).ld(0, 0).shl(0, 8).or_(4, I.R(0))           # r4 = the 10-bit address
-    a.mov(3, 0x80).mov(6, 0)
+    a.mov(3, 0x80)
+    if not arb:                                                 # with arb, r6 is 0 to get here
+        a.mov(6, 0).jpin(sda, 0, "clr").L("go")
     if hs_B:
         a.ucfg(I.TX, I.TX_BIT, B)
         a.call("start").mov(0, master_code).call("wbyte")           # no acknowledge expected
@@ -553,13 +564,27 @@ def i2c_master(B=126, scl=6, sda=7, odly=None, sdly=2, addr10=False, arb=False, 
     a.mov(1, 0x7F).st(6, 1)
     a.host_irq()
     if arb:
-        # Our own START and STOP are behind us. After a lost arbitration the bus stays busy.
-        a.evt(I.DET_RX, I.EV_CLR).evt(I.DET_RX, I.EV_ARM)
-        a.cmp(6, 3).jmp("idle", I.Z).mov(6, 0)
-    a.jmp("idle")
-    if arb:
+        # After a lost arbitration the bus stays busy. Otherwise our own STOP is behind us, or SDA
+        # is still low: bev finds out which.
+        a.cmp(6, 3).jmp("lr", I.Z)
         a.L("bev").evt(I.DET_RX, I.EV_CLR).evt(I.DET_RX, I.EV_ARM)
         a.mov(6, 1).jpin(sda, 0, "idle").mov(6, 0).jmp("idle")
+        a.L("lr").evt(I.DET_RX, I.EV_CLR).evt(I.DET_RX, I.EV_ARM)
+    a.jmp("idle")
+    if arb:
+        # SDA low with a request waiting. It is stuck only if nothing moves for this long.
+        a.L("low").mov(5, stuck)
+        a.L("ll").jpin(sda, 1, "idle").jpin(scl, 0, "idle").djnz(5, "ll")
+    # Bus clear (3.1.16). The STOP resets a device that was in the middle of a byte.
+    a.L("clr").mov(5, 9)
+    a.L("cl").set(scl, I.SRC_0).delay(H).set(scl, I.SRC_1).wait(scl, 1).delay(H)
+    a.jpin(sda, 1, "cr").djnz(5, "cl")
+    a.L("stk").dbclr().mov(6, 4).jmp("rep")
+    a.L("cr").set(scl, I.SRC_0).delay(Q).call("stop")
+    if arb:
+        a.jmp("bev")                                            # back to idle: the request still waits
+    else:
+        a.jpin(sda, 1, "go").djnz(5, "cl").jmp("stk")           # the device drove the next bit low
     # START (also repeated START): SDA falls while SCL is high
     a.L("start").set(sda, I.SRC_1).delay(H).set(scl, I.SRC_1).wait(scl, 1)
     a.delay(H)
@@ -567,10 +592,9 @@ def i2c_master(B=126, scl=6, sda=7, odly=None, sdly=2, addr10=False, arb=False, 
     # phases above, another controller could have started and be in the middle of a bit.
     a.L("start1").set(sda, I.SRC_0)
     if arb:
-        a.call("hi2")                                           # another controller may go first
+        a.jmp("hi2")                                            # another controller may go first
     else:
-        a.delay(H)
-    a.set(scl, I.SRC_0).delay(Q).ret()
+        a.delay(H).set(scl, I.SRC_0).delay(Q).ret()
     # STOP: SDA rises while SCL is high
     a.L("stop").set(sda, I.SRC_0).delay(H).set(scl, I.SRC_1).wait(scl, 1)
     a.delay(H).set(sda, I.SRC_1).delay(H).ret()
@@ -580,7 +604,7 @@ def i2c_master(B=126, scl=6, sda=7, odly=None, sdly=2, addr10=False, arb=False, 
         a.L("wb").shl(0, 1).set(sda, I.SRC_C).delay(H - Q)     # C = the bit to send; low = H with the Q below
         a.call("hi1")
         a.jmp("wbk", I.NC).jpin(sda, 0, "wlost")               # sent 1, read 0: lost
-        a.L("wbk").call("hi2").set(scl, I.SRC_0).delay(Q).djnz(5, "wb")
+        a.L("wbk").call("hi2").djnz(5, "wb")
     else:
         a.L("wbyte").ucfg(I.RX, I.RX_PINS, I.rx_pins(sda, sda, 1))
         a.ustart(I.M_BOTH, I.R(0))
@@ -594,20 +618,21 @@ def i2c_master(B=126, scl=6, sda=7, odly=None, sdly=2, addr10=False, arb=False, 
     a.mov(5, 0).jpin(sda, 0, "wa").mov(5, 1)
     a.L("wa")
     if arb:
-        a.call("hi2")
-    a.set(scl, I.SRC_0).delay(Q).ret()
+        a.jmp("hi2")
+    else:
+        a.set(scl, I.SRC_0).delay(Q).ret()
     if arb:
         a.L("wlost").set(sda, I.SRC_1).set(scl, I.SRC_1).mov(5, 2).ret()
         # One SCL high phase in clock synchronization (3.1.7). hi1: it starts once SCL is really
         # high. SDA is read here: another controller may end the phase at any moment. hi2: it ends
-        # after H, or as soon as another controller pulls SCL low. Uses r6.
+        # after H, or as soon as another controller pulls SCL low, and then SCL goes low. Uses r6.
         a.L("hi1").set(scl, I.SRC_1).wait(scl, 1).ret()
-        a.L("hi2").mov(6, max(1, H // 2)).wait(scl, 0, rd=6).ret()
+        a.L("hi2").mov(6, max(1, H // 2)).wait(scl, 0, rd=6).set(scl, I.SRC_0).delay(Q).ret()
     # read into r0; r5 = 0 -> ACK, 1 -> NACK
     if arb:
         a.L("rbyte").set(sda, I.SRC_1).mov(0, 0).mov(1, 8)      # r1 is free here: writes are over
         a.L("rbit").delay(H - Q).call("hi1").shl(0, 1).jpin(sda, 0, "rb0").or_(0, 1)
-        a.L("rb0").call("hi2").set(scl, I.SRC_0).delay(Q).djnz(1, "rbit")
+        a.L("rb0").call("hi2").djnz(1, "rbit")
     else:
         a.L("rbyte").ucfg(I.RX, I.RX_PINS, I.rx_pins(sda))
         a.set(sda, I.SRC_1)
@@ -619,8 +644,8 @@ def i2c_master(B=126, scl=6, sda=7, odly=None, sdly=2, addr10=False, arb=False, 
     if arb:
         a.call("hi1").call("hi2")
     else:
-        a.set(scl, I.SRC_1).wait(scl, 1).delay(H)
-    a.set(scl, I.SRC_0).delay(Q).set(sda, I.SRC_1).ret()
+        a.set(scl, I.SRC_1).wait(scl, 1).delay(H).set(scl, I.SRC_0).delay(Q)
+    a.set(sda, I.SRC_1).ret()
     return a
 
 

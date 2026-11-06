@@ -558,3 +558,179 @@ def test_spikes_do_break_an_unfiltered_input():
     b.noise = spikes(SCL, 2, 2)
     out = run_ctrl(b, write_tx(ME, [0x10, 0xA5, 0x5A, 0xC3]), "FM")
     assert not all(out["acks"]) or nd.peek(0x10, 3) != [0xA5, 0x5A, 0xC3]
+
+
+# ------------------------------------------------------------------ bus clear, 3.1.16
+def holder(n=None):
+    """A device holding SDA low. It lets go on the SCL fall after n clocks; n = None: only when told
+    (`scr.release = True`). Holding starts with a falling edge while SCL is high, as a real one may."""
+    scr = Script(None)
+    scr.release = False
+
+    def gen():
+        yield {SDA: 0}
+        seen, p = 0, 1
+        while not scr.release:
+            c = (scr.line >> SCL) & 1
+            seen += c and not p
+            if n is not None and p and not c and seen >= n:
+                break
+            p = c
+            yield 1
+        yield {SDA: None}
+
+    scr.gen = gen()
+    return scr
+
+
+def rises(s):
+    return sum(1 for x, y in zip(s, s[1:]) if not (x >> SCL) & 1 and (y >> SCL) & 1)
+
+
+KIND = pytest.mark.parametrize("arb", (False, True), ids=("single", "multi"))
+SHORT = 300         # passes of the wait loop in the multi-master firmware, to keep these runs short
+
+
+@KIND
+@pytest.mark.parametrize("n", range(9))
+def test_bus_clear_device_lets_go(n, arb):
+    """SDA is low when a request starts: clock until it is released, send a STOP, do the request."""
+    t = Target(0x50)
+    b, nd = master(mode="FM", target=t, arb=arb, stuck=SHORT)
+    s0 = len(b.samples)
+    b.devices.append(holder(n))
+    b.run(50)
+    st, _ = request(b, nd, 0x50, [0x10, 0xA5])
+    assert st == 0 and t.mem[0x10] == 0xA5, (st, t.mem[0x10])
+    s = b.samples[s0:]
+    exp = expect_write(0x50, [0x10, 0xA5])
+    assert events(s)[-len(exp):] == exp
+    # the clear clocks, the rise of its STOP, three bytes, the rise of the last STOP. A device letting
+    # go on the fall after clock n is seen in the high phase of clock n + 1.
+    assert rises(s) == n + 1 + 1 + 27 + 1, rises(s)
+    assert not b.contention
+    assert not (v := timing(s, "FM", check=("low", "high", "fscl", "su_sto", "buf"))), v
+
+
+@KIND
+def test_bus_clear_gives_up_after_nine(arb):
+    """Still low after nine: report 4 and raise the IRQ. No START, nothing driven against the device.
+    When the device is reset, the next request works."""
+    t = Target(0x50)
+    b, nd = master(mode="FM", target=t, arb=arb, stuck=SHORT)
+    s0 = len(b.samples)
+    h = holder()
+    b.devices.append(h)
+    b.run(50)
+    st, _ = request(b, nd, 0x50, [0x10, 0xA5])
+    s = b.samples[s0:]
+    assert st == 4 and rises(s) == 9, (st, rises(s))
+    assert t.mem[0x10] == 0 and not b.contention
+    assert not all((x >> SDA) & 1 for x in s[-50:]), "SDA is still held"
+    st, _ = request(b, nd, 0x50, [0x10, 0xA5])
+    assert st == 4, "another request tries again"
+    h.release = True
+    b.run(100)
+    s0 = len(b.samples)
+    st, _ = request(b, nd, 0x50, [0x10, 0xA5])
+    assert st == 0 and t.mem[0x10] == 0xA5
+    assert events(b.samples[s0:]) == expect_write(0x50, [0x10, 0xA5])
+
+
+@KIND
+@pytest.mark.parametrize("bit", range(1, 8))
+def test_bus_clear_abandoned_read(bit, arb):
+    """The real case: another controller vanished in a read, with the target driving a 0. The target
+    lets go within nine clocks by itself, and the STOP resets it."""
+    t = Target(0x50)
+    b, nd = master(mode="FM", target=t, arb=arb, stuck=SHORT)
+    scr = Script(None)
+    other = Controller(scr, "FM")
+
+    def gen():
+        yield from other.start()
+        yield from other.wbyte((0x50 << 1) | 1)
+        for _ in range(bit):
+            yield from other._clock(1)
+        yield {SCL: None, SDA: None}
+
+    scr.gen = gen()
+    b.devices.append(scr)
+    b.until(lambda: scr.done, what="the other controller is gone")
+    b.run(20)
+    assert not (b.line >> SDA) & 1 and (b.line >> SCL) & 1, "the target holds SDA low"
+    s0 = len(b.samples)
+    st, _ = request(b, nd, 0x50, [0x10, 0xA5])
+    assert st == 0 and t.mem[0x10] == 0xA5, (st, t.mem[0x10])
+    assert rises(b.samples[s0:]) <= 9 + 1 + 27 + 1
+    assert not b.contention
+
+
+def test_bus_clear_not_under_a_run_of_zero_bits():
+    """A long run of zeros in another controller's transfer is not a stuck bus: SCL moves."""
+    t = Target(0x50)
+    b, nd = master(B=48, target=t, arb=True, stuck=SHORT)
+    scr = Script(None)
+    other = Controller(scr, "SM")
+
+    def gen():
+        yield from other.start()
+        yield from other.wbyte(0x50 << 1)
+        for d in (0x10, 0, 0, 0, 0, 0, 0, 0, 0):
+            yield from other.wbyte(d)
+        yield from other.stop()
+
+    scr.gen = gen()
+    s0 = len(b.samples)
+    b.devices.append(scr)
+    b.run(6000)
+    assert not scr.done
+    st, _ = request(b, nd, 0x50, [0x40, 0xCC])
+    assert st == 0 and t.mem[0x40] == 0xCC
+    assert scr.done
+    exp = expect_write(0x50, [0x10] + [0] * 8) + expect_write(0x50, [0x40, 0xCC])
+    assert events(b.samples[s0:]) == exp
+    assert not b.contention
+
+
+def test_bus_clear_not_in_a_short_pause():
+    """After a START, SDA low and SCL high may last a while. Up to the wait there are no clocks."""
+    t = Target(0x50)
+    b, nd = master(B=48, target=t, arb=True, stuck=SHORT)
+    scr = Script(None)
+    other = Controller(scr, "FM")
+
+    def gen():
+        yield 20                    # idle samples first, so the decoder sees the START edge
+        yield {SDA: 0}
+        yield 1200                  # under the wait below
+        yield {SCL: 0}
+        yield other.hold
+        yield from other.wbyte(0x50 << 1)
+        yield from other.wbyte(0x20)
+        yield from other.wbyte(0x77)
+        yield from other.stop()
+
+    scr.gen = gen()
+    s0 = len(b.samples)
+    b.devices.append(scr)
+    nd.dmem(0, [0x50, 2, 0, 0x40, 0xCC])
+    nd.doorbell()
+    fw_wait(b, nd, limit=3_000_000)
+    assert nd.peek(0x7F)[0] == 0 and t.mem[0x20] == 0x77 and t.mem[0x40] == 0xCC
+    assert not b.contention
+    assert events(b.samples[s0:]) == expect_write(0x50, [0x20, 0x77]) + expect_write(0x50, [0x40, 0xCC])
+
+
+def test_bus_clear_wait_of_the_multi_master():
+    """The default wait, as documented: about 8 ms of nothing moving, far over any bit time."""
+    t = Target(0x50)
+    b, nd = master(mode="FM", target=t, arb=True)
+    b.devices.append(holder())
+    b.run(50)
+    nd.dmem(0, [0x50, 2, 0, 0x10, 0xA5])
+    t0 = len(b.samples)
+    nd.doorbell()
+    b.until(lambda: not (b.line >> SCL) & 1, limit=2_000_000, what="the first clock")
+    ms = (len(b.samples) - t0) / 48_000
+    assert 4 < ms < 12, ms
