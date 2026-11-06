@@ -217,7 +217,7 @@ async def test_usb_both_speeds(dut):
             data = [random.getrandbits(8) for _ in range(8)]
             await usb_txn(e1, e2, usb.token(pid, 5, ep), F.PID_DATA0, data)
             await usb_wait(e2, f"{name} device")
-            r = await e1.bus.dmem_read(F.UH_RPID, 2)
+            r = await R.usb_result(e1.bus, 2)
             assert r == [F.PID_ACK, F.UH_OK], f"{name}: host result {r}"
             m = await e2.bus.dmem_read(0, 9)
             assert m[F.UD_EVENT] == F.EV_OUT and m[F.UD_TOKEN] == pid and m[F.UD_EP] == ep, m
@@ -225,7 +225,7 @@ async def test_usb_both_speeds(dut):
         # IN: data arrives at the host, the device sees the ACK
         await usb_txn(e1, e2, usb.token(F.PID_IN, 5, 2))
         await usb_wait(e2, f"{name} device IN")
-        r = await e1.bus.dmem_read(F.UH_RPID, 3)
+        r = await R.usb_result(e1.bus, 3)
         assert r == [F.PID_DATA1, F.UH_OK, 11], f"{name}: {r}"
         assert await e1.bus.dmem_read(0x81, 8) == back, name
         m = await e2.bus.dmem_read(0, 9)
@@ -233,7 +233,7 @@ async def test_usb_both_speeds(dut):
         # IN again: nothing ready -> NAK
         await ClockCycles(dut.clk, 300)
         await usb_txn(e1, e2, usb.token(F.PID_IN, 5, 2))
-        assert await e1.bus.dmem_read(F.UH_RPID, 2) == [F.PID_NAK, F.UH_OK], name
+        assert await R.usb_result(e1.bus, 2) == [F.PID_NAK, F.UH_OK], name
         # another address: no answer, the host times out
         await usb_txn(e1, e2, usb.token(F.PID_IN, 6, 2))
         assert (await e1.bus.dmem_read(F.UH_STATUS, 1))[0] == F.UH_TIMEOUT, name

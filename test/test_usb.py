@@ -345,7 +345,7 @@ async def host(dut, speed):
 
 async def go(chip, t, dpid=0, data=(), op=0):
     await chip.bus.write(R.RUN, 1)
-    await chip.bus.dmem_write(0, [op] + list(t) + [dpid, len(data)])
+    await chip.bus.dmem_write(0, [op] + list(t) + [dpid, len(data), 0])
     if data:
         await chip.bus.dmem_write(0x10, list(data))
     t0 = len(chip.samples)
@@ -381,7 +381,7 @@ async def test_host_out(dut):
             await peer.idle()
             assert await irq(chip), speed
             await stopped(chip)
-            r = await chip.bus.dmem_read(F.UH_RPID, 3)
+            r = await R.usb_result(chip.bus, 3)
             assert r == [F.PID_ACK, F.UH_OK, 1], r
 
 
@@ -403,7 +403,7 @@ async def test_host_in(dut):
             assert pk[0]["start"] + B >= 2 * B, "ACK too early"
             assert await irq(chip), speed
             await stopped(chip)
-            r = await chip.bus.dmem_read(F.UH_RPID, 3)
+            r = await R.usb_result(chip.bus, 3)
             assert r == [F.PID_DATA1, F.UH_OK, len(data) + 3], r
             assert await chip.bus.dmem_read(0x81, len(data)) == data if data else True
 

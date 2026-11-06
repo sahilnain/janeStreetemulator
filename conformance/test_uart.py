@@ -14,9 +14,9 @@ import random
 import pe_fw as F
 import pytest
 import sigrok
-from bench import A_STATUS, CLOCK_HZ, Script
+from bench import A_STATUS, CLOCK_HZ, OWN_TX, Bench, Script, owners
 from pe_model.blocks import A_IRQ_EN
-from uart_lib import boot, check_grid, drain, frame, play, rx_words, transfer, tx_words
+from uart_lib import boot, check_grid, drain, frame, fw, play, rx_words, transfer, tx_words
 
 PARITY = {F.PAR_NONE: "none", F.PAR_EVEN: "even", F.PAR_ODD: "odd", F.PAR_MARK: "one", F.PAR_SPACE: "zero"}
 STOP = {2: 1.0, 3: 1.5, 4: 2.0}
@@ -267,24 +267,52 @@ def test_rx_joins_a_running_stream(skip):
     out += [(1, 12.0)] + frame(0x3C)
     b.devices.append(Script(play(1, out, B, lead=20)))
     b.run(int(sum(n for _, n in out) * B) + 40)
-    got = transfer(b, nd, n_rx=len(list(_fifo(nd))), limit=4000) if False else []
+    got = []
     while not nd.chip.rxf.empty:
         got.append(nd.read(0x09))
     assert got and got[-1] == 0x3C, f"last byte {got}"
 
 
-def _fifo(nd):
-    return []
+def noisy(frames, glitch, B, where, at=0.2):
+    """Frames with a spike of `glitch` cycles, in the data bits or early in the start bit."""
+    seg = []
+    for f in frames:
+        for k, (lv, n) in enumerate(f):
+            if (where == "data" and 0 < k < len(f) - 1) or (where == "start" and k == 0):
+                at = 0.5 if where == "data" else at
+                first = n * at - glitch / B / 2
+                seg += [(lv, first), (lv ^ 1, glitch / B), (lv, n - first - glitch / B)]
+            else:
+                seg.append((lv, n))
+    return seg
 
 
 @pytest.mark.parametrize("glitch", (1, 2, 4, 8))
-def test_rx_short_noise_inside_a_bit(glitch):
-    """Noise shorter than the vote window, in the middle of each bit, does not change the data."""
+def test_rx_noise_in_data_bits(glitch):
+    """The vote of several samples per bit: a spike at mid-bit, where a 16550 would sample, is harmless."""
     B = 104
     b, nd = boot(B)
-    seg = []
-    for lv, n in frame(0xC5) + frame(0x3A):
-        half = (n - glitch / B) / 2
-        seg += [(lv, half), (lv ^ 1, glitch / B), (lv, half)]
-    b.devices.append(Script(play(1, seg, B, lead=20)))
+    b.devices.append(Script(play(1, noisy([frame(0xC5), frame(0x3A)], glitch, B, "data"), B, lead=20)))
+    assert transfer(b, nd, n_rx=2, limit=30 * B + 20000) == [0xC5, 0x3A]
+
+
+@pytest.mark.parametrize("glitch", (1, 2, 3))
+def test_rx_noise_in_start_bit_with_filter(glitch):
+    """With PIN_FILT on the RX pin, a spike of up to 3 cycles in the start bit changes nothing."""
+    B = 104
+    b = Bench(1)
+    nd = b.nodes[0]
+    nd.load(fw(B), own=owners(p0=OWN_TX), filt=0x02)
+    b.run(200)
+    b.devices.append(Script(play(1, noisy([frame(0xC5), frame(0x3A)], glitch, B, "start"), B, lead=20)))
+    assert transfer(b, nd, n_rx=2, limit=30 * B + 20000) == [0xC5, 0x3A]
+
+
+@pytest.mark.parametrize("at", (0.05, 0.1, 0.2, 0.3, 0.4, 0.45))
+def test_rx_noise_in_start_bit_away_from_the_middle(at):
+    """A 16550 only looks at the start bit at mid-bit, so a spike elsewhere does nothing to it. Here too,
+    even with no filter and a spike of 8 cycles at a bit time of 104."""
+    B = 104
+    b, nd = boot(B)
+    b.devices.append(Script(play(1, noisy([frame(0xC5), frame(0x3A)], 8, B, "start", at=at), B, lead=20)))
     assert transfer(b, nd, n_rx=2, limit=30 * B + 20000) == [0xC5, 0x3A]

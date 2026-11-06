@@ -39,6 +39,11 @@ CS_RUN, CS_BLOCKED, CS_Z, CS_C, CS_TO, CS_ETX, CS_ERX, CS_DB = (1 << i for i in 
 OWN_CTRL, OWN_TX, OWN_RX = 0, 1, 2
 
 
+async def usb_result(bus, n=3):
+    """pe_fw.usb_host: the first byte received, UH_STATUS, UH_RXLEN."""
+    return ([(await bus.dmem_read(0x80, 1))[0]] + await bus.dmem_read(7, 2))[:n]
+
+
 def owner_map(**pins):
     """owner_map(p0=OWN_TX, p3=OWN_RX) -> 16-bit PIN_OWNER value."""
     v = 0

@@ -305,6 +305,7 @@ v1 addresses are kept where the meaning is the same. Unmapped addresses read 0.
 | 0x0F | DOORBELL | W | any write sets the controller's DB flag |
 | 0x10–0x13 | IMEM_DATA | W | instruction staging, byte 0 = bits [7:0]; writing 0x13 commits. A commit while RUN = 1 is dropped and sets imem_err (as v1) |
 | 0x14–0x15 | PIN_OD | RW | open-drain enable, bit i = pin i |
+| 0x16–0x17 | PIN_FILT | RW | input filter enable, bit i = pin i. **Model only so far** (docs/protocol_conformance.md, I5): a filtered input takes a new level after 4 samples in a row have it, so it rejects pulses of up to 3 cycles and adds 4 cycles of input delay |
 | 0x18–0x1B | PIN_OWNER | RW | 2 bits per pin, pin 0 at bit 0 of 0x18 |
 | 0x20–0x21 | START_PC | RW | [9:0] |
 | 0x22–0x23 | PC | R | [9:0] |

@@ -267,19 +267,19 @@ async def usb_speed(dut, role, name, B, jp, kp):
         data = [random.getrandbits(8) for _ in range(8)]
         await usb_txn(a, b, usb.token(pid, 5, ep), F.PID_DATA0, data)
         await usb_wait(b, f"{name} device")
-        r = await a.bus.dmem_read(F.UH_RPID, 2)
+        r = await R.usb_result(a.bus, 2)
         assert r == [F.PID_ACK, F.UH_OK], f"{name}: host result {r}"
         m = await b.bus.dmem_read(0, 9)
         assert m[F.UD_EVENT] == F.EV_OUT and m[F.UD_TOKEN] == pid and m[F.UD_EP] == ep, m
         assert await b.bus.dmem_read(F.UD_RXDATA + 1, 8) == data, name
     await usb_txn(a, b, usb.token(F.PID_IN, 5, 2))
     await usb_wait(b, f"{name} device IN")
-    r = await a.bus.dmem_read(F.UH_RPID, 3)
+    r = await R.usb_result(a.bus, 3)
     assert r == [F.PID_DATA1, F.UH_OK, 11], f"{name}: {r}"
     assert await a.bus.dmem_read(0x81, 8) == back, name
     await ClockCycles(dut.clk, 300)
     await usb_txn(a, b, usb.token(F.PID_IN, 5, 2))
-    assert await a.bus.dmem_read(F.UH_RPID, 2) == [F.PID_NAK, F.UH_OK], name
+    assert await R.usb_result(a.bus, 2) == [F.PID_NAK, F.UH_OK], name
     await usb_txn(a, b, usb.token(F.PID_IN, 6, 2))
     assert (await a.bus.dmem_read(F.UH_STATUS, 1))[0] == F.UH_TIMEOUT, name
 
@@ -308,7 +308,7 @@ async def usb_suspend_resume(dut, role, name, B, jp, kp):
     data = [random.getrandbits(8) for _ in range(4)]
     await usb_txn(a, b, usb.token(F.PID_OUT, 5, 1), F.PID_DATA0, data)
     await usb_wait(b, f"{name}: device")
-    assert await a.bus.dmem_read(F.UH_RPID, 2) == [F.PID_ACK, F.UH_OK], name
+    assert await R.usb_result(a.bus, 2) == [F.PID_ACK, F.UH_OK], name
     assert await b.bus.dmem_read(F.UD_RXDATA + 1, 4) == data, name
 
 

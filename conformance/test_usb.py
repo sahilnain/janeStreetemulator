@@ -249,7 +249,7 @@ def test_device_waits_for_the_handshake_as_long_as_it_must(speed):
     send(b, speed, encode(token(IN, ADDR, EP)))
     b.until(lambda: nd.chip.pins.pad_oe(nd.chip.regs.od) != 0, limit=40 * B, what="device starts")
     b.until(lambda: nd.chip.pins.pad_oe(nd.chip.regs.od) == 0, limit=100 * 14 * B, what="device releases")
-    b.run(15 * B)
+    b.run(15 * B - 2)
     send(b, speed, encode([ACK]))
     b.run(10 * B)
     assert nd.peek(F.UD_EVENT)[0] == F.EV_IN_ACK, "timed out before 16 bit times"
@@ -679,7 +679,7 @@ def test_host_accepts_a_late_answer(speed):
     b, nd = host(speed)
     htok(nd, token(IN, ADDR, EP))
     wait_oe_off(b, nd, B, 60 * B)
-    b.run(15 * B)
+    b.run(15 * B - 2)                 # send() takes 2 cycles to its first K: it starts at 16 bit times
     send(b, speed, encode(data_packet(DATA1, [1, 2])))
     hwait(b, nd, limit=60 * B + 2000)
     assert nd.peek(F.UH_STATUS)[0] == F.UH_OK and nd.peek(0x81, 2) == [1, 2]
