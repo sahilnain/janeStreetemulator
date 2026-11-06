@@ -1,6 +1,6 @@
 # Protocol conformance
 
-This document records how the chip was checked against the industry standards for UART, SPI, I2C and USB, what was wrong, and how each problem was fixed. It runs on the Python model of the hardware, so no RTL is involved. Everything here is on the `test` branch.
+This document records how the chip was checked against the industry standards for UART, SPI, I2C and USB, what was wrong, and how each problem was fixed. The conformance tests run on the Python model of the hardware; Section 7 records what was then carried over to the RTL and checked there. Everything here is on the `test` branch.
 
 ## 1. Method
 
@@ -19,17 +19,17 @@ Earlier checks compared our own code with our own code: the model with the RTL, 
 
 **Why a pass means something:** `test_controls.py` feeds the decoders and checkers traces that are wrong on purpose (bad parity, bad stop bit, bad CRC, missing stuff bit, wrong SPI phase, I2C too fast), and they must flag them. Each bug in Section 6 was also seen failing before its fix.
 
-**Result:** 1,744 cases: 1,710 pass, 34 are skipped, none fail. The skips are not requirements: packets over the maximum size for low speed, SE0 glitches shorter than one clock period, UART bit times too short for the firmware, and SPI slave half periods under the documented limit.
+**Result:** 1,799 cases: 1,765 pass, 34 are skipped, none fail. The skips are not requirements: packets over the maximum size for low speed, SE0 glitches shorter than one clock period, UART bit times too short for the firmware, and SPI slave half periods under the documented limit.
 
 | File | Cases |
 |---|---|
 | `test_uart.py` | 745 |
 | `test_spi.py` | 486 |
-| `test_usb.py` | 255 |
-| `test_i2c.py` | 245 |
+| `test_usb.py` | 273 |
+| `test_i2c.py` | 282 |
 | `test_controls.py` | 13 |
 
-To run them: `docker build -t pe-conformance conformance`, then `conformance/run.sh -n 12`. A full run takes about 8 minutes.
+To run them: `docker build -t pe-conformance conformance`, then `conformance/run.sh -n 12`. A full run takes about 9 minutes.
 
 ## 2. UART
 
@@ -107,6 +107,7 @@ Reference: NXP UM10204 Rev. 7. The master runs at Standard mode (B = 478), Fast 
 | **Target's data ready before it releases a stretched SCL** | Table 11 notes 3, 4 | Slow SDA, fast SCL | Pass after I4 |
 | tVD;DAT, tVD;ACK | Table 11 | Measured | Pass |
 | **Spikes under 50 ns suppressed** | Table 10, tSP | 1–3 cycles on SCL and SDA, both roles | Pass after I5 |
+| **Bus clear: SDA stuck low** | 3.1.16 | Device letting go after 0–8 clocks, or never; a read abandoned at bits 1–7; another controller's transfer must not be clocked over | Pass after I7 |
 
 Measured top SCL speeds with the filter on: 99 kHz (SM), 364 kHz (FM), 889 kHz (FM+).
 
@@ -133,21 +134,25 @@ Reference: USB 2.0 chapters 7 and 8, low speed (B = 32) and full speed (B = 4). 
 | **SE0 in a transition is not an EOP** | 7.1.4 | Up to 210 ns at LS | Pass after U9 |
 | **Reset detected at 2.5 µs**; an EOP is not a reset | Table 7-14 | | Pass after U10 |
 | Clock tolerance: ±0.25% FS, ±1.5% LS | 7.1.11 | Full range | Pass |
-| Jitter: 20 ns FS, 141 ns LS | Tables 7-4, 7-5 | Random on each edge | Pass |
+| **Jitter: 20 ns FS, 141 ns LS, to the next transition** | Tables 7-4, 7-5 | Neighbouring edges differ by up to 1 cycle (FS), 7 cycles (LS); data and response limits checked | Pass after U14, U15 |
+| **Every byte stored and counted, whatever the phase of the last byte against the EOP** | | All 16 clock phases of a bit pair, 8 payloads, two transactions in a row, both roles | Pass after U13 |
 | **Next packet 2 bit times after the last** | 7.1.18.1 | Token after SOF, data after token | Pass after U12 |
 | Suspend after 3 ms, resume, then normal work | 7.1.7.6 | | Pass |
 | Control transfer, chip at both ends | 8.5.3 | sigrok `usb_request` reads the request | Pass |
 
-Measured response times, in bit times:
+Measured response times, in bit times. Each is the range over clock phase and random payloads, with and without jitter at the budget. An earlier version of this table gave a single phase, which hid the worst cases: see U15.
 
 | | Full speed | Low speed | Limit |
 |---|---|---|---|
-| Device ACK | 5.5 | 2.38 | 2 to 6.5 |
-| Device NAK or IN data | 6.25 | 2.53 | 2 to 6.5 |
-| Host ACK | 3.75 | 2.47 | 2 to 7.5 |
-| Host time-out | 17.5 | 17.4 | 16 to 18 |
+| Device ACK | 4.25–6.0 | 2.22–2.53 | 2 to 6.5 |
+| Device NAK | 6.25–6.5 | 2.53–2.75 | 2 to 6.5 |
+| Device IN data | 6.25–6.5 | 2.53–2.75 | 2 to 6.5 |
+| Host ACK | 3.75–6.75 | 2.47–2.81 | 2 to 7.5 |
+| Host time-out (not swept) | 17.5 | 17.4 | 16 to 18 |
 
-The firmware still fits IMEM: 156 and 158 words for the device (FS, LS), 156 and 157 for the host, out of 160.
+Device NAK and IN data at full speed reach the limit exactly, with no margin.
+
+The firmware still fits IMEM, out of 160 words: device 160 (FS) and 159 (LS), host 158 and 155. **The full-speed device has no spare word left.**
 
 ## 6. Bugs and solutions
 
@@ -170,6 +175,7 @@ All of these passed the old tests, because those tests shared the firmware's ass
 | I4 | The target released stretched SCL 250 ns after its data | On a bus with slow rise times SDA was not yet valid | Wait tr(max) + tSU;DAT = 1250 ns, as Table 11 note 4 says | Firmware |
 | I5 | Inputs had no spike filter | A 50 ns spike on SCL or SDA was taken as a clock or as a START or STOP | New `PIN_FILT` register: a new level must be seen on 4 samples in a row. This rejects 3 samples, the most a 49 ns pulse can touch at 48 MHz. Off by default; adds 4 cycles of input delay on that pin | **Model** |
 | I6 | The master moved SDA 125 ns after pulling SCL low, when the units finished | With a 300 ns fall time, SCL could still be high, which makes a false STOP or START | Wait `ODLY` (312 ns at SM and FM) before moving SDA | Firmware |
+| I7 | No bus clear: with SDA held low by a device stuck in a read, the master waited for ever | The bus stayed dead until a reset | Up to nine SCL pulses until SDA is released, then a STOP and the request. If it is not released: status 4 and the IRQ, with no START. The multi-master build first waits for SDA low and SCL high to last about 8 ms (`stuck`), so it does not clock over another controller's zeros | Firmware |
 
 ### USB
 
@@ -187,34 +193,42 @@ All of these passed the old tests, because those tests shared the firmware's ass
 | U10 | Reset took 2.7 µs to detect | A 2.5 µs reset was missed | Decide earlier, and still after the longest EOP | Firmware |
 | U11 | After sending data the device waited 40 bit times for a handshake | It took the host's next token for a handshake and lost it | Give up before 18 bit times, by the start of a packet | Firmware |
 | U12 | Returning to listen took too long | A token 2 bit times after an SOF was missed | Start hunting first and do the rest after. The next bits reach the FIFO only once the hunt ends | Firmware |
+| U13 | At full speed the last byte of a packet can reach the FIFO just after the loop finds it empty and just before it sees the EOP. About 1 packet in 3 lost it, depending on the phase | `UH_RXLEN` and `UD_RXLEN` one short, and the last CRC byte not stored, so software working out the payload size from the length loses a data byte. In the host the byte stayed in the FIFO and was read as the PID of the **next** packet: that transaction reported a handshake the device never sent | The CRC unit has already seen the byte, so the answer does not depend on it: answer first, then store what is left | Firmware |
+| U14 | The same race on a one-byte packet in the host | With jitter inside the budget, 7 of 300 good handshakes were reported as `UH_BADPKT` | Read the FIFO once more before judging a one-byte packet | Firmware |
+| U15 | The device's ACK could take 6.75 bit times with jitter inside the budget, over the 6.5 limit | Over the limit for a detachable cable, by 1 clock cycle | Look for the EOP every 2 instructions instead of 3, using the FIFO-empty jump condition | Firmware |
+
+**How U13–U15 were missed.** Three gaps in these tests, all now closed:
+
+- The tests ran each packet at one clock phase, and U13 depends on the phase. It was found by accident on the RTL, when a new random seed moved a chip-to-chip test onto a bad phase.
+- The full-speed jitter test applied no jitter: its cycle count was `int(20 ns // 20.83 ns)`, which is 0. The earlier "Jitter: Pass" at full speed meant nothing. The count is now rounded to nearest and the test asserts it is at least 1.
+- The jitter tests did not check response times.
+
+Fixing U13 by reading the FIFO once more on the way to the handshake was tried first. It put the device's ACK at up to 7.5 bit times and the conformance tests rejected it, which is why the stored byte now comes after the answer. On a bad packet with a good CRC, the host now turns the CRC unit off instead of testing a flag, so its ACK path did not get longer.
 
 Changes to how firmware is used:
 
 - `UH_RPID` is now `0x80`, the first byte received. The separate copy was removed to fit IMEM. The RTL tests use the new `pe_host.usb_result`.
 - `dmem[UH_NH]` is the high byte of the reset and resume count.
+- A one-byte packet in the host, whatever its PID, is now reported as `UH_OK` with `UH_RXLEN` = 1, and gets no ACK. A lone DATA PID used to give `UH_BADPKT`. Software must look at `UH_RPID`, as it already must for handshakes.
+- The I2C master's status 4 means SDA is stuck low (I7).
 - A device now needs a sync of at least 6 bits at full speed, where the old firmware took 4 when the packets were 6 bit times apart. The standard gives no shorter figure for full speed, so this is not a violation, but the margin is smaller.
 
-## 7. What the RTL needs
+## 7. What was carried over to the RTL
 
-The RTL was not changed, as instructed. Only one model change needs to reach it:
+Only one model change needed new hardware: `PIN_FILT` (I5). The RTL now has it: registers at 0x16–0x17, and a filter per pin in `src/io/pe_pins.v`, 32 flip-flops in all (8 enable, 8 output, 16 count). All the other fixes are firmware.
 
-| Change | Files | Size |
+| Check, on the final RTL and firmware | Result | What it shows |
 |---|---|---|
-| `PIN_FILT` (I5): registers at 0x16–0x17, and a filter per pin | `src/io/pe_pins.v`, `src/host/pe_regs.v`, top level | About 3 flip-flops per pin plus 8 for the enable: about 32 in all. A small part of the current total |
-
-Until then the model and the RTL differ in this one feature. `git diff v2..test -- model/` shows exactly what changed.
-
-Results on the unchanged RTL, with the fixed firmware:
-
-| Check | Result | What it shows |
-|---|---|---|
-| Chip tests (cocotb, including lockstep fuzz and RTL-to-model cross tests) | 135 of 136 pass, 1 skipped (optional soak). The full run gave 133; the other 2 failed because the tests did not write `UH_NH`, and passed when rerun on their own after that fix | The firmware fixes work on the real RTL |
+| Chip tests (cocotb) | 138 of 139 pass, 1 skipped (optional soak), on each of 3 random seeds | The firmware fixes, the filter and bus clear work on the RTL |
+| Same suite with lockstep on every test (`make LOCKSTEP=1`) | 138 of 139 pass, 1 skipped. One seed. First full run of this | RTL and model agree on every flip-flop, every cycle, across all of those tests |
 | Dual-chip tests | 5 of 5 pass | |
-| z3 proof and model tests | 58 of 58 pass | The model still matches the RTL **with the filter off** |
+| Unit benches | 28 of 28 pass | Includes the filter's pulse widths |
+| Formal (`pe_pins`, `pe_regs`, top level) | All pass | |
+| z3 proof and model tests | 58 of 58 pass | The model matches the RTL **with the filter included**: the harness now compares `PIN_FILT` and the filter state |
 
-**The proof does not cover `PIN_FILT`.** Its harness does not know the new register: `filt` starts at 0, so the filter is never on, and a write to 0x16 has no effect it can see. A pass here says nothing about the filter, and the proof did not flag the difference. When the RTL gets the filter, the harness must get `filt` and the filter state as well. The filter itself is tested only by the I2C and UART cases in this document.
+The unit, formal and z3 runs were made on this RTL before the last firmware fixes, which changed firmware and tests only.
 
-The whole chip suite with lockstep on every test (`make LOCKSTEP=1`) was not rerun; only the lockstep fuzz tests were. The firmware's I2C fixes were run on the RTL without the filter, because the RTL has no filter yet. So on the current RTL the requirement of I5 is still not met.
+The spike test on the RTL has a negative control: with the filter off, SDA spikes of 1 cycle corrupt a read and spikes of 2 and 3 cycles cause a NACK. SCL spikes do not trouble a master, as it drives SCL itself, so they do not serve as the control.
 
 ## 8. What this does not show
 
@@ -228,9 +242,15 @@ Features not implemented:
 
 | Feature | Standard | Note |
 |---|---|---|
-| I2C bus clear: nine clocks when SDA is stuck low | 3.1.16, "should" | The master has no time-out, so it waits |
 | I2C device ID, software reset | 3.1.14, 3.1.17 | Optional. General call data is stored, not acted on |
 | I2C Hs mode as target | 5.3 | Master only |
 | USB remote wakeup | 7.1.7.7 | The device must not advertise it |
 | USB high speed | 7.1 | Far above the 48 MHz clock |
 | USB data toggles, enumeration, frame timing | 8.6, 9, 11 | Left to host software |
+
+Known limits of what is implemented:
+
+- **SCL stuck low is not cleared.** The standard offers only a hardware reset or a power cycle for that case (3.1.16), and the master waits.
+- **Bus clear in the multi-master build** waits about 8 ms before acting. Another controller that pauses for longer than that with SDA low and SCL high could be clocked over.
+- **I2C multi-master with 10-bit addressing does not fit**: 166 words against 160. The other builds fit: single 126, 10-bit 138, multi-master 154, Hs 132, Hs with 10-bit 144.
+- **Bug U13 depended on timing that random tests hit only sometimes.** The phase sweeps now cover it, but other timing races could remain outside what was swept.
