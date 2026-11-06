@@ -729,7 +729,8 @@ UD_INDATA, UD_RXDATA = 0x10, 0x80
 USB_IDLE = 65535        # usb_device: cycles of J that set ETX (1.37 ms at 48 MHz)
 EV_OUT, EV_IN_ACK, EV_RESET, EV_IN_NOACK = 1, 2, 3, 4
 # usb_host DMEM map
-UH_OP, UH_TOK0, UH_TOK1, UH_TOK2, UH_DPID, UH_N, UH_RPID, UH_STATUS, UH_RXLEN = range(9)
+UH_OP, UH_TOK0, UH_TOK1, UH_TOK2, UH_DPID, UH_N, UH_NH, UH_STATUS, UH_RXLEN = range(9)
+UH_RPID = 0x80          # the first byte received
 UH_OK, UH_TIMEOUT, UH_BADPKT = 0, 1, 2
 
 
@@ -747,7 +748,9 @@ def _usb_setup(a, B, jp, kp):
     a.ucfg(I.RX, I.RX_TICK, I.rx_tick(I.SRC_DPLL))
     a.ucfg(I.RX, I.RX_ODLY, I.rx_line(nrzi=1, hunt=1, stuffn=6))
     a.ucfg(I.ERX_U, I.D_COND, I.cond(jp, I.LEVEL, 0, qpin=kp, qen=1, qlvl=0, stop=1))   # SE0
-    a.ucfg(I.ERX_U, I.D_DUR, max(2, B // 4))
+    # SE0 of an EOP: over 210 ns at low speed, where D+ and D- may both be low in a transition
+    # (7.1.4), and at most 82 ns at full speed and 670 ns at low speed (7.1.13.2).
+    a.ucfg(I.ERX_U, I.D_DUR, max(2, B // 2))
     a.set(jp, I.SRC_1).set(kp, I.SRC_0)                          # J, not driven yet
 
 
@@ -772,64 +775,85 @@ def _tx_on(a, jp, kp):
     a.setoe(jp, 1).setoe(kp, 1).ustart(I.M_TX, USB_SYNC)
 
 
+def _next_crc(r, poly, bit=1):
+    return ((r << 1) ^ (poly if ((r >> 15) ^ bit) & 1 else 0)) & 0xFFFF
+
+
+# USB 2.0 7.1.9.1: a dribble bit, one more 1 before the EOP, must be accepted. It goes through the
+# CRC unit as well, and then gives this value instead of the residual.
+CRC5_DRIB, CRC16_DRIB = _next_crc(CRC5_RES, CRC5_POLY), _next_crc(CRC16_RES, CRC16_POLY)
+
+
+def _crc_good(a, res, drib, ok, bad):
+    """Compare r4 with the residual: to `ok` if good (the usual case is the short one), else `bad`."""
+    a.cmp(4, res).jmp(ok, I.Z).cmp(4, drib).jmp(bad, I.NZ)
+
+
 def usb_device(B=4, jp=0, kp=1, turn=None):
     """USB device at transaction level, low or full speed. The host side sets
     the address and handshakes in DMEM and owns the higher layers (enumeration,
     data toggles, endpoints). See UD_* for the map; UD_EVENT says what happened,
     with a controller IRQ. `turn`: extra cycles before answering (B = 32: the
-    answer must not come before 2 bit times).
+    answer must not come before 2 bit times). A SETUP is always answered with ACK (8.5.3).
     Suspend: ETX times the idle bus. CSTAT.ETX set means J for at least USB_IDLE cycles
     (1.37 ms) since the last packet, and any packet clears it. Read it twice, 1.7 ms
     apart: still set means suspend (3 ms of idle). Resume shows as K on PIN_IN; the firmware
     keeps hunting all along, so the next packet is received normally. Remote wakeup is
     not implemented: the device must not advertise it."""
     if turn is None:
-        turn = 0 if B <= 8 else 5 * B
+        turn = 0 if B <= 8 else 3 * B
+    wait_h = max(1, (33 * B // 2 - 14) // 4)                # handshake: give up before 18 bit times
     a = Asm()
     _usb_setup(a, B, jp, kp)
     a.ucfg(I.ETX_U, I.D_COND, I.cond(jp, I.LEVEL, 1))
     a.ucfg(I.ETX_U, I.D_DUR, USB_IDLE)
-    a.L("idle").fget(0, I.FIFO_RX, nb=1).jmp("idle", I.NC)       # drain
+    # Everything ends here, with whatever it had going stopped. The hunt comes first: the next
+    # packet may start 2 bit times after the last one, and no bit reaches the FIFO or the CRC unit
+    # until the hunt ends, so the rest has time.
+    a.L("idle").ustop(I.M_RX).evt(I.DET_RX, I.EV_DISARM).evt(I.DET_RX, I.EV_CLR)
+    _rx_go(a, jp)
+    a.L("dr").fget(0, I.FIFO_RX, nb=1).jmp("dr", I.NC)           # drain
+    _crc_rx(a, CRC5_POLY, CRC5_INIT)
     a.evt(I.DET_TX, I.EV_CLR).evt(I.DET_TX, I.EV_ARM)            # the idle timer starts again
     a.mov(3, UD_ADDR).ld(7, 3)
     a.mov(3, UD_INLEN).ld(5, 3)
-    _crc_rx(a, CRC5_POLY, CRC5_INIT)
-    _rx_go(a, jp)
+    a.mov(6, 0)
     a.evt(I.DET_RX, I.EV_WAITC)                                  # SE0: RX is stopped
-    a.mov(6, 0).fget(6, I.FIFO_RX, nb=1).fget(1, I.FIFO_RX, nb=1).fget(2, I.FIFO_RX, nb=1)
+    a.fget(6, I.FIFO_RX, nb=1).fget(1, I.FIFO_RX, nb=1)
     a.urd(4, I.CRC, I.CRC_VAL)
+    _crc_good(a, CRC5_RES, CRC5_DRIB, "t_ok", "t_bad")
+    a.L("t_ok").mov(4, I.R(1)).and_(4, 0x7F).cmp(4, I.R(7)).jmp("idle", I.NZ)
     a.cmp(6, PID_IN).jmp("in_tok", I.Z)                          # no time to spare here
-    a.cmp(6, 0).jmp("short", I.Z)
-    # OUT / SETUP: the data packet follows soon, so hunt first and check after.
-    # No bit reaches the CRC unit until the hunt ends, so its setup can follow.
+    # OUT / SETUP: the data packet follows soon. No bit reaches the CRC unit until the hunt ends.
     _rx_go(a, jp)
-    _crc_rx(a, CRC16_POLY, CRC16_INIT)
-    a.cmp(4, CRC5_RES).jmp("abort", I.NZ)
-    a.mov(4, I.R(1)).and_(4, 0x7F).cmp(4, I.R(7)).jmp("abort", I.NZ)
+    a.ucfg(I.CRC, I.CRC_POLY, CRC16_POLY).ucfg(I.CRC, I.CRC_INIT, CRC16_INIT)
+    a.fget(2, I.FIFO_RX, nb=1)
     a.cmp(6, PID_OUT).jmp("o_ok", I.Z)
-    a.cmp(6, PID_SETUP).jmp("abort", I.NZ)
-    a.L("o_ok").mov(3, UD_TOKEN).st(6, 3)
-    a.and_(2, 7).shl(2, 1).shr(1, 7).or_(2, I.R(1))
-    a.mov(3, UD_EP).st(2, 3)
+    a.cmp(6, PID_SETUP).jmp("idle", I.NZ)
+    a.L("o_ok").mov(3, UD_TOKEN).st(6, 3, inc=1)                 # UD_EP comes next
+    a.and_(2, 7).shl(2, 1).shr(1, 7).or_(2, I.R(1)).st(2, 3)
     a.mov(3, UD_OUTHS).ld(1, 3)                                  # handshake ready in r1
-    a.mov(3, UD_RXDATA)
-    a.L("rl").jmp("re", I.ERX).fget(0, I.FIFO_RX, nb=1).jmp("rl", I.C)
-    a.st(0, 3, inc=1).jmp("rl")
-    a.L("re").evt(I.DET_RX, I.EV_CLR)
-    a.L("rd").fget(0, I.FIFO_RX, nb=1).jmp("rc", I.C).st(0, 3, inc=1).jmp("rd")
-    a.L("rc").urd(4, I.CRC, I.CRC_VAL).cmp(4, CRC16_RES).jmp("idle", I.NZ)
+    a.cmp(6, PID_SETUP).jmp("o_hs", I.NZ).mov(1, PID_ACK)
+    a.L("o_hs").mov(3, UD_RXDATA)
+    # The first byte must be a good DATA PID. The slow checks are done here, as bytes arrive:
+    # after the EOP only the CRC and the stuff flag stand between us and the handshake.
+    a.L("op").jmp("idle", I.ERX).fget(0, I.FIFO_RX, nb=1).jmp("op", I.C)
+    a.st(0, 3, inc=1).cmp(0, PID_DATA0).jmp("rl", I.Z).cmp(0, PID_DATA1).jmp("idle", I.NZ).jmp("rl")
+    a.L("rs").st(0, 3, inc=1)
+    a.L("rl").fget(0, I.FIFO_RX, nb=1).jmp("rs", I.NC).jmp("rl", I.NERX)
+    a.urd(4, I.CRC, I.CRC_VAL)
+    _crc_good(a, CRC16_RES, CRC16_DRIB, "rc2", "idle")
+    a.L("rc2").urd(4, I.RX, I.RX_STAT).and_(4, I.RX_ST_SERR).jmp("idle", I.NZ)
     if turn:
         a.delay(turn)
     _tx_on(a, jp, kp)
-    a.fput(1, I.FIFO_TX)
-    a.ucfg(I.CRC, I.CRC_CTRL, 0)
-    a.uwait(I.M_TX)
+    a.call("hsend")
     a.mov(0, I.R(3)).sub(0, UD_RXDATA).mov(3, UD_RXLEN).st(0, 3)
     a.mov(0, EV_OUT).jmp("ev")
-    # IN: answer within 7.5 bit times. Sync goes out first; it is the same for both
+    a.L("hsend").fput(1, I.FIFO_TX).ucfg(I.CRC, I.CRC_CTRL, 0).uwait(I.M_TX).ret()
+    # IN: answer within 6.5 bit times. Sync goes out first; it is the same for both
     # answers, and it gives the time to decide and to set up the CRC.
-    a.L("in_tok").cmp(4, CRC5_RES).jmp("idle", I.NZ)
-    a.and_(1, 0x7F).cmp(1, I.R(7)).jmp("idle", I.NZ)
+    a.L("in_tok")
     if turn:
         a.delay(turn)
     _tx_on(a, jp, kp)
@@ -840,66 +864,67 @@ def usb_device(B=4, jp=0, kp=1, turn=None):
     a.mov(3, UD_INDATA).sub(5, 1).jmp("txe", I.Z)
     a.L("txl").ld(0, 3, inc=1).fput(0, I.FIFO_TX).djnz(5, "txl")
     a.L("txe").uwait(I.M_TX)
-    # the host's handshake, with a timeout (the host answers within 16 bit times)
+    # the host's handshake: its packet must start before 18 bit times
     a.ucfg(I.CRC, I.CRC_CTRL, 0)
+    a.fget(1, I.FIFO_RX, nb=1)                                   # the last byte of the token
     _rx_go(a, jp)
-    a.mov(5, 10 * B)                                             # 40 bit times: 16 + one handshake
-    a.L("ha").jmp("hg", I.ERX).djnz(5, "ha")
-    a.ustop(I.M_RX).evt(I.DET_RX, I.EV_DISARM).mov(0, EV_IN_NOACK).jmp("ev")
-    a.L("hg").evt(I.DET_RX, I.EV_CLR).fget(1, I.FIFO_RX, nb=1)
-    a.mov(0, EV_IN_NOACK).cmp(1, PID_ACK).jmp("ev", I.NZ)
+    a.mov(5, wait_h)
+    a.L("ha").jpin(kp, 1, "hb").djnz(5, "ha")
+    a.L("nk").mov(0, EV_IN_NOACK).jmp("ev")
+    a.L("hb").evt(I.DET_RX, I.EV_WAITC).fget(1, I.FIFO_RX, nb=1)
+    a.cmp(1, PID_ACK).jmp("nk", I.NZ)
     a.mov(3, UD_INLEN).mov(0, 0).st(0, 3).mov(0, EV_IN_ACK).jmp("ev")
-    a.L("nak")
-    a.ucfg(I.CRC, I.CRC_CTRL, 0)
-    a.mov(3, UD_INHS).ld(0, 3).fput(0, I.FIFO_TX)
-    a.uwait(I.M_TX).jmp("idle")
-    a.L("abort").ustop(I.M_RX).evt(I.DET_RX, I.EV_DISARM).evt(I.DET_RX, I.EV_CLR).jmp("idle")
-    # A packet shorter than a token, or a bus reset: SE0 still there after 2.5 us.
-    a.L("short").delay(130).jpin(jp, 1, "idle").mov(0, EV_RESET)
+    a.L("nak").mov(3, UD_INHS).ld(1, 3).call("hsend").jmp("idle")
+    # A packet shorter than a token, or a bus reset: SE0 still there after 2 us (the limit is 2.5).
+    a.L("t_bad").cmp(6, 0).jmp("idle", I.NZ)
+    a.delay(70).jpin(jp, 1, "idle").mov(0, EV_RESET)
     a.L("ev").mov(3, UD_EVENT).st(0, 3).host_irq().jmp("idle")
     return a
 
 
 def usb_host(B=4, jp=0, kp=1, gap=None, timeout=None):
     """USB host at transaction level, low or full speed. dmem: UH_OP (0
-    transaction, 1 bus reset for UH_N * 256 cycles, 2 EOP = keep-alive, 3 resume: K for
-    UH_N * 256 cycles, then an EOP; suspend = no transactions), UH_TOK0-2 = the
+    transaction, 1 bus reset, 2 EOP = keep-alive, 3 resume; suspend = no transactions), UH_TOK0-2 = the
     token with its CRC5, UH_DPID = data PID for OUT / SETUP (0 for IN), UH_N = data
-    bytes at 0x10. Result: UH_RPID = handshake or data PID, UH_STATUS, UH_RXLEN = bytes
+    bytes at 0x10. Reset and resume last n * 256 cycles, n = UH_N + 256 * dmem[UH_N + 1]: 1875 for the
+    10 ms of a reset, 3750 for the 20 ms of a resume.
+    Result: UH_RPID = handshake or data PID, UH_STATUS, UH_RXLEN = bytes
     received with the PID, at 0x80; controller IRQ. An IN gets an ACK when its
-    CRC is good."""
+    PID, CRC and stuffing are good, within 7.5 bit times. Only a one-byte packet (a handshake) is
+    reported with a PID that was not checked: the host software looks at UH_RPID."""
     if gap is None:
-        gap = max(0, 4 * B - 20)        # >= 2 bit times after SE0 ends, measured from SE0
+        gap = max(0, 4 * B - 24)        # >= 2 bit times after SE0 ends, measured from SE0
     if timeout is None:
-        timeout = max(8, 3 * B)
+        timeout = max(1, (35 * B // 2 - 30 - B) // 4)    # the answer must start before 18 bit times
     a = Asm()
     _usb_setup(a, B, jp, kp)
     a.L("idle").jmp("idle", I.NDB).dbclr()
     a.mov(3, UH_OP).ld(0, 3).cmp(0, 0).jmp("tok", I.Z)
     a.cmp(0, 3).jmp("resu", I.Z)
     a.cmp(0, 1).jmp("keep", I.NZ)
-    a.mov(3, UH_N).ld(5, 3)
+    a.call("gn")
     a.set(jp, I.SRC_0).setoe(jp, 1).setoe(kp, 1)
-    a.L("rl").delay(250).djnz(5, "rl")
+    a.L("rl").delay(252).djnz(5, "rl")                           # 256 cycles a turn
     a.jmp("rel")
     a.L("keep").set(jp, I.SRC_0).setoe(jp, 1).setoe(kp, 1)
     a.L("eop").delay(2 * B - 6)
     a.L("rel").set(jp, I.SRC_1).delay(max(0, B - 3)).setoe(jp, 0).setoe(kp, 0).jmp("fin0")
+    a.L("gn").mov(3, UH_N).ld(5, 3, inc=1).ld(6, 3).shl(6, 8).or_(5, I.R(6)).ret()
     # resume: K, then the EOP that "keep" ends with. J to K changes two pins: only a TX unit
     # write with DIFF changes both in one edge, with no glitch of SE0 between them.
-    a.L("resu").mov(3, UH_N).ld(5, 3)
+    a.L("resu").call("gn")
     a.ucfg(I.TX, I.TX_LINE, I.tx_line(diff=1, d2pin=kp))
     a.ucfg(I.TX, I.TX_FRAME, I.tx_frame(nbits=1))
     a.ucfg(I.ETX_U, I.D_AFTER, I.A_NONE)
     a.setoe(jp, 1).setoe(kp, 1)                                  # J, as the pull-ups had it
     a.ustart(I.M_TX, 0).uwait(I.M_TX)
-    a.L("rk").delay(250).djnz(5, "rk")
+    a.L("rk").delay(252).djnz(5, "rk")
     a.ucfg(I.TX, I.TX_LINE, I.tx_line(nrzi=1, eop=1, diff=1, d2pin=kp, stuffn=6))
     a.ucfg(I.TX, I.TX_FRAME, I.tx_frame(chain=1))
     a.ucfg(I.ETX_U, I.D_AFTER, I.A_RELEASE)
     a.set(kp, I.SRC_0).jmp("eop")
     # token
-    a.L("tok").ucfg(I.CRC, I.CRC_CTRL, 0)
+    a.L("tok")                      # the CRC unit is off or on RX here: neither adds to a TX packet
     _tx_on(a, jp, kp)
     a.mov(3, UH_TOK0).ld(0, 3, inc=1).fput(0, I.FIFO_TX).ld(0, 3, inc=1).fput(0, I.FIFO_TX)
     a.ld(0, 3).fput(0, I.FIFO_TX).uwait(I.M_TX)
@@ -912,30 +937,34 @@ def usb_host(B=4, jp=0, kp=1, gap=None, timeout=None):
     a.mov(3, UH_N).ld(5, 3).mov(3, 0x10).cmp(5, 0).jmp("dte", I.Z)
     a.L("dtl").ld(0, 3, inc=1).fput(0, I.FIFO_TX).djnz(5, "dtl")
     a.L("dte").uwait(I.M_TX)
-    # receive a packet (handshake or data) into 0x80
+    # receive a packet (handshake or data) into 0x80. Its start must come in time.
     a.L("rxp")
     _crc_rx(a, CRC16_POLY, CRC16_INIT)
     _rx_go(a, jp)
-    a.mov(3, 0x80).mov(5, timeout)
-    a.L("rw").jmp("rg", I.ERX).fget(0, I.FIFO_RX, nb=1).jmp("rn", I.C)
-    a.st(0, 3, inc=1).mov(5, timeout).jmp("rw")
-    a.L("rn").djnz(5, "rw")
+    a.mov(3, 0x80).mov(5, timeout).mov(1, UH_OK)
+    a.L("rw").jpin(kp, 1, "sop").djnz(5, "rw")
     a.ustop(I.M_RX).evt(I.DET_RX, I.EV_DISARM).mov(1, UH_TIMEOUT).jmp("done")
-    a.L("rg").evt(I.DET_RX, I.EV_CLR)
-    a.L("rd").fget(0, I.FIFO_RX, nb=1).jmp("rc", I.C).st(0, 3, inc=1).jmp("rd")
-    a.L("rc").urd(4, I.CRC, I.CRC_VAL).urd(2, I.RX, I.RX_STAT)
-    a.mov(1, UH_OK).sub(3, 0x80).cmp(3, 1).jmp("hs", I.Z)        # one byte: a handshake
-    a.cmp(4, CRC16_RES).jmp("bad", I.NZ)
-    a.and_(2, I.RX_ST_SERR | I.RX_ST_NBITS).jmp("bad", I.NZ)
-    a.cmp(6, 0).jmp("hs", I.NZ)                                  # data stage already done
-    a.delay(gap)
-    a.ucfg(I.CRC, I.CRC_CTRL, 0)
+    # The first byte decides. Only a good DATA PID in answer to an IN goes on to the ACK path, where
+    # time is short: the other checks are made here, as bytes arrive.
+    a.L("sop").fget(0, I.FIFO_RX, nb=1).jmp("s1", I.NC).jmp("rn", I.ERX).jmp("sop")
+    a.L("s1").st(0, 3, inc=1).cmp(6, 0).jmp("rx", I.NZ)
+    a.cmp(0, PID_DATA0).jmp("rd", I.Z).cmp(0, PID_DATA1).jmp("rd", I.Z)
+    # anything else: no ACK. One byte is a handshake; more is a bad packet.
+    a.L("rx").fget(0, I.FIFO_RX, nb=1).jmp("rxs", I.NC).jmp("rn", I.ERX).jmp("rx")
+    a.L("rxs").st(0, 3, inc=1).jmp("rx")
+    a.L("rs").st(0, 3, inc=1)
+    a.L("rd").fget(0, I.FIFO_RX, nb=1).jmp("rs", I.NC).jmp("rd", I.NERX)
+    a.urd(4, I.CRC, I.CRC_VAL)
+    _crc_good(a, CRC16_RES, CRC16_DRIB, "rc2", "bad")
+    a.L("rc2").urd(4, I.RX, I.RX_STAT).and_(4, I.RX_ST_SERR).jmp("bad", I.NZ)
+    if gap:
+        a.delay(gap)
     _tx_on(a, jp, kp)
     a.mov(0, PID_ACK).fput(0, I.FIFO_TX).uwait(I.M_TX)
     a.jmp("hs")
+    a.L("rn").cmp(3, 0x81).jmp("hs", I.Z)
     a.L("bad").mov(1, UH_BADPKT)
-    a.L("hs").mov(0, I.R(3)).mov(3, UH_RXLEN).st(0, 3)
-    a.mov(3, 0x80).ld(0, 3).mov(3, UH_RPID).st(0, 3)
+    a.L("hs").evt(I.DET_RX, I.EV_CLR).sub(3, 0x80).mov(0, I.R(3)).mov(3, UH_RXLEN).st(0, 3)
     a.L("done").mov(3, UH_STATUS).st(1, 3)
     a.L("fin0").host_irq().jmp("idle")
     return a

@@ -131,3 +131,49 @@ def test_i2c_timing_flags_fast_and_broken():
     tr = i2c_trace(["S"] + bits(0xA0) + [0] + ["P"], h=10)
     assert L.timing(tr, "SM") and L.timing(tr, "FM")     # 10 cycles = 208 ns: far too fast for both
     assert not L.timing(i2c_trace(["S"] + bits(0xA0) + [0] + ["P"], h=300), "SM", check=("low", "high", "fscl"))
+
+
+def usb_trace(levels, speed="FS", bit=None):
+    import usb_lib as U
+    sp = U.SPEEDS[speed]
+    bit = bit or sp["B"]
+    idle = 1 << sp["jp"]
+    code = {U.J: 1 << sp["jp"], U.K: 1 << sp["kp"], U.SE0: 0}
+    s = bytearray([idle] * 100)
+    for lv in levels:
+        s += bytes([code[lv]]) * bit
+    s += bytes([idle]) * (20 * bit)
+    return s
+
+
+def test_usb_crc_matches_the_catalogue():
+    """CRC-5/USB and CRC-16/USB check values from the CRC catalogue, CRC-16 also via crcmod."""
+    import crcmod.predefined as p
+    import usb_lib as U
+    msg = b"123456789"
+    bits = [(c >> i) & 1 for c in msg for i in range(8)]
+    c5 = U.crc5(bits)
+    assert sum(b << i for i, b in enumerate(c5)) == 0x19
+    c16 = U.crc16_bits(list(msg))
+    assert sum(b << i for i, b in enumerate(c16)) == 0xB4C8 == p.mkCrcFun("crc-16-usb")(msg)
+
+
+def test_usb_good_packets_clean():
+    import usb_lib as U
+    for pkt, name in ((U.token(U.IN, 0x2A, 3), "IN"), (U.data_packet(U.DATA1, [1, 2, 3]), "DATA1"), ([U.ACK], "ACK")):
+        for speed in ("FS", "LS"):
+            d = sigrok.usb(usb_trace(U.encode(pkt), speed), 0, 1, speed)
+            assert not d["errors"], d["errors"]
+            assert [p[1] for p in d["packets"]] == [name]
+
+
+def test_usb_decoder_flags_bad_packets():
+    import usb_lib as U
+    a = sigrok.usb(usb_trace(U.encode(U.token(U.IN, 0x2A, 3, bad_crc=True))), 0, 1, "FS")
+    assert any(e[1] == "crc5-err" for e in a["errors"])
+    a = sigrok.usb(usb_trace(U.encode(U.data_packet(U.DATA1, [1, 2, 3], bad_crc=True))), 0, 1, "FS")
+    assert any(e[1] == "crc16-err" for e in a["errors"])
+    a = sigrok.usb(usb_trace(U.encode(U.data_packet(U.DATA1, [0xFF, 0xFF, 0x12]), no_stuff_first=True)), 0, 1, "FS")
+    assert any("stuff" in e[2].lower() for e in a["errors"])
+    a = sigrok.usb(usb_trace(U.encode(U.token(U.IN, 0x2A, 3), sync_bits=6)), 0, 1, "FS")
+    assert any(e[1] == "sync-err" for e in a["errors"])
