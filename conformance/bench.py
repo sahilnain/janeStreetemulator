@@ -233,3 +233,9 @@ def backdoor_txf(node, data):
 
 __all__ = ["Bench", "Node", "Script", "Edges", "owners", "rx_all", "NS", "CLOCK_HZ",
            "OWN_CTRL", "OWN_TX", "OWN_RX", "A_DMADDR", "A_DMDATA", "A_TXF", "A_RXF", "A_STATUS"]
+
+
+def fw_wait(b, nd, limit=2_000_000, what="firmware IRQ"):
+    """Wait for the controller IRQ of a DMEM-driven firmware, and clear it."""
+    b.until(lambda: nd.chip.regs.st2 & 0x10, limit=limit, what=what)
+    nd.write(0x0E, 0x10)

@@ -191,6 +191,13 @@ def uart_ex(txd=0, rxd=1, B=112, N=9, K=1, S=12, bits=8, parity=PAR_NONE, stop_b
 SPI_PINS = dict(sck=2, mosi=3, miso=4, cs=5)
 
 
+def _cs_time(a, B):
+    """CS lead and lag: at least half an SCK period, after CS falls and before it rises."""
+    if B // 2 > 3:
+        a.delay(B // 2 - 3)
+    return a
+
+
 def spi_master_words(B=2, cpol=0, cpha=0, msb=1, sdly=3, bits=16, sck=2, mosi=3, miso=4, cs=5):
     """SPI master for words of 1-16 bits, DMEM-driven: dmem[0] = n words,
     then two bytes per word (low first) from dmem[1]; n replies, two bytes
@@ -210,6 +217,7 @@ def spi_master_words(B=2, cpol=0, cpha=0, msb=1, sdly=3, bits=16, sck=2, mosi=3,
     a.dbclr()
     a.mov(1, 0).ld(2, 1, inc=1).mov(3, 0x80)
     a.set(cs, I.SRC_0, dly=1)
+    _cs_time(a, B)
     a.L("word")
     a.ld(0, 1, inc=1).ld(4, 1, inc=1).shl(4, 8).or_(0, I.R(4))
     a.ustart(I.M_BOTH, I.R(0))
@@ -217,6 +225,7 @@ def spi_master_words(B=2, cpol=0, cpha=0, msb=1, sdly=3, bits=16, sck=2, mosi=3,
     a.urd(4, I.RX, I.RX_DATA)
     a.st(4, 3, inc=1).shr(4, 8).st(4, 3, inc=1)
     a.djnz(2, "word")
+    _cs_time(a, B)
     a.set(cs, I.SRC_1)
     a.host_irq()
     a.jmp("idle")
@@ -244,6 +253,7 @@ def spi_master(B=2, cpol=0, cpha=0, msb=1, sdly=3, sck=2, mosi=3, miso=4, cs=5):
     a.mov(1, 0).ld(2, 1, inc=1)                                 # r2 = n, r1 -> data
     a.mov(3, 0x80)
     a.set(cs, I.SRC_0, dly=1)
+    _cs_time(a, B)
     a.L("byte")
     a.ld(0, 1, inc=1)
     a.ustart(I.M_BOTH, I.R(0))                                  # one byte out and in
@@ -251,6 +261,7 @@ def spi_master(B=2, cpol=0, cpha=0, msb=1, sdly=3, sck=2, mosi=3, miso=4, cs=5):
     a.fget(4, I.FIFO_RX)
     a.st(4, 3, inc=1)
     a.djnz(2, "byte")
+    _cs_time(a, B)
     a.set(cs, I.SRC_1)
     a.host_irq()
     a.jmp("idle")
@@ -276,10 +287,11 @@ def spi_slave(cpol=0, cpha=0, msb=1, bits=0, sck=2, mosi=3, miso=4, cs=5):
     for d in (I.ETX_U, I.ERX_U):
         a.ucfg(d, I.D_COND, I.cond(cs, I.LEVEL, 0, start=1, autoarm=1))
         a.ucfg(d, I.D_DUR, 1)
-    a.setoe(miso, 1)
-    a.L("idle").wait(cs, 1)
-    a.evt(I.DET_TX, I.EV_ARM).evt(I.DET_RX, I.EV_ARM)
-    a.wait(cs, 0)
+    # Not selected: MISO is left to the others. OE can only change while TX is idle, so ETX
+    # is armed once MISO is on, a few cycles after CS falls (spi_slave_lead_cycles).
+    a.L("idle").setoe(miso, 0).wait(cs, 1)
+    a.evt(I.DET_RX, I.EV_ARM)
+    a.wait(cs, 0).setoe(miso, 1).evt(I.DET_TX, I.EV_ARM)
     a.L("run").jpin(cs, 1, "end")
     a.jmp("run")
     a.L("end").ustop(I.M_BOTH)
@@ -313,7 +325,8 @@ def spi_master_stream(B=4, cpol=0, cpha=0, msb=1, sdly=3, sck=2, mosi=3, miso=4,
     a.mov(1, 0).ld(2, 1, inc=1).mov(5, I.R(2)).mov(3, 0x80).mov(6, 0)    # r2 tx left, r5 rx left
     a.L("pre").ld(0, 1, inc=1).fput(0, I.FIFO_TX).sub(2, 1).jmp("go", I.Z)
     a.jmp("go", I.TXF_FULL).jmp("pre")
-    a.L("go").set(cs, I.SRC_0, dly=1).ustart(I.M_BOTH)
+    a.L("go").set(cs, I.SRC_0, dly=1)
+    _cs_time(a, B).ustart(I.M_BOTH)
     a.cmp(2, 0).jmp("drain", I.Z)
     # While bytes are left to send, the last reply cannot have come: no test of r5 or r2 here
     a.L("run").fget(4, I.FIFO_RX, nb=1).jmp("no_rx", I.C)
@@ -331,6 +344,7 @@ def spi_master_stream(B=4, cpol=0, cpha=0, msb=1, sdly=3, sck=2, mosi=3, miso=4,
     a.st(4, 3, inc=1).sub(5, 1).jmp("end", I.Z).jmp("dry")
     a.L("lost").mov(6, 2)
     a.L("end").uwait(I.M_TX).ustop(I.M_RX)
+    _cs_time(a, B)
     a.set(cs, I.SRC_1)
     a.mov(1, 0x7F).st(6, 1)
     a.host_irq()
@@ -357,6 +371,7 @@ def spi_master_3wire(B=8, cpol=0, cpha=0, msb=1, sdly=3, sck=2, dio=3, cs=5):
     a.ucfg(I.TX, I.TX_PINS, I.tx_pins(dio, 1, sck, 1))
     a.setoe(dio, 1)
     a.set(cs, I.SRC_0, dly=1)
+    _cs_time(a, B)
     a.cmp(2, 0).jmp("rd", I.Z)
     a.L("wr").ld(0, 1, inc=1).ustart(I.M_TX, I.R(0)).uwait(I.M_TX).djnz(2, "wr")
     a.L("rd").setoe(dio, 0)                                     # turnaround
@@ -364,7 +379,8 @@ def spi_master_3wire(B=8, cpol=0, cpha=0, msb=1, sdly=3, sck=2, dio=3, cs=5):
     a.cmp(5, 0).jmp("fin", I.Z).delay(B)
     a.L("rl").ustart(I.M_BOTH, 0).uwait(I.M_BOTH)
     a.fget(4, I.FIFO_RX).st(4, 3, inc=1).djnz(5, "rl")
-    a.L("fin").set(cs, I.SRC_1)
+    a.L("fin")
+    _cs_time(a, B).set(cs, I.SRC_1)
     a.host_irq()
     a.jmp("idle")
     return a
@@ -420,8 +436,7 @@ def spi_slave_words(bits=12, cpol=0, cpha=0, msb=1, sck=2, mosi=3, miso=4, cs=5)
     a.ucfg(I.RX, I.RX_PINS, I.rx_pins(mosi))
     a.ucfg(I.RX, I.RX_FRAME, I.rx_frame(msb, hold=1, nbits=bits))
     a.ucfg(I.RX, I.RX_TICK, I.rx_tick(I.SRC_EXT, sck, samp_edge, 0))
-    a.setoe(miso, 1)
-    a.L("idle").call("next").wait(cs, 1).wait(cs, 0)
+    a.L("idle").setoe(miso, 0).call("next").wait(cs, 1).wait(cs, 0).setoe(miso, 1)
     # The next word starts at once, and the word just received is stored after that: RX
     # keeps DATA and RXRDY across a start, and the next edge is only half a period away.
     a.L("word").ustart(I.M_BOTH, I.R(0))
