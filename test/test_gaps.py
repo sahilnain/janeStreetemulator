@@ -582,7 +582,7 @@ async def test_usb_host_resume(dut):
         chip, peer, B, jp, kp = await usb_host_chip(dut, speed)
         n = 2
         await chip.bus.dmem_write(F.UH_OP, [3])
-        await chip.bus.dmem_write(F.UH_N, [n])
+        await chip.bus.dmem_write(F.UH_N, [n, 0])
         t0 = len(chip.samples)
         await chip.bus.write(R.DOORBELL, 0)
         await wait_irq(chip, f"{speed}: resume")

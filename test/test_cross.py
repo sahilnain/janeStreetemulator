@@ -300,7 +300,7 @@ async def usb_suspend_resume(dut, role, name, B, jp, kp):
     await ClockCycles(dut.clk, F.USB_IDLE + 300)
     assert await b.bus.read(R.CSTAT) & R.CS_ETX, f"{name}: idle flag"
     await a.bus.dmem_write(F.UH_OP, [3])
-    await a.bus.dmem_write(F.UH_N, [2])
+    await a.bus.dmem_write(F.UH_N, [2, 0])
     await a.bus.write(R.DOORBELL, 0)
     await usb_wait(a, f"{name}: resume")
     await ClockCycles(dut.clk, 40 * B)

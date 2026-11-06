@@ -177,3 +177,7 @@ These are known limits, not fixed problems.
 - **SPI:** slaves lose the word already prepared when CS rises. At `B = 2`, long streams pause SCK.
 - **USB:** no high speed and no remote wakeup. Suspend is read by the host, not an IRQ.
 - **UART:** break handling is only in `uart_ex`. With odd `B` the start bit is one cycle long.
+
+## Protocol conformance
+
+The bugs found by checking the chip against the UART, SPI, I2C and USB standards with third-party decoders are in [protocol_conformance.md](protocol_conformance.md).
