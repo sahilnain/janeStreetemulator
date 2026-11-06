@@ -74,6 +74,7 @@ class Rtl:
             else:
                 raise ValueError(f"unexpected cell {t} in {top}")
         self._memo = {}
+        self.compared = set()  # flip-flops whose next value a proof has looked at
         self.ncells = len(mod["cells"])
         self.nff = len(self.dff_d)
 
@@ -164,6 +165,7 @@ class Rtl:
         vals, mask = [], 0
         for i, b in enumerate(bits):
             if isinstance(b, int) and b in self.dff_d:
+                self.compared.add(b)
                 vals.append(self.bit(self.dff_d[b]))
                 mask |= 1 << i
             elif not isinstance(b, int) and b in "01":

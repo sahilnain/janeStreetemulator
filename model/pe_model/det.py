@@ -9,6 +9,8 @@ chip model can use it before the controller. after() gives the after-packet step
 clock() updates the state.
 """
 
+from .blocks import mux
+
 
 class Det:
     def __init__(self, kind, cfg):
@@ -30,89 +32,63 @@ class Det:
         c = self.cond
         cur = (pin_in >> (c & 15)) & 1
         mode = (c >> 4) & 3
-        qual = not (c >> 13) & 1 or ((pin_in >> ((c >> 9) & 15)) & 1) == (c >> 14) & 1
+        qual = (((c >> 13) & 1) ^ 1) | (((pin_in >> ((c >> 9) & 15)) & 1) == (c >> 14) & 1)
         is_lvl = mode == 0
-        edge = cur != self.prev and (mode == 3 or (mode == 1 and cur) or (mode == 2 and not cur))
-        edge_ev = bool(edge and qual and not is_lvl)
-        if is_lvl:
-            cont = cur == (c >> 6) & 1 and qual
-        else:
-            cont = edge_ev or (self.hold and cur == self.hlvl)   # QUAL applies to the edge only
-        cnt_nx = 1 if edge_ev else self.cnt + 1
-        fire = bool(self.armed and cont and cnt_nx == (self.dur or 1))
+        dir_ok = (mode == 3) | ((mode == 1) & cur) | ((mode == 2) & (cur ^ 1))
+        edge_ev = (is_lvl ^ 1) & (cur != self.prev) & dir_ok & qual
+        # QUAL applies to the edge only
+        cont = mux(is_lvl, (cur == (c >> 6) & 1) & qual, edge_ev | (self.hold & (cur == self.hlvl)))
+        cnt_nx = mux(edge_ev, 1, self.cnt + 1)
+        fire = self.armed & cont & (cnt_nx == mux(self.dur != 0, self.dur, 1))
         return dict(cur=cur, edge_ev=edge_ev, cont=cont, cnt_nx=cnt_nx, fire=fire,
-                    start_req=int(fire and (c >> 7) & 1), stop_req=int(fire and (c >> 15) & 1))
+                    start_req=fire & ((c >> 7) & 1), stop_req=fire & ((c >> 15) & 1))
 
     def after(self, unit_done, unit_chain, act_mask, act2_mask, act_in):
-        chk_en = self.kind == 1 and self.aft & 1 and not unit_chain
-        last = self.apend and self.acnt == 1
-        chk_now = chk_en and ((unit_done and self.adly == 0) or last)
-        after_end = int(bool((unit_done and not (chk_en and self.adly != 0)) or last))
-        wm = wv = om = ov = 0
-        if self.kind == 0 and unit_done and self.aft & 3:
-            om = act_mask | act2_mask
-            if self.aft & 3 == 3:
-                ov = 0
-            else:
-                wm = act_mask
-                wv = act_mask if self.aft & 3 == 2 else 0
-                ov = om
-        return dict(chk_en=chk_en, chk_now=chk_now, after_end=after_end, pw_mask=wm, pw_val=wv, po_mask=om,
-                    po_val=ov, act_in=act_in)
+        aft = self.aft & 3
+        chk_en = (self.kind == 1) & (self.aft & 1) & (unit_chain ^ 1)
+        last = self.apend & (self.acnt == 1)
+        chk_now = chk_en & ((unit_done & (self.adly == 0)) | last)
+        after_end = (unit_done & ((chk_en & (self.adly != 0)) ^ 1)) | last
+        drv = (self.kind == 0) & unit_done & (aft != 0)
+        drv_out = drv & (aft != 3)
+        om = mux(drv, act_mask | act2_mask, 0)
+        return dict(chk_en=chk_en, chk_now=chk_now, after_end=after_end, pw_mask=mux(drv_out, act_mask, 0),
+                    pw_val=mux(drv_out & (aft == 2), act_mask, 0), po_mask=om, po_val=mux(drv_out, om, 0),
+                    act_in=act_in)
 
     def clock(self, rst, restart, t, a, unit_busy, unit_done, unit_stop, start_ack, clr, arm, disarm,
               cfg_we, cfg_idx, cfg_data):
         if rst:
             self.reset()
             return
-        trig = cfg_we and cfg_idx in (0, 1)
+        trig = cfg_we & ((cfg_idx == 0) | (cfg_idx == 1))
         self.prev = t["cur"]
         if restart:
             self.armed = self.pend = self.mine = self.hold = self.cnt = 0
             self.flag = self.ferr = self.apend = self.acnt = 0
         else:
-            active = unit_busy or self.apend
-            rearm = a["after_end"] and (self.pend or ((self.cond >> 8) & 1 and self.mine))
+            fire, cont, edge_ev, after_end = t["fire"], t["cont"], t["edge_ev"], a["after_end"]
+            active = unit_busy | self.apend
+            rearm = after_end & (self.pend | (((self.cond >> 8) & 1) & self.mine))
+            idle_pend = self.pend & (active ^ 1) & (unit_done ^ 1)
             # counter
-            if not self.armed or t["fire"] or trig or not t["cont"]:
-                self.cnt = self.hold = 0
-            else:
-                self.cnt = t["cnt_nx"] & 0xFFFF
-                if t["edge_ev"]:
-                    self.hold, self.hlvl = 1, t["cur"]
+            clear = (self.armed ^ 1) | fire | trig | (cont ^ 1)
+            self.cnt = mux(clear, 0, t["cnt_nx"] & 0xFFFF)
+            self.hlvl = mux(clear | (edge_ev ^ 1), self.hlvl, t["cur"])
+            self.hold = mux(clear, 0, self.hold | edge_ev)
             # flag
-            if t["fire"]:
-                self.flag = 1
-            elif clr:
-                self.flag = 0
+            self.flag = mux(fire, 1, mux(clr, 0, self.flag))
             # armed / pending
-            idle_pend = self.pend and not active and not unit_done
-            if t["fire"] or disarm:
-                self.armed = 0
-            elif rearm or (arm and not active) or idle_pend:
-                self.armed = 1
-            if disarm or rearm:
-                self.pend = 0
-            elif arm and active:
-                self.pend = 1
-            elif idle_pend:
-                self.pend = 0
+            self.armed = mux(fire | disarm, 0, mux(rearm | (arm & (active ^ 1)) | idle_pend, 1, self.armed))
+            self.pend = mux(disarm | rearm, 0, mux(arm & active, 1, mux(idle_pend, 0, self.pend)))
             # mine
-            if start_ack:
-                self.mine = 1
-            elif a["after_end"] or unit_stop:
-                self.mine = 0
+            self.mine = mux(start_ack, 1, mux(after_end | unit_stop, 0, self.mine))
             # after step
-            if a["chk_now"]:
-                self.ferr = int(a["act_in"] != (self.aft >> 1) & 1)
-            if unit_stop:
-                self.apend = 0
-            elif unit_done and a["chk_en"] and self.adly != 0:
-                self.apend, self.acnt = 1, self.adly
-            elif self.apend:
-                self.acnt -= 1
-                if self.acnt == 0:
-                    self.apend = 0
+            self.ferr = mux(a["chk_now"], a["act_in"] ^ ((self.aft >> 1) & 1), self.ferr)
+            load = unit_done & a["chk_en"] & (self.adly != 0)
+            last = self.apend & (self.acnt == 1)
+            self.acnt = mux(unit_stop, self.acnt, mux(load, self.adly, mux(self.apend, self.acnt - 1, self.acnt)))
+            self.apend = mux(unit_stop, 0, mux(load, 1, mux(last, 0, self.apend)))
         if cfg_we:
             if cfg_idx == 0:
                 self.cond = cfg_data

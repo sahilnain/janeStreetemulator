@@ -9,7 +9,7 @@ external edge or the resynchronised timer), decodes it as Section 4.5 lists, and
 gives the pin write, done and push. clock() updates the state.
 """
 
-from .blocks import Vote
+from .blocks import Vote, mux
 from .txu import field, nbits_of
 
 
@@ -38,125 +38,74 @@ class Rxu:
 
     @property
     def chain_on(self):
-        return (self.frame >> 3) & 1 and (self.tick & 3) != 0 and not self.need
-
-    def cfg_write(self, idx, data):
-        if idx == 0:
-            self.pins = data & 0x3FFF
-        elif idx == 1:
-            self.bit = data
-        elif idx == 2:
-            self.frame = data & 0x01FF
-        elif idx == 3:
-            self.vcfg = data & 0xFF
-        elif idx == 4:
-            self.step = data
-        elif idx == 5:
-            self.first = data
-        elif idx == 6:
-            self.tick = data & 0xF1F3
-        elif idx == 7:
-            self.odly = data & 0x0F3F
+        return ((self.frame >> 3) & 1) & ((self.tick & 3) != 0) & (self.need ^ 1)
 
     def read(self, idx, ferr):
-        if idx == 0:
-            return self.data_q
-        if idx == 1:
-            return (self.busy | self.rxrdy << 1 | ferr << 2 | self.overrun << 3 | self.serr << 4 | self.nb << 8)
-        return 0
+        status = self.busy | self.rxrdy << 1 | ferr << 2 | self.overrun << 3 | self.serr << 4 | self.nb << 8
+        return mux(idx == 0, self.data_q, mux(idx == 1, status, 0))
 
     def comb(self, start, start_data, stop, pin_in, stick, dtick):
-        ipin = self.ipin
-        ibit = (pin_in >> ipin) & 1
+        ibit = (pin_in >> self.ipin) & 1
         i2 = (pin_in >> field(self.pins, 7, 4)) & 1
         src = self.tick & 3
-        epin = field(self.tick, 7, 4)
+        ein = (pin_in >> field(self.tick, 7, 4)) & 1
         eedge = (self.tick >> 8) & 1
-        ein = (pin_in >> epin) & 1
         sdly = self.tick >> 12
         msb, hold, inv = self.frame & 1, (self.frame >> 1) & 1, (self.frame >> 2) & 1
         n = nbits_of(self.frame)
-        B = self.bit or 1
+        B = mux(self.bit != 0, self.bit, 1)
         live = self.busy
-        diff = (self.pins >> 13) & 1
-        se0 = diff and not ibit and not i2
+        se0 = ((self.pins >> 13) & 1) & (ibit ^ 1) & (i2 ^ 1)
         odly, nrzi, huntcfg, stuffn = self.odly & 15, (self.odly >> 4) & 1, (self.odly >> 5) & 1, field(self.odly, 11, 8)
 
         # sample and drive events
         edge_i = ibit != self.iprev
-        sel_edge = ein != self.eprev and ein == (eedge ^ 1)
-        opp_edge = ein != self.eprev and ein == eedge
-        raw_t = live and (stick if src == 1 else (sel_edge if src == 2 else 0))
-        tq_n = ((self.tq << 1) | int(bool(raw_t))) & 0xFFFF
-        take_t = bool(raw_t) if sdly == 0 else bool(live and (self.tq >> (sdly - 1)) & 1)
-        raw_o = live and (dtick if src == 1 else (opp_edge if src == 2 else 0))
-        oq_n = ((self.oq << 1) | int(bool(raw_o))) & 0xFFFF
-        drv_d = bool(raw_o) if odly == 0 else bool(live and (self.oq >> (odly - 1)) & 1)
+        sel_edge = (ein != self.eprev) & (ein == (eedge ^ 1))
+        opp_edge = (ein != self.eprev) & (ein == eedge)
+        raw_t = live & mux(src == 1, stick, mux(src == 2, sel_edge, 0))
+        tq_n = ((self.tq << 1) | raw_t) & 0xFFFF
+        take_t = mux(sdly == 0, raw_t, live & ((self.tq >> ((sdly - 1) & 15)) & 1))
+        raw_o = live & mux(src == 1, dtick, mux(src == 2, opp_edge, 0))
+        oq_n = ((self.oq << 1) | raw_o) & 0xFFFF
+        drv_d = mux(odly == 0, raw_o, live & ((self.oq >> ((odly - 1) & 15)) & 1))
 
-        win_now = src == 0 and ((start and self.first == 0) or (live and self.wins < n and self.wcnt == 0))
-        take = False
-        sample = 0
-        if live:
-            if src == 0:
-                take = bool(self.vote.done)
-                sample = self.vote.bit
-            elif src == 3:
-                take = self.wcnt == 0 and not edge_i
-                sample = ibit
-            else:
-                take = take_t
-                sample = ibit
-        if se0:
-            take = False
+        win_now = (src == 0) & ((start & (self.first == 0)) | (live & (self.wins < n) & (self.wcnt == 0)))
+        take = live & (se0 ^ 1) & mux(src == 0, self.vote.done,
+                                      mux(src == 3, (self.wcnt == 0) & (edge_i ^ 1), take_t))
+        sample = mux(src == 0, self.vote.bit, ibit)
 
         # decoding, in the order of Section 4.5
         v = sample ^ inv
-        data = False
-        d_bit = 0
-        hunting, hz, rones, serr = self.hunting, self.hz, self.rones, self.serr
-        sprev = self.sprev
-        if take:
-            d = int(v == sprev) if nrzi else v
-            sprev = v
-            if hunting:
-                if d and hz == 2:
-                    hunting, rones = 0, 1
-                hz = 0 if d else min(hz + 1, 2)
-            elif stuffn and rones == stuffn:
-                if d:
-                    serr = 1
-                rones = 0
-            else:
-                data, d_bit = True, d
-                rones = (rones + 1) & 15 if d else 0
+        d = mux(nrzi, v == self.sprev, v)
+        hunting_t = take & self.hunting
+        skip = (self.hunting ^ 1) & (stuffn != 0) & (self.rones == stuffn)
+        data = take & (self.hunting ^ 1) & (skip ^ 1)
+        found = hunting_t & d & (self.hz == 2)
+        hunting = mux(found, 0, self.hunting)
+        hz = mux(hunting_t, mux(d, 0, mux(self.hz < 2, self.hz + 1, self.hz)), self.hz)
+        rones = mux(found, 1, mux(take & skip, 0, mux(data, mux(d, (self.rones + 1) & 15, 0), self.rones)))
+        serr = mux(take & skip & d, 1, self.serr)
+        sprev = mux(take, v, self.sprev)
 
-        done = data and self.nb == n - 1
-        word = self.word
-        if data:
-            word = ((word << 1) | d_bit) & 0xFFFF if msb else (word | (d_bit << self.nb))
+        done = data & (self.nb == n - 1)
+        word = mux(data, mux(msb, ((self.word << 1) | d) & 0xFFFF, self.word | (d << (self.nb & 15))), self.word)
 
         # drive
-        oen = self.need
-        src_own = src == 0
-        drv_ev = live and self.oidx != n - 1 and ((win_now and self.wins != 0) if src_own else drv_d)
-        wr_o = oen and (start or drv_ev)
-        wm = wv = 0
-        if wr_o:
-            obit = 0 if start else self.oidx + 1
-            dsrc = start_data if start else self.od
-            b = (dsrc >> (n - 1 - obit if msb else obit)) & 1
-            wm = (1 << field(self.pins, 11, 8)) & self.nm
-            wv = wm if b ^ inv else 0
+        drv_ev = live & (self.oidx != n - 1) & mux(src == 0, win_now & (self.wins != 0), drv_d)
+        wr_o = self.need & (start | drv_ev)
+        obit = mux(start, 0, self.oidx + 1)
+        dsrc = mux(start, start_data, self.od)
+        b = (dsrc >> (mux(msb, n - 1 - obit, obit) & 15)) & 1     # 4-bit position, as in the RTL
+        om = (1 << field(self.pins, 11, 8)) & self.nm
 
         # A stop in cycle D is too late: the word is complete (the FIFO grant to the controller
         # depends on push, so push cannot depend on the controller's ustop).
-        push = int(done and not hold)
-        return dict(wm=wm, wv=wv, done=int(done), push=push, push_data=word & 0xFF, bit_v=int(data),
-                    bit_o=d_bit, _=dict(start=start, start_data=start_data, stop=stop, ibit=ibit, ein=ein, tq=tq_n,
-                                        oq=oq_n, win_now=win_now, take=take, data=data, word=word, hunting=hunting,
-                                        hz=hz, rones=rones, serr=serr, sprev=sprev, done=done, hold=hold,
-                                        edge_i=edge_i, drv_ev=drv_ev, n=n, B=B, src=src, huntcfg=huntcfg,
-                                        inv=inv, pin_in=pin_in))
+        return dict(wm=mux(wr_o, om, 0), wv=mux(wr_o & (b ^ inv), om, 0), done=done, push=done & (hold ^ 1),
+                    push_data=word & 0xFF, bit_v=data, bit_o=d,
+                    _=dict(start=start, start_data=start_data, stop=stop, ibit=ibit, ein=ein, tq=tq_n, oq=oq_n,
+                           win_now=win_now, data=data, word=word, hunting=hunting, hz=hz, rones=rones, serr=serr,
+                           sprev=sprev, done=done, hold=hold, edge_i=edge_i, drv_ev=drv_ev, n=n, B=B, src=src,
+                           huntcfg=huntcfg, inv=inv, pin_in=pin_in))
 
     def clock(self, rst, restart, cfg_we, cfg_idx, cfg_data, r, after_end, rd_data_now, clr_ovr):
         if rst:
@@ -164,64 +113,56 @@ class Rxu:
             self.vote = Vote(self.cfg)
             return
         x = r["_"]
-        start, stop, n, B, src = x["start"], x["stop"], x["n"], x["B"], x["src"]
+        start, stop, n, B, src, done = x["start"], x["stop"], x["n"], x["B"], x["src"], x["done"]
         hold = x["hold"]
         v = self.vcfg
-        self.vote.clock(bool(stop or restart), x["win_now"], self.ipin, x["pin_in"], (v & 15) or 1, v >> 4, self.step)
+        self.vote.clock(stop | restart, x["win_now"], self.ipin, x["pin_in"], mux(v & 15, v & 15, 1), v >> 4, self.step)
         self.eprev, self.iprev = x["ein"], x["ibit"]
-        self.tq, self.oq = (0, 0) if (stop or restart or start) else (x["tq"], x["oq"])
+        clear = stop | restart | start
+        self.tq, self.oq = mux(clear, 0, x["tq"]), mux(clear, 0, x["oq"])
 
         # results
-        if x["done"]:
-            self.rbyte = x["word"]
+        self.rbyte = mux(done, x["word"], self.rbyte)
         if restart:
             self.rxrdy = self.overrun = 0
         else:
-            if after_end and hold and self.rxrdy and not rd_data_now:
-                self.overrun = 1                    # a set wins over a clear in the same cycle
-            elif clr_ovr:
-                self.overrun = 0
-            if after_end and hold:
-                self.data_q = x["word"] if x["done"] else self.rbyte
-                self.rxrdy = 1
-            elif rd_data_now:
-                self.rxrdy = 0
+            load = after_end & hold
+            # a set of overrun wins over a clear in the same cycle
+            self.overrun = mux(load & self.rxrdy & (rd_data_now ^ 1), 1, mux(clr_ovr, 0, self.overrun))
+            self.data_q = mux(load, self.rbyte, self.data_q)
+            self.rxrdy = mux(load, 1, mux(rd_data_now, 0, self.rxrdy))
 
+        chain_on = self.chain_on
         if start:
             self.busy = 1
             self.word = self.nb = self.oidx = self.serr = 0
             self.od = x["start_data"]
-            if self.first == 0:
-                self.wins, self.wcnt = 1, B - 1
-            else:
-                self.wins, self.wcnt = 0, self.first - 1
+            no_first = self.first == 0
+            self.wins = mux(no_first, 1, 0)
+            self.wcnt = mux(no_first, B - 1, self.first - 1)
             self.hunting, self.hz, self.rones = x["huntcfg"], 0, 0
             self.sprev = x["ibit"] ^ x["inv"]
         elif self.busy:
-            if stop or restart or (x["done"] and not self.chain_on):
-                self.busy = 0
+            self.busy = mux(stop | restart | (done & (chain_on ^ 1)), 0, 1)
             self.hunting, self.hz, self.rones, self.serr = x["hunting"], x["hz"], x["rones"], x["serr"]
             self.sprev = x["sprev"]
-            if x["data"]:
-                restart_word = x["done"] and self.chain_on
-                self.word = 0 if restart_word else x["word"]
-                self.nb = 0 if restart_word else self.nb + 1
-            if x["drv_ev"]:
-                self.oidx = (self.oidx + 1) & 15
-            if src == 0:
-                if self.wcnt == 0:
-                    if self.wins < n:
-                        self.wins += 1
-                        self.wcnt = B - 1
-                else:
-                    self.wcnt -= 1
-            elif src == 3:
-                half = B >> 1
-                if x["edge_i"]:
-                    self.wcnt = max(half - 1, 0)
-                elif self.wcnt == 0:
-                    self.wcnt = B - 1
-                else:
-                    self.wcnt -= 1
-        if cfg_we:
-            self.cfg_write(cfg_idx, cfg_data)
+            next_word = done & chain_on
+            self.word = mux(next_word, 0, x["word"])
+            self.nb = mux(next_word, 0, mux(x["data"], (self.nb + 1) & 31, self.nb))
+            self.oidx = mux(x["drv_ev"], (self.oidx + 1) & 15, self.oidx)
+            zero = self.wcnt == 0
+            more = zero & (self.wins < n)
+            half = B >> 1
+            own = mux(zero, mux(more, B - 1, self.wcnt), self.wcnt - 1)
+            dp = mux(x["edge_i"], mux(half != 0, half - 1, 0), mux(zero, B - 1, self.wcnt - 1))
+            self.wcnt = mux(src == 0, own, mux(src == 3, dp, self.wcnt))
+            self.wins = mux((src == 0) & more, self.wins + 1, self.wins)
+        w = [cfg_we & (cfg_idx == k) for k in range(8)]
+        self.pins = mux(w[0], cfg_data & 0x3FFF, self.pins)
+        self.bit = mux(w[1], cfg_data, self.bit)
+        self.frame = mux(w[2], cfg_data & 0x01FF, self.frame)
+        self.vcfg = mux(w[3], cfg_data & 0xFF, self.vcfg)
+        self.step = mux(w[4], cfg_data, self.step)
+        self.first = mux(w[5], cfg_data, self.first)
+        self.tick = mux(w[6], cfg_data & 0xF1F3, self.tick)
+        self.odly = mux(w[7], cfg_data & 0x0F3F, self.odly)

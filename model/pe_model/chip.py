@@ -155,10 +155,10 @@ class Chip:
         cw = e["cfg_we"]
         cu, ci, cd = e["cfg_unit"], e["cfg_idx"], e["cfg_data"]
         crc.clock(rst, cw and cu == 4, ci, cd, t["bit_v"], t["bit_o"], r["bit_v"], r["bit_o"], t["chain"] and next_crc)
-        etx.clock(rst, restart, te, a_e, tx_busy, t["done"], stm & 1 or etx_stop, etx_ack,
+        etx.clock(rst, restart, te, a_e, tx_busy, t["done"], int(bool(stm & 1 or etx_stop)), etx_ack,
                   e["det_clr"] and not e["det_sel"], e["det_arm"] and not e["det_sel"],
                   e["det_disarm"] and not e["det_sel"], cw and cu == 2, ci, cd)
-        erx.clock(rst, restart, tr, a_r, rx.busy, r["done"], stm & 2 or erx_stop, erx_ack,
+        erx.clock(rst, restart, tr, a_r, rx.busy, r["done"], int(bool(stm & 2 or erx_stop)), erx_ack,
                   e["det_clr"] and e["det_sel"], e["det_arm"] and e["det_sel"],
                   e["det_disarm"] and e["det_sel"], cw and cu == 3, ci, cd)
         rxrdy_after = a_r["after_end"]

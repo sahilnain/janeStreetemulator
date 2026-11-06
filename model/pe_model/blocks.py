@@ -21,6 +21,11 @@ def bits(v, w):
     return v & ((1 << w) - 1)
 
 
+def mux(c, a, b):
+    """a if c else b, without a branch when the proof in model/equiv/ runs the model symbolically."""
+    return c.mux(a, b) if hasattr(c, "mux") else (a if c else b)
+
+
 # ------------------------------------------------------------------- FIFO
 class Fifo:
     def __init__(self, depth, w):
@@ -121,16 +126,10 @@ class Pins:
         for i in range(self.n):
             o = (owner >> (2 * i)) & 3
             b = 1 << i
-            if o == 1:
-                own_t |= b
-                if not tx_busy:
-                    ok_c |= b
-            elif o == 2:
-                own_r |= b
-                if not rx_busy:
-                    ok_c |= b
-            else:
-                ok_c |= b
+            is_t, is_r = o == 1, o == 2
+            own_t |= is_t * b
+            own_r |= is_r * b
+            ok_c |= b * (is_t * (1 - tx_busy) + is_r * (1 - rx_busy) + (1 - is_t - is_r))
         t_wh, t_oh = t[0] & own_t, t[2] & own_t
         r_wh = r[0] & own_r
         c_wh = c[0] & ok_c & ~t_wh & ~r_wh
@@ -166,23 +165,23 @@ class Vote:
             self.sel = self.n_l = self.k_l = self.s_l = self.scnt = self.idx = self.ones = 0
             return
         done = 0
-        if start and not self.running:
+        if start & (self.running ^ 1):
             self.running = 1
             self.sel, self.n_l, self.k_l, self.s_l = pin_sel, n_cfg, k_cfg, s_cfg
-            self.scnt = s_cfg - 1 if s_cfg else 0
+            self.scnt = mux(s_cfg != 0, s_cfg - 1, 0)
             self.idx = self.ones = 0
         elif self.running:
             if self.scnt == 0:
                 sample = (pin_in >> self.sel) & 1
-                in_win = self.idx >= self.k_l and self.idx + self.k_l < self.n_l
-                ones_nx = bits(self.ones + int(in_win and sample), self.nw)
+                in_win = (self.idx >= self.k_l) & (self.idx + self.k_l < self.n_l)
+                ones_nx = bits(self.ones + (in_win & sample), self.nw)
                 self.ones = ones_nx
-                self.scnt = self.s_l - 1 if self.s_l else 0
+                self.scnt = mux(self.s_l != 0, self.s_l - 1, 0)
                 if self.idx + 1 >= self.n_l:
                     self.running = 0
                     done = 1
-                    votes = max(self.n_l - 2 * self.k_l, 0)
-                    self.bit = int(2 * ones_nx > votes)
+                    votes = self.n_l - 2 * self.k_l
+                    self.bit = 2 * ones_nx > mux(votes > 0, votes, 0)
                 else:
                     self.idx = bits(self.idx + 1, self.nw)
             else:
@@ -300,30 +299,29 @@ class Regs:
     def comb(self, h):
         """h: the host interface's combinational outputs."""
         a, wd, we, re = h["r_addr"], h["r_wdata"], h["r_we"], h["r_re"]
-        errclr = we and a == A_ERR_CLR
-        commit = we and a == A_IMDATA + 3
-        dm_acc = (we or re) and a == A_DMDATA
+        errclr = we & (a == A_ERR_CLR)
+        commit = we & (a == A_IMDATA + 3)
         return dict(
-            im_commit=int(bool(commit)), im_we=int(bool(commit and not self.run)), im_waddr=self.imaddr,
+            im_commit=commit, im_we=commit & (self.run ^ 1), im_waddr=self.imaddr,
             im_wdata=(wd << 24) | self.stage,
-            txf_wr=int(bool(we and a == A_TXF)), txf_wdata=wd,
-            rxf_rd=int(bool(re and a == A_RXF)),
-            txf_clr=int(bool(errclr and wd & 0x10)), rxf_clr=int(bool(errclr and wd & 0x20)),
-            owner_clr=int(bool(errclr and wd & 0x40)),
-            restart=int(bool(we and a == A_RESTART and wd & 1)),
-            db_set=int(bool(we and a == A_DOORBELL)),
-            rx_ovr_clr=int(bool(we and a == A_STATUS2 and wd & 4)),
-            dm_acc=int(bool(dm_acc)), dm_we=int(bool(we and a == A_DMDATA)), dm_addr=self.dm_addr, dm_wdata=wd,
+            txf_wr=we & (a == A_TXF), txf_wdata=wd,
+            rxf_rd=re & (a == A_RXF),
+            txf_clr=errclr & (wd >> 4), rxf_clr=errclr & (wd >> 5), owner_clr=errclr & (wd >> 6),
+            restart=we & (a == A_RESTART) & wd,
+            db_set=we & (a == A_DOORBELL),
+            rx_ovr_clr=we & (a == A_STATUS2) & (wd >> 2),
+            dm_acc=(we | re) & (a == A_DMDATA), dm_we=we & (a == A_DMDATA), dm_addr=self.dm_addr, dm_wdata=wd,
         )
 
     def status2(self, rx_overrun):
         return (self.st2 & 0x03) | (rx_overrun << 2) | (self.st2 & 0x18)
 
     def irq(self, st):
-        any_err = (st["txf_overrun"] or st["rxf_overrun"] or st["owner_err"] or self.imem_err
-                   or (self.status2(st["rx_overrun"]) & 0xF))
-        return int(bool((self.irq_en & 1 and not st["rxf_empty"]) or (self.irq_en & 2 and not st["txf_full"])
-                        or (self.irq_en & 4 and any_err) or (self.irq_en & 8 and self.st2 & 0x10)))
+        any_err = (st["txf_overrun"] | st["rxf_overrun"] | st["owner_err"] | self.imem_err
+                   | ((self.status2(st["rx_overrun"]) & 0xF) != 0))
+        en = self.irq_en
+        return ((en & (st["rxf_empty"] ^ 1)) | ((en >> 1) & (st["txf_full"] ^ 1)) | ((en >> 2) & any_err)
+                | ((en >> 3) & (self.st2 >> 4))) & 1
 
     def read(self, a, st):
         if a == A_ID:
@@ -375,39 +373,30 @@ class Regs:
             return
         c = self.cfg
         a, wd, we = h["r_addr"], h["r_wdata"], h["r_we"]
+
+        def wr(addr):
+            return we & (a == addr)
+
+        def byte_in(old, k, w):
+            sh = 8 * k
+            return bits((old & ~(0xFF << sh)) | (wd << sh), w)
+
         run = self.run
-        if we:
-            if a == A_RUN:
-                self.run = wd & 1
-            elif a == A_IRQ_EN:
-                self.irq_en = wd & 0xF
-            elif A_IMDATA <= a < A_IMDATA + 3:
-                sh = 8 * (a - A_IMDATA)
-                self.stage = (self.stage & ~(0xFF << sh)) | (wd << sh)
-            elif A_PIN_OD <= a <= A_PIN_OD + 1:
-                sh = 8 * (a - A_PIN_OD)
-                self.od = bits((self.od & ~(0xFF << sh)) | (wd << sh), c.num_pins)
-            elif A_OWNER <= a <= A_OWNER + 3:
-                sh = 8 * (a - A_OWNER)
-                self.owner = bits((self.owner & ~(0xFF << sh)) | (wd << sh), 2 * c.num_pins)
-            elif A_START_PC <= a <= A_START_PC + 1:
-                sh = 8 * (a - A_START_PC)
-                self.start_pc = bits((self.start_pc & ~(0xFF << sh)) | (wd << sh), c.aw)
-        if we and a == A_IMADDR:
-            self.imaddr = bits((self.imaddr & ~0xFF) | wd, c.aw)
-        elif we and a == A_IMADDR_H:
-            self.imaddr = bits((self.imaddr & 0xFF) | (wd << 8), c.aw)
-        elif rc["im_we"]:
-            self.imaddr = bits(self.imaddr + 1, c.aw)
-        if rc["im_commit"] and run:
-            self.imem_err = 1
-        elif we and a == A_ERR_CLR and wd & 0x80:
-            self.imem_err = 0
-        wc = wd if (we and a == A_STATUS2) else 0
+        self.run = mux(wr(A_RUN), wd & 1, run)
+        self.irq_en = mux(wr(A_IRQ_EN), wd & 0xF, self.irq_en)
+        for k in range(3):
+            self.stage = mux(wr(A_IMDATA + k), byte_in(self.stage, k, 24), self.stage)
+        for k in range(2):
+            self.od = mux(wr(A_PIN_OD + k), byte_in(self.od, k, c.num_pins), self.od)
+            self.start_pc = mux(wr(A_START_PC + k), byte_in(self.start_pc, k, c.aw), self.start_pc)
+        for k in range(4):
+            self.owner = mux(wr(A_OWNER + k), byte_in(self.owner, k, 2 * c.num_pins), self.owner)
+        self.imaddr = mux(wr(A_IMADDR), bits((self.imaddr & ~0xFF) | wd, c.aw),
+                          mux(wr(A_IMADDR_H), bits((self.imaddr & 0xFF) | (wd << 8), c.aw),
+                              mux(rc["im_we"], bits(self.imaddr + 1, c.aw), self.imaddr)))
+        self.imem_err = mux(rc["im_commit"] & run, 1, mux(wr(A_ERR_CLR) & (wd >> 7), 0, self.imem_err))
+        wc = mux(wr(A_STATUS2), wd, 0)
         st2 = self.st2
         self.st2 = ((ill | (st2 & 1 & ~wc)) & 1) | ((stk << 1 | (st2 & 2 & ~wc)) & 2) \
             | ((underrun << 3 | (st2 & 8 & ~wc)) & 8) | ((ctrl_irq << 4 | (st2 & 0x10 & ~wc)) & 0x10)
-        if we and a == A_DMADDR:
-            self.dm_addr = wd
-        elif rc["dm_acc"]:
-            self.dm_addr = (self.dm_addr + 1) & 0xFF
+        self.dm_addr = mux(wr(A_DMADDR), wd, mux(rc["dm_acc"], (self.dm_addr + 1) & 0xFF, self.dm_addr))

@@ -18,11 +18,18 @@ What this file does
   prefix). So EVERY feasible path through the model is executed once.
 * For each path, `explore()` asks Z3 whether ANY state/input on that path
   makes the model differ from the RTL. "unsat" on every path = equivalent.
+* `SymList` stands in for a model list such as a register file. Indexing it with
+  a symbolic value builds a mux instead of splitting the path once per index,
+  which keeps the path count small, and still fails if the index can be out of
+  range.
 """
+
+import os
 
 import z3
 
 W = 64
+PROGRESS = int(os.environ.get("EQUIV_PROGRESS", 0))
 
 
 class EquivError(AssertionError):
@@ -32,11 +39,14 @@ class EquivError(AssertionError):
 class Explorer:
     cur = None  # explorer in charge of the running model code
 
-    def __init__(self, assumptions=()):
+    def __init__(self, assumptions=(), timeout_s=None):
         self.s = z3.SolverFor("QF_BV")
+        if timeout_s:
+            self.s.set("timeout", int(timeout_s * 1000))  # per query, so a slow case fails and cannot hang
         for a in assumptions:
             self.s.add(a)
         self.paths = 0
+        self.describe = None  # gives the state and inputs of a counterexample
 
     def _sat(self, cond):
         self.s.push()
@@ -67,6 +77,8 @@ class Explorer:
     def explore(self, run, check):
         """run(): executes the model, returns its results.
         check(results): list of (name, z3 Bool that is True when model != RTL)."""
+        if self.s.check() != z3.sat:      # assumptions that contradict would make any proof pass
+            raise EquivError("the assumptions cannot all hold")
         self.pending = [[]]
         while self.pending:
             self.prefix, self.i, self.decisions = self.pending.pop(), 0, []
@@ -83,12 +95,15 @@ class Explorer:
             if r == z3.sat:
                 m = self.s.model()
                 bad = [n for n, d in diffs if z3.is_true(m.eval(d, model_completion=True))]
-                raise EquivError(f"model != RTL on path {self.decisions}: {bad}")
+                info = self.describe(m) if self.describe else ""
+                raise EquivError(f"model != RTL: {bad}\n{info}")
             if r != z3.unsat:
                 raise EquivError(f"solver returned {r} on path {self.decisions}")
             self.s.pop()
             self.s.pop()
             self.paths += 1
+            if PROGRESS and self.paths % PROGRESS == 0:
+                print(f"paths {self.paths}, open {len(self.pending)}", flush=True)
         return self.paths
 
 
@@ -96,6 +111,8 @@ def V(x):
     """Z3 bit-vector for a Sym, Python int or bool."""
     if isinstance(x, Sym):
         return x.e
+    if isinstance(x, z3.BitVecRef):
+        return x
     return z3.BitVecVal(int(x), W)
 
 
@@ -123,6 +140,7 @@ class Sym:
     def __rlshift__(self, o): return Sym(V(o) << self.e)
     def __rshift__(self, o): return Sym(self.e >> V(o))      # arithmetic, like Python
     def __rrshift__(self, o): return Sym(V(o) >> self.e)
+    def __mod__(self, o): return Sym(z3.URem(self.e, V(o)))  # only used on values >= 0
     def __neg__(self): return Sym(-self.e)
     def __invert__(self): return Sym(~self.e)
 
@@ -133,6 +151,9 @@ class Sym:
     def __le__(self, o): return SymBool(self.e <= V(o))
     def __gt__(self, o): return SymBool(self.e > V(o))
     def __ge__(self, o): return SymBool(self.e >= V(o))
+
+    def mux(self, a, b):
+        return Sym(z3.If(self.e != 0, V(a), V(b)))
 
     # control flow on a symbolic value -> path decision
     def __bool__(self):
@@ -166,3 +187,35 @@ class SymBool(Sym):
         return 1 if bool(self) else 0
 
     __int__ = __index__
+
+
+class SymList:
+    """A list whose index may be symbolic: a read is a mux, a write a conditional update."""
+
+    def __init__(self, items):
+        self.items = [V(x) for x in items]
+
+    def __len__(self):
+        return len(self.items)
+
+    def _check(self, i):
+        ex = Explorer.cur
+        if ex._sat(z3.Or(i.e < 0, i.e >= len(self.items))):
+            raise EquivError(f"list index can be out of range: {z3.simplify(i.e)}")
+
+    def __getitem__(self, i):
+        if not isinstance(i, Sym):
+            return Sym(self.items[i])
+        self._check(i)
+        out = self.items[-1]
+        for k in range(len(self.items) - 2, -1, -1):
+            out = z3.If(i.e == k, self.items[k], out)
+        return Sym(out)
+
+    def __setitem__(self, i, val):
+        if not isinstance(i, Sym):
+            self.items[i] = V(val)
+            return
+        self._check(i)
+        for k in range(len(self.items)):
+            self.items[k] = z3.If(i.e == k, V(val), self.items[k])

@@ -40,10 +40,10 @@ class Ctrl:
         return bool(run and not self.slot and self.stall == 0)
 
     def _cond(self, code, s):
-        table = (1, self.z, not self.z, self.c, not self.c, self.to, not self.to, s["erx"], not s["erx"],
-                 s["tx_busy"], not s["tx_busy"], s["rx_busy"], not s["rx_busy"], s["etx"], not s["etx"],
-                 s["ferr"], not s["ferr"], s["txf_empty"], not s["txf_empty"], s["txf_full"], s["rxf_empty"],
-                 not s["rxf_empty"], s["rxf_full"], self.db, not self.db, s["rxrdy"], not s["rxrdy"])
+        table = (1, self.z, self.z ^ 1, self.c, self.c ^ 1, self.to, self.to ^ 1, s["erx"], s["erx"] ^ 1,
+                 s["tx_busy"], s["tx_busy"] ^ 1, s["rx_busy"], s["rx_busy"] ^ 1, s["etx"], s["etx"] ^ 1,
+                 s["ferr"], s["ferr"] ^ 1, s["txf_empty"], s["txf_empty"] ^ 1, s["txf_full"], s["rxf_empty"],
+                 s["rxf_empty"] ^ 1, s["rxf_full"], self.db, self.db ^ 1, s["rxrdy"], s["rxrdy"] ^ 1)
         return bool(table[code]) if code < len(table) else False
 
     def comb(self, run, word, s, rd_data, dm_rdata):
@@ -220,7 +220,10 @@ class Ctrl:
             e["host_irq"] = int(fb == 0)
             e["db_clr"] = int(fb == 1)
         elif op == OP_PAR:
-            c = bin(ra).count("1") & 1
+            x = ra ^ (ra >> 8)
+            x ^= x >> 4
+            x ^= x >> 2
+            c = (x ^ (x >> 1)) & 1
         else:
             e["ill"] = 1
 
