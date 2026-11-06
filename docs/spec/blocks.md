@@ -361,7 +361,7 @@ The functional behaviour seen from the host bus is the same as v1. The tests kee
 - `spi_slave_words`: words of 1–16 bits, as two FIFO bytes each, low first. SCK half period ≥ 12 cycles.
 - Every slave prepares the next word before its first clock, so at CS high that word has already left the FIFO and is lost. Load one extra word, or none if only reading.
 
-**I2C, options of `pe_fw.i2c_master` and `pe_fw.i2c_slave`.** Chosen when the firmware is built, so each only costs IMEM when used (master 105 words, up to 138 with `addr10` and `arb`).
+**I2C, options of `pe_fw.i2c_master` and `pe_fw.i2c_slave`.** Chosen when the firmware is built, so each only costs IMEM when used (master: 126 words, 138 with `addr10`, 154 with `arb`, 132 with `hs_B`, 144 with `hs_B` and `addr10`; `arb` with `addr10` needs 166 and does not fit).
 - Timing: `i2c.check_timing` measures the bus against every limit of the I2C standard. The controller's START, STOP and ACK phases last at least H = floor(B/2), the same as a data bit, and the SCL period is B + 2. Fastest legal B: 478 (100 kHz), 126 (375 kHz), 48 (960 kHz), `hs_B` 16 (2.67 MHz; a 50% duty clock cannot reach 3.4 MHz here). These allow for ideal edges, so a real bus needs a margin for its rise time.
 - `addr10`: 10-bit addressing, master and slave. A slave read needs a write address phase first, then a repeated START.
 - `arb` (master): waits for a free bus, then checks every written bit: sent 1 and read 0 means lost. The loser releases both lines at once, sends no STOP, and reports status 3. The writes are clocked by firmware rather than the units, since a unit would keep driving the rest of its byte: B ≥ 48. A loser does not then answer as a slave if it is the one addressed.
@@ -371,7 +371,7 @@ The functional behaviour seen from the host bus is the same as v1. The tests kee
 
 **USB (`pe_fw.usb_device`, `pe_fw.usb_host`).**
 - Pins: jp is high in J (full speed D+, low speed D−), kp is the other. Both are owned by the TX unit; external pull-up and transceiver as USB requires.
-- TX: NRZI, STUFFN = 6, DIFF, EOP, CHAIN; ETX AFTER = release. RX: SRC 3, NRZI, HUNT, STUFFN = 6, CHAIN, DIFF; ERX = SE0 (level 0 on jp with qualifier kp = 0, DUR = max(2, B/4)), STOP.
+- TX: NRZI, STUFFN = 6, DIFF, EOP, CHAIN; ETX AFTER = release. RX: SRC 3, NRZI, HUNT, STUFFN = 6, CHAIN, DIFF; ERX = SE0 (level 0 on jp with qualifier kp = 0, DUR = max(2, B/2)), STOP.
 - A packet: `setoe` both pins, `ustart TX, 0x80` (sync), then PID and data through the FIFO. With data, the CRC unit has APPEND set, SKIP = PID + sync bits still to come.
 - Scope: transaction level, one transaction at a time. Host: token, data, handshake, bus reset, keep-alive EOP. Device: address match, IN / OUT / SETUP, ACK / NAK / STALL chosen by the host side, reset detection. The external host MCU handles enumeration, data toggles, endpoint state, SOF timing and tokens' CRC5 in the host role.
 - Suspend: ETX times the idle bus in hardware (4 words, as a firmware timer does not fit IMEM). CSTAT.ETX set means J for at least 1.37 ms since the last packet, and any packet clears it. The host reads it twice, 1.7 ms apart: still set means suspend. Resume shows as K on PIN_IN, and the firmware keeps hunting throughout. Remote wakeup is not implemented, so the device must not advertise it.

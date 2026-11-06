@@ -1,5 +1,7 @@
 # Module breakdown (RTL v0)
 
+> **Out of date.** This describes the first design (RTL v0: `pe_core`, `pe_ctx`, `pe_exec`, two contexts), which was replaced. For the current chip, read `architecture_guide.md`, `spec/isa.md` and `spec/blocks.md`.
+
 Splits Architecture v2 (`../../Claude.md` §6, `hw_plan.md` §0) into Verilog modules with fixed interfaces, so each module can be written and tested on its own.
 Port lists are the contract between modules. Bit-level instruction encoding and the register map go in `docs/spec/` (M1), not here.
 

@@ -51,7 +51,7 @@ The host starts and stops the controller with the RUN register, as in v1. The co
 
 | Field | Use |
 |---|---|
-| `opcode` | 64 opcodes: 36 used, 28 reserved |
+| `opcode` | 64 opcodes: 34 used, 30 reserved |
 | `dly` | 0–7 extra stall cycles after the instruction (as in v1) |
 | `A` | destination/source register `rd`/`rs`, or unit id / unit mask |
 | `I` | 1: the operand is `imm16`. 0: the operand is register `rs = imm16[2:0]` |
