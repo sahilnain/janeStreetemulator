@@ -510,7 +510,7 @@ def i2c_master(B=126, scl=6, sda=7, odly=None, sdly=2, addr10=False, arb=False, 
         a.ucfg(I.TX, I.TX_BIT, B)
         a.call("start").mov(0, master_code).call("wbyte")           # no acknowledge expected
         a.ucfg(I.TX, I.TX_BIT, hs_B)
-    a.call("start")
+    a.call("start1" if arb else "start")
     if addr10:
         a.mov(0, I.R(4)).shr(0, 7).and_(0, 0x06).or_(0, 0xF0)       # 11110 A9 A8 W
         a.call("wbyte").cmp(5, 0).jmp("err_a", I.NZ)
@@ -562,7 +562,10 @@ def i2c_master(B=126, scl=6, sda=7, odly=None, sdly=2, addr10=False, arb=False, 
         a.mov(6, 1).jpin(sda, 0, "idle").mov(6, 0).jmp("idle")
     # START (also repeated START): SDA falls while SCL is high
     a.L("start").set(sda, I.SRC_1).delay(H).set(scl, I.SRC_1).wait(scl, 1)
-    a.delay(H).set(sda, I.SRC_0)
+    a.delay(H)
+    # With arb, a first START comes here, right after the bus was seen free: in the time of the
+    # phases above, another controller could have started and be in the middle of a bit.
+    a.L("start1").set(sda, I.SRC_0)
     if arb:
         a.call("hi2")                                           # another controller may go first
     else:
