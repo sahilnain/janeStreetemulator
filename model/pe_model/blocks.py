@@ -105,12 +105,10 @@ class Pins:
         self.m = (1 << cfg.num_pins) - 1
         self.out_r, self.oe_r, self.owner_err = self.m, 0, 0
         self.s1 = self.s2 = 0
-        self.filt = self.f_out = 0
-        self.f_cnt = [0] * cfg.num_pins
+        self.f_out = self.f_c0 = self.f_c1 = 0
 
-    @property
-    def pin_in(self):
-        return (self.f_out & self.filt) | (self.s2 & ~self.filt)
+    def pin_in(self, filt):
+        return (self.f_out & filt) | (self.s2 & ~filt)
 
     def pad_out(self, od):
         return self.out_r & ~od & self.m
@@ -118,16 +116,15 @@ class Pins:
     def pad_oe(self, od):
         return ((od & ~self.out_r) | (~od & self.oe_r)) & self.m
 
-    def clock(self, rst, c, t, r, tx_busy, rx_busy, owner, clr, pad_in, filt=0):
+    def clock(self, rst, c, t, r, tx_busy, rx_busy, owner, clr, pad_in, filt):
         """c, t, r: (wm, wv, om, ov) of the CTRL, TXP and RXP ports.
         filt: PIN_FILT. A filtered input takes a new level only after 4 samples in a row have it, so
-        it rejects anything shorter than 3 clock periods: 62 ns at 48 MHz, covering the 50 ns
-        spikes of I2C (UM10204 Table 10, tSP). It adds 4 cycles of input delay on that pin."""
+        it rejects pulses of up to 3 samples, which covers the 50 ns spikes of I2C at 48 MHz
+        (UM10204 Table 10, tSP). It adds 4 cycles of input delay on that pin."""
         if rst:
             self.out_r, self.oe_r, self.owner_err = self.m, 0, 0
             self.s1 = self.s2 = 0
-            self.filt = self.f_out = 0
-            self.f_cnt = [0] * self.n
+            self.f_out = self.f_c0 = self.f_c1 = 0
             return
         own_t = own_r = ok_c = 0
         for i in range(self.n):
@@ -152,20 +149,11 @@ class Pins:
             self.owner_err = 1
         elif clr:
             self.owner_err = 0
-        for i in range(self.n):
-            b = 1 << i
-            if not (self.filt & b):
-                self.f_out = (self.f_out & ~b) | (self.s2 & b)
-                self.f_cnt[i] = 0
-            elif (self.s2 ^ self.f_out) & b:
-                if self.f_cnt[i] == 3:
-                    self.f_out ^= b
-                    self.f_cnt[i] = 0
-                else:
-                    self.f_cnt[i] += 1
-            else:
-                self.f_cnt[i] = 0
-        self.filt = filt & self.m
+        diff = (self.s2 ^ self.f_out) & filt
+        fire = diff & self.f_c0 & self.f_c1
+        self.f_out = ((self.s2 & ~filt) | ((self.f_out ^ fire) & filt)) & self.m
+        self.f_c1 = diff & (self.f_c0 ^ self.f_c1)
+        self.f_c0 = diff & ~self.f_c0
         self.s1, self.s2 = pad_in & self.m, self.s1
 
 

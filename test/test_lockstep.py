@@ -242,6 +242,7 @@ async def host_ops(dut, ls, bus, rng, n):
             await bus.write(R.PIN_OWNER + rng.randrange(2), rng.getrandbits(8))
         elif a < 0.86:
             await bus.write(R.PIN_OD, rng.getrandbits(8) if rng.random() < 0.3 else 0)
+            await bus.write(R.PIN_FILT, rng.getrandbits(8) if rng.random() < 0.3 else 0)
         elif a < 0.87:
             await bus.write(R.RUN, 1)
             await bus.write(R.IMEM_DATA + 3, rng.getrandbits(8))   # commit while running: imem_err

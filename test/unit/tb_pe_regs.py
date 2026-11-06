@@ -33,14 +33,14 @@ INS = ("r_addr", "r_wdata", "r_we", "r_re", "txf_full", "txf_empty", "txf_count"
        "dm_rdata")
 OUTS = ("r_rdata", "irq", "im_we", "im_waddr", "im_wdata", "txf_wr", "txf_wdata",
         "txf_clr_overrun", "rxf_rd", "rxf_clr_overrun", "run", "restart", "start_pc", "db_set",
-        "rx_ovr_clr", "pin_owner", "pin_od", "owner_clr_err", "dm_acc", "dm_we", "dm_addr",
+        "rx_ovr_clr", "pin_owner", "pin_od", "pin_filt", "owner_clr_err", "dm_acc", "dm_we", "dm_addr",
         "dm_wdata")
 MAPPED = list(range(0x00, 0x16)) + [0x18, 0x19, 0x1A, 0x1B, 0x20, 0x21, 0x22, 0x23, 0x24, 0x28, 0x29]
 
 
 class Regs:
     def __init__(self):
-        self.run = self.start_pc = self.owner = self.od = self.imaddr = self.stage = 0
+        self.run = self.start_pc = self.owner = self.od = self.filt = self.imaddr = self.stage = 0
         self.irq_en = self.imem_err = self.dm_addr = 0
         self.st2 = 0  # bits 0,1,3,4
 
@@ -59,6 +59,7 @@ class Regs:
               0x07: (i["txf_count"] & cm) | ((i["rxf_count"] & cm) << 4), 0x09: i["rxf_rdata"],
               0x0A: self.imaddr & 0xFF, 0x0D: self.imaddr >> 8, 0x0B: i["pin_in"] & 0xFF,
               0x0C: (i["pin_in"] >> 8) & 0xFF, 0x0E: s2, 0x14: self.od & 0xFF, 0x15: self.od >> 8,
+              0x16: self.filt & 0xFF, 0x17: self.filt >> 8,
               0x18: self.owner & 0xFF, 0x19: (self.owner >> 8) & 0xFF, 0x1A: (self.owner >> 16) & 0xFF,
               0x1B: (self.owner >> 24) & 0xFF, 0x20: self.start_pc & 0xFF, 0x21: self.start_pc >> 8,
               0x22: i["pc"] & 0xFF, 0x23: i["pc"] >> 8, 0x24: (i["cstat_in"] & 0xFE) | self.run,
@@ -70,7 +71,7 @@ class Regs:
                  rxf_clr_overrun=int(we and a == 0x05 and d >> 5 & 1), run=self.run,
                  restart=int(we and a == 0x03 and d & 1), start_pc=self.start_pc,
                  db_set=int(we and a == 0x0F), rx_ovr_clr=int(we and a == 0x0E and d >> 2 & 1),
-                 pin_owner=self.owner, pin_od=self.od, owner_clr_err=int(we and a == 0x05 and d >> 6 & 1),
+                 pin_owner=self.owner, pin_od=self.od, pin_filt=self.filt, owner_clr_err=int(we and a == 0x05 and d >> 6 & 1),
                  dm_acc=int((we or re) and a == 0x29), dm_we=int(we and a == 0x29), dm_addr=self.dm_addr,
                  dm_wdata=d)
         return o
@@ -89,6 +90,9 @@ class Regs:
             if a in (0x14, 0x15):
                 sh = 8 * (a - 0x14)
                 self.od = ((self.od & ~(0xFF << sh)) | (d << sh)) & ((1 << NP) - 1)
+            if a in (0x16, 0x17):
+                sh = 8 * (a - 0x16)
+                self.filt = ((self.filt & ~(0xFF << sh)) | (d << sh)) & ((1 << NP) - 1)
             if 0x18 <= a <= 0x1B:
                 sh = 8 * (a - 0x18)
                 self.owner = ((self.owner & ~(0xFF << sh)) | (d << sh)) & ((1 << (2 * NP)) - 1)

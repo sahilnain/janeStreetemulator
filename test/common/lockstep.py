@@ -99,11 +99,15 @@ class Lockstep:
             ("pins.out_r", up.u_pins.out_r, lambda m: m.pins.out_r, always),
             ("pins.oe_r", up.u_pins.oe_r, lambda m: m.pins.oe_r, always),
             ("pins.owner_err", up.u_pins.owner_err, lambda m: m.pins.owner_err, always),
+            ("pins.filt_out", up.u_pins.filt_out, lambda m: m.pins.f_out, always),
+            ("pins.filt_c0", up.u_pins.filt_c0, lambda m: m.pins.f_c0, always),
+            ("pins.filt_c1", up.u_pins.filt_c1, lambda m: m.pins.f_c1, always),
             ("regs.run", up.u_regs.run, lambda m: m.regs.run, always),
             ("regs.imaddr", up.u_regs.imaddr, lambda m: m.regs.imaddr, always),
             ("regs.start_pc", up.u_regs.start_pc, lambda m: m.regs.start_pc, always),
             ("regs.pin_owner", up.u_regs.pin_owner, lambda m: m.regs.owner, always),
             ("regs.pin_od", up.u_regs.pin_od, lambda m: m.regs.od, always),
+            ("regs.pin_filt", up.u_regs.pin_filt, lambda m: m.regs.filt, always),
             ("regs.irq_en", up.u_regs.irq_en, lambda m: m.regs.irq_en, always),
             ("regs.imem_err", up.u_regs.imem_err, lambda m: m.regs.imem_err, always),
             ("regs.dm_addr", up.u_regs.dm_addr, lambda m: m.regs.dm_addr, always),
@@ -168,7 +172,7 @@ class Lockstep:
     def _context(self):
         """The model's unit state, to help read a failure."""
         m = self.chip
-        return (f"pin_in={m.pins.pin_in:02x} tx busy={m.tx.busy} pins={m.tx.pins:04x} bit={m.tx.bit} frame={m.tx.frame:04x} "
+        return (f"pin_in={m.pins.pin_in(m.regs.filt):02x} tx busy={m.tx.busy} pins={m.tx.pins:04x} bit={m.tx.bit} frame={m.tx.frame:04x} "
                 f"clk={m.tx.clk} tick={m.tx.tick:04x} line={m.tx.line:04x} | rx busy={m.rx.busy} pins={m.rx.pins:04x} "
                 f"bit={m.rx.bit} frame={m.rx.frame:04x} vote={m.rx.vcfg:02x} step={m.rx.step} first={m.rx.first} "
                 f"tick={m.rx.tick:04x} odly={m.rx.odly:04x} | etx cond={m.etx.cond:04x} dur={m.etx.dur} aft={m.etx.aft} "

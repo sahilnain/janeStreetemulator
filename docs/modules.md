@@ -102,7 +102,7 @@ Conventions for every module: `clk` and active-high synchronous `rst` (generated
              out [NUM_CTX*IMEM_AW-1:0] ctx_start_pc, out [NUM_CTX-1:0] ctx_shift_msb,
              out vote N/S/k per vote unit
   core stat: in [NUM_CTX*IMEM_AW-1:0] ctx_pc, in [NUM_CTX-1:0] ctx_stalled, in err flags
-  pin cfg  : out [NUM_PINS*CTX_W-1:0] pin_owner, out [NUM_PINS-1:0] pin_od,
+  pin cfg  : out [NUM_PINS*CTX_W-1:0] pin_owner, out [NUM_PINS-1:0] pin_od, out [NUM_PINS-1:0] pin_filt,
              in [NUM_PINS-1:0] pin_in (readback), in owner_err
   ```
 - **Test:** cocotb write/readback of every register, plus a check that reserved addresses read 0.
@@ -122,14 +122,14 @@ Conventions for every module: `clk` and active-high synchronous `rst` (generated
 - **Does:** 2-FF synchroniser with a reset value parameter. Used by `pe_pins` and `pe_host_if`.
 
 ### 3.7 `pe_pins`
-- **Does:** the pin fabric. Each pin has an `out` reg and an `oe` reg, which hold until written. Open-drain mode (`pin_od[i]`): writing 1 releases (oe=0), writing 0 drives low (oe=1, out=0). An owner check lets a write from context `c` affect only pins with `pin_owner[i]==c`. Other bits are ignored and `owner_err` is set (sticky). Inputs pass through `pe_sync`.
+- **Does:** the pin fabric. Each pin has an `out` reg and an `oe` reg, which hold until written. Open-drain mode (`pin_od[i]`): writing 1 releases (oe=0), writing 0 drives low (oe=1, out=0). Input filter (`pin_filt[i]`): `pin_in` takes a new level after 4 samples in a row have it. An owner check lets a write from context `c` affect only pins with `pin_owner[i]==c`. Other bits are ignored and `owner_err` is set (sticky). Inputs pass through `pe_sync`.
 - **Ports:**
   ```
   from core: in wr_en, in [CTX_W-1:0] wr_ctx,
              in [NUM_PINS-1:0] wr_mask, in [NUM_PINS-1:0] wr_val,     // set / out / set C / side-set
              in oe_en, in [NUM_PINS-1:0] oe_mask, in [NUM_PINS-1:0] oe_val
   to core  : out [NUM_PINS-1:0] pin_in_sync
-  cfg      : in pin_owner, in pin_od, out owner_err, in clr_err
+  cfg      : in pin_owner, in pin_od, in pin_filt, out owner_err, in clr_err
   pads     : out [NUM_PINS-1:0] pad_out, out [NUM_PINS-1:0] pad_oe, in [NUM_PINS-1:0] pad_in
   ```
 - **Notes:** a mask/value write port covers `set` (1 bit), `out pin,n` (n consecutive bits) and side-set (M8) without changing the interface. Only one context executes per cycle, so a single port is enough.

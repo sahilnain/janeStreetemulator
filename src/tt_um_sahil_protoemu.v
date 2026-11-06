@@ -100,7 +100,7 @@ module tt_um_sahil_protoemu (
   wire rx_overrun, rx_ovr_clr;
 
   wire [2*NUM_PINS-1:0] pin_owner;
-  wire [NUM_PINS-1:0] pin_od, pin_in;
+  wire [NUM_PINS-1:0] pin_od, pin_filt, pin_in;
   wire owner_err, owner_clr;
 
   wire h_dm_acc, h_dm_we;
@@ -259,6 +259,7 @@ module tt_um_sahil_protoemu (
       .rx_ovr_clr     (rx_ovr_clr),
       .pin_owner      (pin_owner),
       .pin_od         (pin_od),
+      .pin_filt       (pin_filt),
       .pin_in         (pin_in),
       .owner_err      (owner_err),
       .owner_clr_err  (owner_clr),
@@ -581,6 +582,7 @@ module tt_um_sahil_protoemu (
       .pin_in   (pin_in),
       .pin_owner(pin_owner),
       .pin_od   (pin_od),
+      .pin_filt (pin_filt),
       .owner_err(owner_err),
       .clr_err  (owner_clr),
       .pad_out  (uio_out),

@@ -11,8 +11,9 @@ A Python model of docs/spec/blocks.md Section 7 runs alongside:
   denied bits are dropped and set owner_err (sticky, clr_err clears, set wins)
   priority TXP > RXP > CTRL (only reachable with an idle unit writing)
   pad_out = out & ~od; pad_oe = od ? ~out : oe; pin_in = pad_in delayed 2.
+  pin_filt[i] = 1: pin_in takes a new level after 4 samples in a row have it.
 1. random_ports: 5000 cycles of random writes on all ports, random owners,
-   busy flags and open-drain bits.
+   busy flags, open-drain bits and filter bits.
 2. reset_state: out = 1, oe = 0, no drive, owner_err = 0.
 3. busy_rule: controller write to a TX/RX-owned pin succeeds while the unit
    is idle and is dropped (owner_err) while it is busy.
@@ -31,6 +32,24 @@ PORTS = ("c_wm", "c_wv", "c_om", "c_ov", "t_wm", "t_wv", "t_om", "t_ov", "r_wm",
 class Model:
     def __init__(self):
         self.out, self.oe, self.err = M, 0, 0
+        self.level, self.seen = 0, [0] * NP     # filter: the output, and differing samples in a row
+
+    def pin_in(self, sync, filt):
+        return (self.level & filt) | (sync & ~filt & M)
+
+    def filter_step(self, sync, filt):
+        for i in range(NP):
+            b = 1 << i
+            if not filt & b:
+                self.level = (self.level & ~b) | (sync & b)
+                self.seen[i] = 0
+            elif (sync ^ self.level) & b:
+                self.seen[i] += 1
+                if self.seen[i] == 4:
+                    self.level ^= b
+                    self.seen[i] = 0
+            else:
+                self.seen[i] = 0
 
     def step(self, p, owner, od, txb, rxb, clr):
         own = [(owner >> (2 * i)) & 3 for i in range(NP)]
@@ -59,7 +78,7 @@ def pads(m, od):
 
 
 async def init(dut):
-    for s in PORTS + ("tx_busy", "rx_busy", "pin_owner", "pin_od", "clr_err", "pad_in"):
+    for s in PORTS + ("tx_busy", "rx_busy", "pin_owner", "pin_od", "pin_filt", "clr_err", "pad_in"):
         getattr(dut, s).value = 0
     await start(dut)
     return Model()
@@ -80,19 +99,51 @@ async def random_ports(dut):
         if n % 300 == 0:
             owner = random.getrandbits(2 * NP)
             od = random.getrandbits(NP) if random.random() < 0.5 else 0
+            filt = random.getrandbits(NP) if random.random() < 0.5 else 0
         p = {k: (random.getrandbits(NP) if random.random() < 0.3 else 0) for k in PORTS}
         txb, rxb, clr = random.getrandbits(1), random.getrandbits(1), int(random.random() < 0.05)
-        pin = random.getrandbits(NP)
+        # mostly steady inputs, or the filter never sees 4 equal samples
+        pin = random.getrandbits(NP) if random.random() < 0.1 else hist[-1]
         for k, x in p.items():
             getattr(dut, k).value = x
         dut.tx_busy.value, dut.rx_busy.value, dut.clr_err.value = txb, rxb, clr
         dut.pin_owner.value, dut.pin_od.value, dut.pad_in.value = owner, od, pin
+        dut.pin_filt.value = filt
         await settle()
         check(dut, m, od)
-        assert v(dut.pin_in) == hist[-2], "pin_in = pad_in delayed by 2 cycles"
+        assert v(dut.pin_in) == m.pin_in(hist[-2], filt), "pin_in: delayed by 2 cycles, then the filter"
         m.step(p, owner, od, txb, rxb, clr)
+        m.filter_step(hist[-2], filt)
         hist.append(pin)
         await fall(dut)
+
+
+@cocotb.test()
+async def filter_pulse_width(dut):
+    """A filtered pin ignores a pulse of up to 3 samples and follows one of 4, 4 cycles later."""
+    await init(dut)
+    dut.pin_filt.value = 1
+    dut.pad_in.value = M
+    for _ in range(8):
+        await fall(dut)
+    await settle()
+    assert v(dut.pin_in) & 1 == 1
+    for width in (1, 2, 3, 4):
+        dut.pad_in.value = M - 1
+        seen = []
+        for t in range(width + 12):
+            if t == width:
+                dut.pad_in.value = M
+            await fall(dut)
+            await settle()
+            seen.append(v(dut.pin_in) & 1)
+        if width < 4:
+            assert seen == [1] * len(seen), f"a pulse of {width} went through: {seen}"
+        else:
+            assert 0 in seen, "a pulse of 4 samples was lost"
+            assert seen.index(0) == 2 + 4 - 1, f"delay: {seen}"
+        for _ in range(8):
+            await fall(dut)
 
 
 @cocotb.test()

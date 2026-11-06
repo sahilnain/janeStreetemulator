@@ -52,7 +52,7 @@ class Chip:
         return dict(txf_empty=self.txf.empty, txf_full=self.txf.full, txf_count=self.txf.cnt,
                     txf_overrun=self.txf.overrun, rxf_empty=self.rxf.empty, rxf_full=self.rxf.full,
                     rxf_count=self.rxf.cnt, rxf_overrun=self.rxf.overrun, rxf_rdata=self.rxf.rdata,
-                    owner_err=self.pins.owner_err, rx_overrun=self.rx.overrun, pin_in=self.pins.pin_in,
+                    owner_err=self.pins.owner_err, rx_overrun=self.rx.overrun, pin_in=self.pins.pin_in(self.regs.filt),
                     pc=c.pc, blocked=c.blocked, z=c.z, c=c.c, to=c.to, db=c.db, etx=self.etx.flag,
                     erx=self.erx.flag, dm_rdata=dm_rdata)
 
@@ -83,7 +83,7 @@ class Chip:
         din, op, stb = ui_in & 0xF, (ui_in >> 4) & 3, (ui_in >> 6) & 1
         tx, rx, etx, erx, crc = self.tx, self.rx, self.etx, self.erx, self.crc
         txf, rxf = self.txf, self.rxf
-        pin_in = self.pins.pin_in
+        pin_in = self.pins.pin_in(self.regs.filt)
         tx_busy, rx_busy = tx.busy, self.rx_busy
 
         # host side

@@ -213,12 +213,15 @@ def pins(NUM_PINS=8):
         m = Pins(cfg)
         m.out_r, m.oe_r, m.owner_err = S(r.now("out_r")), S(r.now("oe_r")), S(r.now("owner_err"))
         m.s1, m.s2 = S(r.now("u_sync.s1")), S(r.now("u_sync.s2"))
+        m.f_out, m.f_c0, m.f_c1 = S(r.now("filt_out")), S(r.now("filt_c0")), S(r.now("filt_c1"))
         g = lambda n: S(r.now(n))  # noqa: E731
-        od = g("pin_od")
-        out = dict(pad_out=m.pad_out(od), pad_oe=m.pad_oe(od), pin_in=m.pin_in, owner_err=m.owner_err)
+        od, filt = g("pin_od"), g("pin_filt")
+        out = dict(pad_out=m.pad_out(od), pad_oe=m.pad_oe(od), pin_in=m.pin_in(filt), owner_err=m.owner_err)
         m.clock(g("rst"), (g("c_wm"), g("c_wv"), g("c_om"), g("c_ov")), (g("t_wm"), g("t_wv"), g("t_om"), g("t_ov")),
-                (g("r_wm"), g("r_wv"), 0, 0), g("tx_busy"), g("rx_busy"), g("pin_owner"), g("clr_err"), g("pad_in"))
-        nxt = {"out_r": m.out_r, "oe_r": m.oe_r, "owner_err": m.owner_err, "u_sync.s1": m.s1, "u_sync.s2": m.s2}
+                (g("r_wm"), g("r_wv"), 0, 0), g("tx_busy"), g("rx_busy"), g("pin_owner"), g("clr_err"), g("pad_in"),
+                filt)
+        nxt = {"out_r": m.out_r, "oe_r": m.oe_r, "owner_err": m.owner_err, "u_sync.s1": m.s1, "u_sync.s2": m.s2,
+               "filt_out": m.f_out, "filt_c0": m.f_c0, "filt_c1": m.f_c1}
         return out, nxt, []
 
     return Ob(f"pe_pins NUM_PINS={NUM_PINS}", r, build)
@@ -296,6 +299,7 @@ def regs(IMEM_DEPTH=160, NUM_PINS=8):
         g = lambda n: S(r.now(n))  # noqa: E731
         m = Regs(cfg)
         m.run, m.start_pc, m.owner, m.od = g("run"), g("start_pc"), g("pin_owner"), g("pin_od")
+        m.filt = g("pin_filt")
         m.imaddr, m.stage, m.irq_en, m.imem_err = g("imaddr"), g("stage"), g("irq_en"), g("imem_err")
         m.dm_addr = g("dm_addr")
         # st2[2] is always 0 and never read: rx_overrun takes its place in STATUS2
@@ -313,9 +317,9 @@ def regs(IMEM_DEPTH=160, NUM_PINS=8):
                    txf_clr_overrun=rc["txf_clr"], rxf_clr_overrun=rc["rxf_clr"], owner_clr_err=rc["owner_clr"],
                    restart=rc["restart"], db_set=rc["db_set"], rx_ovr_clr=rc["rx_ovr_clr"], dm_acc=rc["dm_acc"],
                    dm_we=rc["dm_we"], dm_addr=m.dm_addr, dm_wdata=rc["dm_wdata"], run=m.run, start_pc=m.start_pc,
-                   pin_owner=m.owner, pin_od=m.od)
+                   pin_owner=m.owner, pin_od=m.od, pin_filt=m.filt)
         m.clock(g("rst"), h, rc, g("ill_err"), g("stk_err"), g("tx_underrun"), g("ctrl_irq"))
-        nxt = dict(run=m.run, start_pc=m.start_pc, pin_owner=m.owner, pin_od=m.od, imaddr=m.imaddr, stage=m.stage,
+        nxt = dict(run=m.run, start_pc=m.start_pc, pin_owner=m.owner, pin_od=m.od, pin_filt=m.filt, imaddr=m.imaddr, stage=m.stage,
                    irq_en=m.irq_en, imem_err=m.imem_err, st2=m.st2, dm_addr=m.dm_addr)
         return out, nxt, []
 

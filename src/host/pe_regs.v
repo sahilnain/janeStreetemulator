@@ -26,6 +26,7 @@
  *                      0x13 commits to IMEM_ADDR. A commit while RUN = 1 is
  *                      dropped and sets imem_err.
  *   0x14-0x15 PIN_OD   RW  open-drain enable, bit i = pin i
+ *   0x16-0x17 PIN_FILT RW  input filter enable, bit i = pin i (pe_pins)
  *   0x18-0x1B PIN_OWNER RW 2 bits per pin, pin 0 at bit 0
  *   0x20-0x21 START_PC RW  0x22-0x23 PC R
  *   0x24 CSTAT     R   [0] run [1] blocked [2] Z [3] C [4] TO [5] ETX [6] ERX [7] DB
@@ -100,6 +101,7 @@ module pe_regs #(
     // pin fabric
     output reg  [2*NUM_PINS-1:0] pin_owner,
     output reg  [  NUM_PINS-1:0] pin_od,
+    output reg  [  NUM_PINS-1:0] pin_filt,
     input  wire [  NUM_PINS-1:0] pin_in,
     input  wire                  owner_err,
     output wire                  owner_clr_err,
@@ -129,6 +131,7 @@ module pe_regs #(
   localparam A_DOORBELL = 'h0F;
   localparam A_IMDATA = 'h10;
   localparam A_PIN_OD = 'h14;
+  localparam A_PIN_FILT = 'h16;
   localparam A_OWNER = 'h18;
   localparam A_START_PC = 'h20;
   localparam A_PC = 'h22;
@@ -179,15 +182,18 @@ module pe_regs #(
   wire [15:0] pc16 = {{(16 - AW) {1'b0}}, pc};
   wire [15:0] pin16;
   wire [15:0] od16;
+  wire [15:0] filt16;
   wire [31:0] own32;
   generate
     if (NUM_PINS >= 16) begin : g_p16
       assign pin16 = pin_in[15:0];
       assign od16  = pin_od[15:0];
+      assign filt16 = pin_filt[15:0];
       assign own32 = pin_owner[31:0];
     end else begin : g_plt
       assign pin16 = {{(16 - NUM_PINS) {1'b0}}, pin_in};
       assign od16  = {{(16 - NUM_PINS) {1'b0}}, pin_od};
+      assign filt16 = {{(16 - NUM_PINS) {1'b0}}, pin_filt};
       assign own32 = {{(32 - OWN_W) {1'b0}}, pin_owner};
     end
   endgenerate
@@ -200,6 +206,7 @@ module pe_regs #(
       start_pc  <= {AW{1'b0}};
       pin_owner <= {OWN_W{1'b0}};
       pin_od    <= {NUM_PINS{1'b0}};
+      pin_filt  <= {NUM_PINS{1'b0}};
       imaddr    <= {AW{1'b0}};
       stage     <= 24'd0;
       irq_en    <= 4'd0;
@@ -214,6 +221,7 @@ module pe_regs #(
         if (addr == A_IMDATA + 1) stage[15:8] <= r_wdata;
         if (addr == A_IMDATA + 2) stage[23:16] <= r_wdata;
         for (b = 0; b < NUM_PINS; b = b + 1) if (addr == A_PIN_OD + b / 8) pin_od[b] <= r_wdata[b%8];
+        for (b = 0; b < NUM_PINS; b = b + 1) if (addr == A_PIN_FILT + b / 8) pin_filt[b] <= r_wdata[b%8];
         for (b = 0; b < OWN_W; b = b + 1) if (addr == A_OWNER + b / 8) pin_owner[b] <= r_wdata[b%8];
         for (b = 0; b < AW; b = b + 1) if (addr == A_START_PC + b / 8) start_pc[b] <= r_wdata[b%8];
       end
@@ -260,6 +268,8 @@ module pe_regs #(
       A_STATUS2: r_rdata = status2;
       A_PIN_OD: r_rdata = od16[7:0];
       A_PIN_OD + 1: r_rdata = od16[15:8];
+      A_PIN_FILT: r_rdata = filt16[7:0];
+      A_PIN_FILT + 1: r_rdata = filt16[15:8];
       A_OWNER: r_rdata = own32[7:0];
       A_OWNER + 1: r_rdata = own32[15:8];
       A_OWNER + 2: r_rdata = own32[23:16];
@@ -289,7 +299,7 @@ module pe_regs #(
   //   running sets imem_err (sticky until ERR_CLR bit 7).
   // * Strobes and pulses only for their own address and access type.
   // * No write -> no configuration register changes; a write changes only
-  //   the register at its address (RUN, PIN_OD, PIN_OWNER, START_PC, IRQ_EN).
+  //   the register at its address (RUN, PIN_OD, PIN_FILT, PIN_OWNER, START_PC, IRQ_EN).
   // * IMEM_ADDR / DMEM_ADDR auto-increment rules. STATUS2 stickiness (set
   //   wins over W1C). irq equation.
 `ifdef PE_REGS_TOP
@@ -330,13 +340,14 @@ module pe_regs #(
     if (f_past_ok && f_ok) begin
       if (!$past(r_we)) begin
         assert (run == $past(run) && start_pc == $past(start_pc) && irq_en == $past(irq_en));
-        assert (pin_owner == $past(pin_owner) && pin_od == $past(pin_od));
+        assert (pin_owner == $past(pin_owner) && pin_od == $past(pin_od) && pin_filt == $past(pin_filt));
         assert (stage == $past(stage));
       end else begin
         if ($past(addr) == A_RUN) assert (run == $past(r_wdata[0]));
         else assert (run == $past(run));
         if ($past(addr) < A_OWNER || $past(addr) >= A_OWNER + 4) assert (pin_owner == $past(pin_owner));
         if ($past(addr) != A_PIN_OD && $past(addr) != A_PIN_OD + 1) assert (pin_od == $past(pin_od));
+        if ($past(addr) != A_PIN_FILT && $past(addr) != A_PIN_FILT + 1) assert (pin_filt == $past(pin_filt));
         if ($past(addr) != A_START_PC && $past(addr) != A_START_PC + 1)
           assert (start_pc == $past(start_pc));
         if ($past(addr) != A_IRQ_EN) assert (irq_en == $past(irq_en));
