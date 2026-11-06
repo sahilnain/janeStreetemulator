@@ -78,3 +78,56 @@ def test_spi_check_frames_flags_bad_traces():
         check_frames(good, 0, 0, 14)                      # wrong number of edges
     with pytest.raises(AssertionError):
         check_frames(good, 1, 0)                          # SCK not at the idle level
+
+
+def i2c_trace(seq, h=20, scl=6, sda=7, stuck=False):
+    """seq: list of bits with S/P markers. SCL 1 and SDA 1 when idle."""
+    s = bytearray()
+    lc, ld = 1, 1
+
+    def put(n):
+        s.extend([(lc << scl | ld << sda)] * n)
+
+    put(20)
+    for x in seq:
+        if x == "S":
+            ld = 0
+            put(h)
+            lc = 0
+            put(h)
+        elif x == "P":
+            ld = 0
+            put(h)
+            lc = 1
+            put(h)
+            ld = 1
+            put(h)
+        else:
+            ld = x
+            put(h)
+            lc = 1
+            put(h)
+            lc = 0
+    put(20)
+    return s
+
+
+def bits(b):
+    return [(b >> (7 - k)) & 1 for k in range(8)]
+
+
+def test_i2c_good_write_decoded():
+    tr = i2c_trace(["S"] + bits(0xA0) + [0] + bits(0x12) + [0] + ["P"])
+    assert sigrok.i2c(tr, 6, 7)["ev"] == ["S", ("AW", 0x50), "A", ("DW", 0x12), "A", "P"]
+
+
+def test_i2c_nack_seen():
+    tr = i2c_trace(["S"] + bits(0xA1) + [1] + ["P"])
+    assert sigrok.i2c(tr, 6, 7)["ev"] == ["S", ("AR", 0x50), "N", "P"]
+
+
+def test_i2c_timing_flags_fast_and_broken():
+    import i2c_lib as L
+    tr = i2c_trace(["S"] + bits(0xA0) + [0] + ["P"], h=10)
+    assert L.timing(tr, "SM") and L.timing(tr, "FM")     # 10 cycles = 208 ns: far too fast for both
+    assert not L.timing(i2c_trace(["S"] + bits(0xA0) + [0] + ["P"], h=300), "SM", check=("low", "high", "fscl"))

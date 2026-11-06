@@ -489,15 +489,23 @@ def i2c_master(B=126, scl=6, sda=7, odly=None, sdly=2, addr10=False, arb=False, 
     a.ucfg(I.RX, I.RX_TICK, I.rx_tick(I.SRC_TXTICK, sdly=sdly))
     a.ucfg(I.RX, I.RX_ODLY, odly)
     a.set(scl, I.SRC_1).set(sda, I.SRC_1)
-    a.L("idle").jmp("idle", I.NDB)
+    if arb:
+        # The bus is busy from a START to its STOP, whatever the lines show in between (3.1.8).
+        # ERX reports both; r6 != 0 means busy, between requests.
+        a.ucfg(I.ERX_U, I.D_COND, I.cond(sda, I.ANY, qpin=scl, qen=1, qlvl=1))
+        a.ucfg(I.ERX_U, I.D_DUR, 1)
+        a.evt(I.DET_RX, I.EV_ARM).mov(6, 0)
+        a.L("idle").jmp("bev", I.ERX).jmp("idle", I.NDB)
+        a.cmp(6, 0).jmp("idle", I.NZ)
+        a.jpin(scl, 0, "idle").jpin(sda, 0, "idle").delay(H)     # bus free time
+        a.jmp("idle", I.ERX)
+    else:
+        a.L("idle").jmp("idle", I.NDB)
     a.dbclr()
     a.mov(1, 0).ld(4, 1, inc=1).ld(2, 1, inc=1).ld(7, 1, inc=1)    # addr, n_w, n_r
     if addr10:
         a.mov(0, 0x7E).ld(0, 0).shl(0, 8).or_(4, I.R(0))           # r4 = the 10-bit address
     a.mov(3, 0x80).mov(6, 0)
-    if arb:
-        a.L("free").jpin(scl, 0, "free").jpin(sda, 0, "free").delay(H)
-        a.jpin(scl, 0, "free").jpin(sda, 0, "free")
     if hs_B:
         a.ucfg(I.TX, I.TX_BIT, B)
         a.call("start").mov(0, master_code).call("wbyte")           # no acknowledge expected
@@ -529,6 +537,7 @@ def i2c_master(B=126, scl=6, sda=7, odly=None, sdly=2, addr10=False, arb=False, 
     a.st(0, 3, inc=1)
     a.djnz(7, "rl")
     a.L("fin").call("stop")
+    a.mov(6, 0)
     a.jmp("rep")
     a.L("err_a").mov(6, 1).jmp("err")
     a.L("err_d").mov(6, 2)
@@ -543,10 +552,22 @@ def i2c_master(B=126, scl=6, sda=7, odly=None, sdly=2, addr10=False, arb=False, 
         a.ucfg(I.TX, I.TX_BIT, B)
     a.mov(1, 0x7F).st(6, 1)
     a.host_irq()
+    if arb:
+        # Our own START and STOP are behind us. After a lost arbitration the bus stays busy.
+        a.evt(I.DET_RX, I.EV_CLR).evt(I.DET_RX, I.EV_ARM)
+        a.cmp(6, 3).jmp("idle", I.Z).mov(6, 0)
     a.jmp("idle")
+    if arb:
+        a.L("bev").evt(I.DET_RX, I.EV_CLR).evt(I.DET_RX, I.EV_ARM)
+        a.mov(6, 1).jpin(sda, 0, "idle").mov(6, 0).jmp("idle")
     # START (also repeated START): SDA falls while SCL is high
     a.L("start").set(sda, I.SRC_1).delay(H).set(scl, I.SRC_1).wait(scl, 1)
-    a.delay(H).set(sda, I.SRC_0).delay(H).set(scl, I.SRC_0).delay(Q).ret()
+    a.delay(H).set(sda, I.SRC_0)
+    if arb:
+        a.call("hi2")                                           # another controller may go first
+    else:
+        a.delay(H)
+    a.set(scl, I.SRC_0).delay(Q).ret()
     # STOP: SDA rises while SCL is high
     a.L("stop").set(sda, I.SRC_0).delay(H).set(scl, I.SRC_1).wait(scl, 1)
     a.delay(H).set(sda, I.SRC_1).delay(H).ret()
@@ -554,28 +575,48 @@ def i2c_master(B=126, scl=6, sda=7, odly=None, sdly=2, addr10=False, arb=False, 
     if arb:
         a.L("wbyte").shl(0, 8).mov(5, 8)
         a.L("wb").shl(0, 1).set(sda, I.SRC_C).delay(H - Q)     # C = the bit to send; low = H with the Q below
-        a.set(scl, I.SRC_1).wait(scl, 1).delay(H)
+        a.call("hi1")
         a.jmp("wbk", I.NC).jpin(sda, 0, "wlost")               # sent 1, read 0: lost
-        a.L("wbk").set(scl, I.SRC_0).delay(Q).djnz(5, "wb")
+        a.L("wbk").call("hi2").set(scl, I.SRC_0).delay(Q).djnz(5, "wb")
     else:
         a.L("wbyte").ucfg(I.RX, I.RX_PINS, I.rx_pins(sda, sda, 1))
         a.ustart(I.M_BOTH, I.R(0))
         a.uwait(I.M_BOTH)
-        a.urd(5, I.RX, I.RX_DATA)                               # readback (clears RXRDY)
+        a.urd(5, I.RX, I.RX_DATA).delay(odly)                   # readback (clears RXRDY); data hold
     a.set(sda, I.SRC_1).delay(H)                                # release SDA for the ACK
-    a.set(scl, I.SRC_1).wait(scl, 1).delay(H)
+    if arb:
+        a.call("hi1")
+    else:
+        a.set(scl, I.SRC_1).wait(scl, 1).delay(H)
     a.mov(5, 0).jpin(sda, 0, "wa").mov(5, 1)
-    a.L("wa").set(scl, I.SRC_0).delay(Q).ret()
+    a.L("wa")
+    if arb:
+        a.call("hi2")
+    a.set(scl, I.SRC_0).delay(Q).ret()
     if arb:
         a.L("wlost").set(sda, I.SRC_1).set(scl, I.SRC_1).mov(5, 2).ret()
+        # One SCL high phase in clock synchronization (3.1.7). hi1: it starts once SCL is really
+        # high. SDA is read here: another controller may end the phase at any moment. hi2: it ends
+        # after H, or as soon as another controller pulls SCL low. Uses r6.
+        a.L("hi1").set(scl, I.SRC_1).wait(scl, 1).ret()
+        a.L("hi2").mov(6, max(1, H // 2)).wait(scl, 0, rd=6).ret()
     # read into r0; r5 = 0 -> ACK, 1 -> NACK
-    a.L("rbyte").ucfg(I.RX, I.RX_PINS, I.rx_pins(sda))
-    a.set(sda, I.SRC_1)
-    a.ustart(I.M_BOTH)
-    a.uwait(I.M_BOTH)
-    a.urd(0, I.RX, I.RX_DATA)
+    if arb:
+        a.L("rbyte").set(sda, I.SRC_1).mov(0, 0).mov(1, 8)      # r1 is free here: writes are over
+        a.L("rbit").delay(H - Q).call("hi1").shl(0, 1).jpin(sda, 0, "rb0").or_(0, 1)
+        a.L("rb0").call("hi2").set(scl, I.SRC_0).delay(Q).djnz(1, "rbit")
+    else:
+        a.L("rbyte").ucfg(I.RX, I.RX_PINS, I.rx_pins(sda))
+        a.set(sda, I.SRC_1)
+        a.ustart(I.M_BOTH)
+        a.uwait(I.M_BOTH)
+        a.urd(0, I.RX, I.RX_DATA).delay(odly)                   # data hold
     a.cmp(5, 1).set(sda, I.SRC_NC)                             # Z... use C: r5 < 1 -> C=1 -> drive 0
-    a.delay(H).set(scl, I.SRC_1).wait(scl, 1).delay(H)
+    a.delay(H)
+    if arb:
+        a.call("hi1").call("hi2")
+    else:
+        a.set(scl, I.SRC_1).wait(scl, 1).delay(H)
     a.set(scl, I.SRC_0).delay(Q).set(sda, I.SRC_1).ret()
     return a
 
@@ -619,31 +660,31 @@ def i2c_slave(addr=0x42, scl=6, sda=7, addr10=None, general_call=False, hold=0):
         a.cmp(0, 0).jmp("gc", I.Z)
     if addr10 is None:
         a.mov(1, I.R(0)).shr(1, 1).cmp(1, addr).jmp("idle", I.NZ)  # not us: wait for START
-        a.call("ack")
+        a.call("ack").jmp("ev", I.C)
         a.and_(0, 1).jmp("rd", I.NZ)
     else:
         first = 0xF0 | ((addr10 >> 7) & 0x06)
         a.mov(1, I.R(0)).and_(1, 0xFE).cmp(1, first).jmp("idle", I.NZ)
         a.and_(0, 1).jmp("r10", I.NZ)
-        a.call("ack")
+        a.call("ack").jmp("ev", I.C)
         a.call("rx8").jmp("ev", I.C)
         a.cmp(0, addr10 & 0xFF).jmp("nom", I.NZ)
-        a.call("ack").mov(6, 1).jmp("wstart")
+        a.call("ack").jmp("ev", I.C).mov(6, 1).jmp("wstart")
         a.L("nom").mov(6, 0).jmp("idle")
         a.L("r10").cmp(6, 1).jmp("idle", I.NZ)                  # a read must follow our write
-        a.call("ack").jmp("rd")
+        a.call("ack").jmp("ev", I.C).jmp("rd")
         a.L("wstart")
     a.mov(2, 1)                                                 # r2 = 1: next byte is the pointer
     a.L("wr").call("rx8").jmp("ev", I.C)
-    a.call("ack")
+    a.call("ack").jmp("ev", I.C)
     a.cmp(2, 1).jmp("wd", I.NZ)
     a.mov(3, I.R(0)).mov(2, 0).jmp("wr")
     a.L("wd").st(0, 3, inc=1).jmp("wr")
     if general_call:
-        a.L("gc").call("ack").mov(3, I2C_GC_MEM).mov(2, 0).host_irq().jmp("wr")
+        a.L("gc").call("ack").jmp("ev", I.C).mov(3, I2C_GC_MEM).mov(2, 0).host_irq().jmp("wr")
     a.L("rd").ld(0, 3, inc=1)
     a.ustart(I.M_TX, I.R(0))                                    # bit 7 now, then on SCL falls
-    a.delay(12)                                                 # data setup: 250 ns, the longest limit
+    a.delay(60)                                                 # tr(max) + tSU;DAT = 1250 ns (Table 11 note 4)
     a.set(scl, I.SRC_1)                                         # the data is ready: release
     a.uwait(I.M_TX)
     a.set(sda, I.SRC_1)                                         # release for the master ACK
@@ -660,13 +701,15 @@ def i2c_slave(addr=0x42, scl=6, sda=7, addr10=None, general_call=False, hold=0):
     a.L("rx8").ustart(I.M_RX).set(scl, I.SRC_1)
     a.L("rx_w").jmp("rx_ev", I.ERX).jmp("rx_w", I.NRXRDY)
     a.urd(0, I.RX, I.RX_DATA).cmp(0, 0).ret()                   # cmp x,0 -> C = 0
-    a.L("rx_ev").mov(0, 0).cmp(0, 1).ret()                      # 0 - 1 borrows -> C = 1
+    a.L("rx_ev").urd(0, I.RX, I.RX_DATA).mov(0, 0).cmp(0, 1).ret()   # 0 - 1 borrows -> C = 1
     # ACK: SDA low for the 9th clock, then hold SCL low until the next byte is set up
-    a.L("ack").wait(scl, 0).set(sda, I.SRC_0)
+    # C = 1: a START or STOP came right after bit 8, so there is no ACK (r1 is free here)
+    a.L("ack").jmp("ack_ev", I.ERX).jpin(scl, 1, "ack").set(sda, I.SRC_0)
     a.wait(scl, 1).wait(scl, 0).set(scl, I.SRC_0).set(sda, I.SRC_1)
     if hold:
         a.delay(hold)
-    a.ret()
+    a.cmp(0, 0).ret()
+    a.L("ack_ev").mov(1, 0).cmp(1, 1).ret()
     return a
 
 

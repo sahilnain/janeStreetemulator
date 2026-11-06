@@ -105,10 +105,12 @@ class Pins:
         self.m = (1 << cfg.num_pins) - 1
         self.out_r, self.oe_r, self.owner_err = self.m, 0, 0
         self.s1 = self.s2 = 0
+        self.filt = self.f_out = 0
+        self.f_cnt = [0] * cfg.num_pins
 
     @property
     def pin_in(self):
-        return self.s2
+        return (self.f_out & self.filt) | (self.s2 & ~self.filt)
 
     def pad_out(self, od):
         return self.out_r & ~od & self.m
@@ -116,11 +118,16 @@ class Pins:
     def pad_oe(self, od):
         return ((od & ~self.out_r) | (~od & self.oe_r)) & self.m
 
-    def clock(self, rst, c, t, r, tx_busy, rx_busy, owner, clr, pad_in):
-        """c, t, r: (wm, wv, om, ov) of the CTRL, TXP and RXP ports."""
+    def clock(self, rst, c, t, r, tx_busy, rx_busy, owner, clr, pad_in, filt=0):
+        """c, t, r: (wm, wv, om, ov) of the CTRL, TXP and RXP ports.
+        filt: PIN_FILT. A filtered input takes a new level only after 4 samples in a row have it, so
+        it rejects anything shorter than 3 clock periods: 62 ns at 48 MHz, covering the 50 ns
+        spikes of I2C (UM10204 Table 10, tSP). It adds 4 cycles of input delay on that pin."""
         if rst:
             self.out_r, self.oe_r, self.owner_err = self.m, 0, 0
             self.s1 = self.s2 = 0
+            self.filt = self.f_out = 0
+            self.f_cnt = [0] * self.n
             return
         own_t = own_r = ok_c = 0
         for i in range(self.n):
@@ -145,6 +152,20 @@ class Pins:
             self.owner_err = 1
         elif clr:
             self.owner_err = 0
+        for i in range(self.n):
+            b = 1 << i
+            if not (self.filt & b):
+                self.f_out = (self.f_out & ~b) | (self.s2 & b)
+                self.f_cnt[i] = 0
+            elif (self.s2 ^ self.f_out) & b:
+                if self.f_cnt[i] == 3:
+                    self.f_out ^= b
+                    self.f_cnt[i] = 0
+                else:
+                    self.f_cnt[i] += 1
+            else:
+                self.f_cnt[i] = 0
+        self.filt = filt & self.m
         self.s1, self.s2 = pad_in & self.m, self.s1
 
 
@@ -282,6 +303,7 @@ A_ID, A_VERSION, A_RUN, A_RESTART, A_STATUS, A_ERR_CLR, A_IRQ_EN, A_FIFO_CNT = r
 A_TXF, A_RXF, A_IMADDR, A_PIN_IN, A_PIN_IN_H, A_IMADDR_H, A_STATUS2, A_DOORBELL = range(8, 16)
 A_IMDATA, A_PIN_OD, A_OWNER, A_START_PC, A_PC, A_CSTAT = 0x10, 0x14, 0x18, 0x20, 0x22, 0x24
 A_DMADDR, A_DMDATA = 0x28, 0x29
+A_PIN_FILT = 0x16        # 2 bytes, as PIN_OD: input filter per pin (Pins.clock)
 
 
 class Regs:
@@ -292,7 +314,7 @@ class Regs:
         self.reset()
 
     def reset(self):
-        self.run = self.start_pc = self.owner = self.od = 0
+        self.run = self.start_pc = self.owner = self.od = self.filt = 0
         self.imaddr = self.stage = self.irq_en = self.imem_err = 0
         self.st2 = self.dm_addr = 0
 
@@ -352,6 +374,8 @@ class Regs:
             return self.status2(st["rx_overrun"])
         if A_PIN_OD <= a <= A_PIN_OD + 1:
             return (self.od >> (8 * (a - A_PIN_OD))) & 0xFF
+        if A_PIN_FILT <= a <= A_PIN_FILT + 1:
+            return (self.filt >> (8 * (a - A_PIN_FILT))) & 0xFF
         if A_OWNER <= a <= A_OWNER + 3:
             return (self.owner >> (8 * (a - A_OWNER))) & 0xFF
         if A_START_PC <= a <= A_START_PC + 1:
@@ -388,6 +412,7 @@ class Regs:
             self.stage = mux(wr(A_IMDATA + k), byte_in(self.stage, k, 24), self.stage)
         for k in range(2):
             self.od = mux(wr(A_PIN_OD + k), byte_in(self.od, k, c.num_pins), self.od)
+            self.filt = mux(wr(A_PIN_FILT + k), byte_in(self.filt, k, c.num_pins), self.filt)
             self.start_pc = mux(wr(A_START_PC + k), byte_in(self.start_pc, k, c.aw), self.start_pc)
         for k in range(4):
             self.owner = mux(wr(A_OWNER + k), byte_in(self.owner, k, 2 * c.num_pins), self.owner)

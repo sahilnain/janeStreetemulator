@@ -77,7 +77,7 @@ def spi(samples, sck, mosi, miso, cs, cpol=0, cpha=0, msb=True, bits=8):
 
 def i2c(samples, scl, sda):
     """Returns the bus events in order, as ('S'|'Sr'|'P'|'A'|'N') or ('AW'|'AR'|'DW'|'DR', value)."""
-    a = run(samples, f"i2c:scl={scl}:sda={sda}:address_format=unshifted",
+    a = run(samples, f"i2c:scl={scl}:sda={sda}",
             {"i2c": ["start", "repeat-start", "stop", "ack", "nack", "address-read", "address-write",
                      "data-read", "data-write", "warnings"]})
     ev, warn = [], []
@@ -95,7 +95,7 @@ def i2c(samples, scl, sda):
             ev.append("N")
         elif x.cls == "warnings":
             warn.append(x.text)
-        else:
+        elif ":" in x.text:         # the same class also labels the R/W bit, with no value
             ev.append((names[x.cls], int(x.text.split()[-1], 16)))
     return dict(ev=ev, warn=warn, ann=a)
 

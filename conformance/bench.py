@@ -26,7 +26,7 @@ for p in (ROOT / "model", ROOT / "test" / "common"):
         sys.path.insert(0, str(p))
 
 from pe_model import Chip  # noqa: E402
-from pe_model.blocks import (A_DMADDR, A_DMDATA, A_OWNER, A_PIN_OD, A_RESTART, A_RUN,  # noqa: E402
+from pe_model.blocks import (A_DMADDR, A_DMDATA, A_OWNER, A_PIN_FILT, A_PIN_OD, A_RESTART, A_RUN,  # noqa: E402
                              A_RXF, A_START_PC, A_STATUS, A_TXF)
 
 OP_ADDR, OP_WRITE, OP_READ = 0, 1, 2
@@ -98,13 +98,14 @@ class Node:
         hi = self._op(OP_READ)
         return (hi << 4) | self._op(OP_READ)
 
-    def load(self, asm, own=0, od=0):
+    def load(self, asm, own=0, od=0, filt=0):
         """Load firmware and pin settings, and run it."""
         words = asm.words()
         assert len(words) <= len(self.chip.imem.mem), f"{len(words)} words do not fit IMEM"
         self.chip.imem.mem[:len(words)] = words
         self.write(A_RUN, 0)
         self.write(A_PIN_OD, od)
+        self.write(A_PIN_FILT, filt)
         for b in range(4):
             self.write(A_OWNER + b, (own >> (8 * b)) & 0xFF)
         self.write(A_START_PC, 0)
@@ -169,6 +170,7 @@ class Bench:
         self.samples = bytearray()
         self.line = pull
         self.contention = []
+        self.noise = None          # noise(t) -> pins flipped at the chip inputs only
         for nd in self.nodes:
             for _ in range(10):
                 nd.chip.step(0, 0xFF, 0)
@@ -193,8 +195,9 @@ class Bench:
             line = (line & ~(1 << p)) | (e.step((line >> p) & 1) << p)
         self.line = line
         self.samples.append(line)
+        inp = line ^ self.noise(t) if self.noise else line
         for nd in self.nodes:
-            nd.chip.step(nd.ui, line, 1)
+            nd.chip.step(nd.ui, inp, 1)
             nd.outs = nd.chip.outputs()
 
     def run(self, n):
