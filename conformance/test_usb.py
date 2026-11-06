@@ -425,17 +425,19 @@ def test_device_clock_tolerance(speed, pct):
 @pytest.mark.parametrize("seed", range(5))
 @pytest.mark.parametrize("speed", BOTH)
 def test_device_jitter(speed, seed):
-    """Tables 7-4 and 7-5, receiver budget to the next transition: FS 20 ns = 1 cycle, LS 141 ns = 6 cycles."""
+    """Tables 7-4 and 7-5, receiver budget to the next transition."""
     B = SPEEDS[speed]["B"]
-    j = int(U.LIMITS[speed]["jitter_next"] // U.NS)
+    j = U.next_jitter(speed)
+    assert j >= 1
     b, nd = device(speed)
     r = random.Random(seed)
     d = payload(MAXLEN[speed], seed)
-    send(b, speed, encode(token(OUT, ADDR, EP)), jitter=j, rnd=r)
+    send(b, speed, encode(token(OUT, ADDR, EP)), next_j=j, rnd=r)
     b.run(2 * B)
-    send(b, speed, encode(data_packet(DATA0, d)), jitter=j, rnd=r)
+    t = send(b, speed, encode(data_packet(DATA0, d)), next_j=j, rnd=r)
     b.run(WAIT * B)
     assert nd.peek(RXD, len(d)) == d and nd.peek(F.UD_EVENT)[0] == F.EV_OUT
+    turn_ok(bits_after(b.samples, speed, t), speed)
 
 
 def dribble_payload(speed):
@@ -860,3 +862,110 @@ def test_chip_to_chip_control_transfer(speed):
                    {"usb_request": ["request-setup-read", "errors"]})
     assert [a for a in r if a.cls == "request-setup-read"], f"the request decoder saw no request: {r[:4]}"
     assert not [a for a in r if a.cls == "errors"], r[:4]
+
+
+# ---------------------------------------------------------------- the last byte against the EOP
+# A byte can reach the FIFO in the few cycles between the firmware finding it empty and seeing the
+# EOP, so these sweep the start of the peer's packet over every clock phase.
+PHASES = {"FS": range(16), "LS": range(0, 64, 4)}
+LAST_BYTE = [payload(8, s) for s in range(6)] + [[0xFF] * 8, [0] * 8]
+
+
+@pytest.mark.parametrize("speed", BOTH)
+def test_host_keeps_the_last_byte(speed):
+    """A good data packet at any phase: every byte stored and counted, CRC included, and the next
+    transaction is not disturbed by anything left behind."""
+    B = SPEEDS[speed]["B"]
+    for d in LAST_BYTE:
+        for phase in PHASES[speed]:
+            b, nd = host(speed)
+            for rep in range(2):
+                htok(nd, token(IN, ADDR, EP))
+                wait_oe_off(b, nd, B, 60 * B)
+                b.run(2 * B + phase)
+                pkt = data_packet(DATA1, d)
+                send(b, speed, encode(pkt))
+                hwait(b, nd, limit=40 * B + 2000)
+                got = nd.peek(F.UH_STATUS)[0], nd.peek(F.UH_RXLEN)[0], nd.peek(0x80, 11)
+                assert got == (F.UH_OK, 11, pkt), (bytes(d).hex(), phase, rep, got)
+                b.run(8 * B)
+
+
+@pytest.mark.parametrize("hs", (ACK, NAK, STALL))
+@pytest.mark.parametrize("speed", BOTH)
+def test_host_handshake_at_any_phase(speed, hs):
+    """A handshake is one byte, right before its EOP: it must not be reported as a bad packet."""
+    B = SPEEDS[speed]["B"]
+    for phase in PHASES[speed]:
+        b, nd = host(speed)
+        htok(nd, token(OUT, ADDR, EP), DATA1, [1, 2])
+        lim = 40 * 14 * B
+        wait_oe_off(b, nd, B, lim)
+        wait_oe_off(b, nd, B, lim)
+        b.run(2 * B + phase)
+        send(b, speed, encode([hs]))
+        hwait(b, nd, limit=40 * B + 2000)
+        got = nd.peek(F.UH_STATUS)[0], nd.peek(F.UH_RXLEN)[0], nd.peek(F.UH_RPID)[0]
+        assert got == (F.UH_OK, 1, hs), (phase, got)
+
+
+@pytest.mark.parametrize("speed", BOTH)
+def test_device_keeps_the_last_byte(speed):
+    """A good OUT at any phase: every byte stored and counted, CRC included."""
+    B = SPEEDS[speed]["B"]
+    for d in LAST_BYTE:
+        for phase in PHASES[speed]:
+            b, nd = device(speed)
+            send(b, speed, encode(token(OUT, ADDR, EP)))
+            b.run(2 * B + phase)
+            pkt = data_packet(DATA1, d)
+            send(b, speed, encode(pkt))
+            b.run(WAIT * B)
+            b.until(lambda: nd.peek(F.UD_EVENT)[0] == F.EV_OUT, limit=4000, what="event")
+            got = nd.peek(F.UD_RXLEN)[0], nd.peek(F.UD_RXDATA, 11)
+            assert got == (11, pkt), (bytes(d).hex(), phase, got)
+
+
+@pytest.mark.parametrize("seed", range(4))
+@pytest.mark.parametrize("speed", BOTH)
+def test_last_byte_handshake_and_response_time_with_jitter(speed, seed):
+    """Tables 7-4 and 7-5: edges moved inside the budget also move the last byte against the firmware's
+    loops. Both roles, handshakes after an OUT, and the response limits of 7.1.18.1 still hold."""
+    B = SPEEDS[speed]["B"]
+    j = U.next_jitter(speed)
+    r = random.Random(seed)
+    for i in range(40):
+        d = payload(8, 1000 * seed + i)
+        pkt = data_packet(DATA1, d)
+
+        b, nd = host(speed)
+        htok(nd, token(IN, ADDR, EP))
+        wait_oe_off(b, nd, B, 60 * B)
+        b.run(2 * B + i % 16)
+        t = send(b, speed, encode(pkt), next_j=j, rnd=r)
+        hwait(b, nd, limit=40 * B + 2000)
+        b.run(4 * B)
+        got = nd.peek(F.UH_STATUS)[0], nd.peek(F.UH_RXLEN)[0], nd.peek(0x80, 11)
+        assert got == (F.UH_OK, 11, pkt), (i, got)
+        g = bits_after(b.samples, speed, t)
+        assert g is not None and U.TIPD <= g <= U.TRSPIPD2, f"the host's ACK after {g} bit times"
+
+        b, nd = host(speed)
+        htok(nd, token(OUT, ADDR, EP), DATA1, [1, 2])
+        wait_oe_off(b, nd, B, 40 * 14 * B)
+        wait_oe_off(b, nd, B, 40 * 14 * B)
+        b.run(2 * B + i % 16)
+        send(b, speed, encode([ACK]), next_j=j, rnd=r)
+        hwait(b, nd, limit=40 * B + 2000)
+        got = nd.peek(F.UH_STATUS)[0], nd.peek(F.UH_RXLEN)[0], nd.peek(F.UH_RPID)[0]
+        assert got == (F.UH_OK, 1, ACK), (i, got)
+
+        b, nd = device(speed)
+        send(b, speed, encode(token(OUT, ADDR, EP)))
+        b.run(2 * B + i % 16)
+        t = send(b, speed, encode(pkt), next_j=j, rnd=r)
+        b.run(WAIT * B)
+        b.until(lambda: nd.peek(F.UD_EVENT)[0] == F.EV_OUT, limit=4000, what="event")
+        got = nd.peek(F.UD_RXLEN)[0], nd.peek(F.UD_RXDATA, 11)
+        assert got == (11, pkt), (i, got)
+        turn_ok(bits_after(b.samples, speed, t), speed)

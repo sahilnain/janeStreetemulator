@@ -864,15 +864,21 @@ def usb_device(B=4, jp=0, kp=1, turn=None):
     # after the EOP only the CRC and the stuff flag stand between us and the handshake.
     a.L("op").jmp("idle", I.ERX).fget(0, I.FIFO_RX, nb=1).jmp("op", I.C)
     a.st(0, 3, inc=1).cmp(0, PID_DATA0).jmp("rl", I.Z).cmp(0, PID_DATA1).jmp("idle", I.NZ).jmp("rl")
-    a.L("rs").st(0, 3, inc=1)
-    a.L("rl").fget(0, I.FIFO_RX, nb=1).jmp("rs", I.NC).jmp("rl", I.NERX)
-    a.urd(4, I.CRC, I.CRC_VAL)
+    # The EOP is looked for every 2 instructions: the time from here to the handshake is the tightest
+    # in the firmware.
+    a.L("rl").jmp("rle0", I.ERX).jmp("rl", I.RXF_EMPTY).fget(0, I.FIFO_RX).st(0, 3, inc=1).jmp("rl")
+    a.L("rle0").urd(4, I.CRC, I.CRC_VAL)
     _crc_good(a, CRC16_RES, CRC16_DRIB, "rc2", "idle")
     a.L("rc2").urd(4, I.RX, I.RX_STAT).and_(4, I.RX_ST_SERR).jmp("idle", I.NZ)
     if turn:
         a.delay(turn)
     _tx_on(a, jp, kp)
     a.call("hsend")
+    # At full speed the last byte can reach the FIFO just before the EOP, and the loop above leaves
+    # as soon as it sees the EOP. The CRC unit has it already, so answer first and store it now.
+    # At low speed the EOP takes far longer to detect than the loop takes to go round.
+    if B <= 8:
+        a.fget(0, I.FIFO_RX, nb=1).jmp("rle", I.C).st(0, 3, inc=1).L("rle")
     a.mov(0, I.R(3)).sub(0, UD_RXDATA).mov(3, UD_RXLEN).st(0, 3)
     a.mov(0, EV_OUT).jmp("ev")
     a.L("hsend").fput(1, I.FIFO_TX).ucfg(I.CRC, I.CRC_CTRL, 0).uwait(I.M_TX).ret()
@@ -971,25 +977,33 @@ def usb_host(B=4, jp=0, kp=1, gap=None, timeout=None):
     a.ustop(I.M_RX).evt(I.DET_RX, I.EV_DISARM).mov(1, UH_TIMEOUT).jmp("done")
     # The first byte decides. Only a good DATA PID in answer to an IN goes on to the ACK path, where
     # time is short: the other checks are made here, as bytes arrive.
-    a.L("sop").fget(0, I.FIFO_RX, nb=1).jmp("s1", I.NC).jmp("rn", I.ERX).jmp("sop")
+    # A byte can reach the FIFO between finding it empty and seeing the EOP, so nothing is decided
+    # from the FIFO being empty. A one-byte packet is read once more before it is judged (sope). On
+    # the way to the ACK there is no time for that, but the CRC unit has seen the byte already: the
+    # end ("hs") stores what is left, or it would pass as the next packet's PID.
+    a.L("sop").fget(0, I.FIFO_RX, nb=1).jmp("s1", I.NC).jmp("sope", I.ERX).jmp("sop")
     a.L("s1").st(0, 3, inc=1).cmp(6, 0).jmp("rx", I.NZ)
     a.cmp(0, PID_DATA0).jmp("rd", I.Z).cmp(0, PID_DATA1).jmp("rd", I.Z)
-    # anything else: no ACK. One byte is a handshake; more is a bad packet.
-    a.L("rx").fget(0, I.FIFO_RX, nb=1).jmp("rxs", I.NC).jmp("rn", I.ERX).jmp("rx")
-    a.L("rxs").st(0, 3, inc=1).jmp("rx")
+    # anything else gets no ACK: with the CRC unit off the check below cannot pass, and that costs
+    # the ACK no time. One byte is a handshake; more is a bad packet.
+    a.L("rx").ucfg(I.CRC, I.CRC_CTRL, 0).jmp("rd")
     a.L("rs").st(0, 3, inc=1)
     a.L("rd").fget(0, I.FIFO_RX, nb=1).jmp("rs", I.NC).jmp("rd", I.NERX)
     a.urd(4, I.CRC, I.CRC_VAL)
-    _crc_good(a, CRC16_RES, CRC16_DRIB, "rc2", "bad")
+    _crc_good(a, CRC16_RES, CRC16_DRIB, "rc2", "sope")
     a.L("rc2").urd(4, I.RX, I.RX_STAT).and_(4, I.RX_ST_SERR).jmp("bad", I.NZ)
     if gap:
         a.delay(gap)
     _tx_on(a, jp, kp)
     a.mov(0, PID_ACK).fput(0, I.FIFO_TX).uwait(I.M_TX)
     a.jmp("hs")
+    a.L("sope").fget(0, I.FIFO_RX, nb=1).jmp("s1", I.NC)
     a.L("rn").cmp(3, 0x81).jmp("hs", I.Z)
     a.L("bad").mov(1, UH_BADPKT)
-    a.L("hs").evt(I.DET_RX, I.EV_CLR).sub(3, 0x80).mov(0, I.R(3)).mov(3, UH_RXLEN).st(0, 3)
+    a.L("hs")
+    if B <= 8:                      # at low speed the EOP takes far longer than a turn of the loop
+        a.fget(0, I.FIFO_RX, nb=1).jmp("hse", I.C).st(0, 3, inc=1).jmp("hs").L("hse")
+    a.evt(I.DET_RX, I.EV_CLR).sub(3, 0x80).mov(0, I.R(3)).mov(3, UH_RXLEN).st(0, 3)
     a.L("done").mov(3, UH_STATUS).st(1, 3)
     a.L("fin0").host_irq().jmp("idle")
     return a

@@ -101,9 +101,17 @@ def _pins(jp, kp, lv):
     return {J: {jp: 1, kp: 0}, K: {jp: 0, kp: 1}, SE0: {jp: 0, kp: 0}}[lv]
 
 
-def play(jp, kp, levels, bit, jitter=0, rnd=None, se0_cycles=None, glitch=0, release=True):
-    """Generator for Script. bit: cycles per bit, may be fractional. jitter: largest error of an edge,
-    in cycles. se0_cycles: length of the EOP's SE0. glitch: cycles of SE0 put into each J-K change."""
+def next_jitter(speed):
+    """The receiver's budget to the next transition (Tables 7-4, 7-5), in cycles, rounded to nearest:
+    FS 20 ns is 1 cycle, LS 141 ns is 7. Rounding down would make the full-speed value 0."""
+    return round(LIMITS[speed]["jitter_next"] / NS)
+
+
+def play(jp, kp, levels, bit, jitter=0, rnd=None, se0_cycles=None, glitch=0, release=True, next_j=0):
+    """Generator for Script. bit: cycles per bit, may be fractional. jitter: largest error of each edge
+    on its own, in cycles, so neighbours can differ by twice that. next_j: each edge is late by 0 or
+    next_j cycles, so neighbours differ by at most next_j: the budget as the standard states it.
+    se0_cycles: length of the EOP's SE0. glitch: cycles of SE0 put into each J-K change."""
     def g():
         yield _pins(jp, kp, J)
         t, cyc = 0.0, 0
@@ -119,6 +127,8 @@ def play(jp, kp, levels, bit, jitter=0, rnd=None, se0_cycles=None, glitch=0, rel
                 length = se0_cycles
             t += length
             end = t + (rnd.randint(-jitter, jitter) if jitter and lv != SE0 else 0)
+            if next_j and lv != SE0:
+                end = t + rnd.choice((0, next_j))
             k = max(1, int(round(end)) - cyc)
             cyc += k
             if glitch and prev != SE0 and lv != SE0 and prev != lv:
