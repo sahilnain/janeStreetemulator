@@ -31,6 +31,7 @@ project:
     - "unit/pe_txu.v"
     - "unit/pe_rxu.v"
     - "unit/pe_det.v"
+    - "unit/pe_crc.v"
 
 # The pinout of your project. Leave unused pins blank. DO NOT delete or add any pins.
 # This section is for the datasheet/website. Use descriptive names (e.g., RX, TX, MOSI, SCL, SEG_A, etc.).
