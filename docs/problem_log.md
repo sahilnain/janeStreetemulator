@@ -119,6 +119,25 @@ Words used below:
 - `bit_v` has to be allowed in the start cycle
 - the stuffing property must exclude `EXT`
 
+## 5a. Model bugs found by the v2 z3 proof
+
+The proof compares the model and the RTL in every state, including states no test reaches. All of these needed firmware to change a unit's config in the middle of a word, or two events to land in the same cycle. The RTL was right each time, and no RTL changed.
+
+| Problem | Fix |
+|---|---|
+| TX bit timer `o`, bit index `idx` and RX bit count `nb` kept counting in the model but wrap in the RTL | Masked to the RTL's width |
+| TX and RX bit position went negative in the model after `NBITS` shrank mid-word, while the RTL wraps at 4 bits | 4-bit position |
+| RX LSB-first shift used all of `nb` in the model, the RTL only uses 4 bits | 4-bit shift |
+| TX with external clock ignored `crc_pkt` in the model, if the clock mode changed during a CRC word | Same handling as the timer path |
+| TX `sp`: a stretch release and the half-bit set in the same cycle cleared it in the model, set it in the RTL | Set wins |
+
+| Proof problem | Fix |
+|---|---|
+| Each independent `if` in the model doubled the paths: `pe_regs` took 27,820 paths and 22 minutes, `pe_det` never finished | Model logic moved to a small `mux` helper, which adds no path in the proof. `pe_regs` now takes 46 paths and 4 seconds, `pe_det` 13 paths and 1 second |
+| Register and memory indexing split the path once per index | `SymList` turns indexing into a mux, and fails if the index can be out of range |
+| A proof could pass because it left a register out, or because its assumptions contradict | The proof now fails if any flip-flop is not compared, or if the assumptions cannot all hold |
+| My first mutant run reported 28 of 29 as missed | My script read the wrong output line. Fixed: 29 of 29 caught. One mutant had to be replaced because it did not change behaviour |
+
 ## 6. Tool and environment problems
 
 | Problem | Fix |
@@ -148,7 +167,8 @@ These are known limits, not fixed problems.
 **Design and verification**
 - The design needs about 178% of the 6x4 area in synthesis, so it does not fit yet. This is the next task.
 - Place and route, pad timing and gate-level simulation have not been run, so every speed comes from simulation with ideal peers.
-- The z3 proof that the model equals the RTL has not been ported to v2. Lockstep and fuzz cover this ground, but only for what they run.
+- The z3 proof covers each module, not the wiring between them. The chip top (`chip.py` against `tt_um_sahil_protoemu.v`) is still only checked by lockstep and fuzz, for what they run. A few proof assumptions rest on that wiring, such as a unit only getting a start while idle.
+- The IMEM proof covers the flip-flop version. The latch version is not proved against the model, and would need it if the area work moves to latches.
 - One branch is uncovered: `pe_txu.v:377`, which needs a mid-word `EEDGE` change.
 - `docs/modules.md` still describes v1, and `docs/info.md` is an empty template.
 

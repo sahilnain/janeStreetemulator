@@ -43,4 +43,4 @@ The current goal is maximum speed for every protocol regardless of area. That ne
 - `assist` opcode (15) for CRC, NRZI/Manchester and bit stuffing: needed for the stretch goals (low-speed USB, 10BASE-T).
 - Timestamp counter and capture FIFO.
 - SRAM-based instruction memory instead of flip-flops (area).
-- Symbolic proof of the `pe_core` / chip composition (currently covered by lockstep simulation only).
+- Symbolic proof of the chip composition. Each module is proved against the model (`model/tests/test_equiv.py`), but the wiring is covered by lockstep simulation only.
