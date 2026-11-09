@@ -377,3 +377,52 @@ The functional behaviour seen from the host bus is the same as v1. The tests kee
 - Suspend: ETX times the idle bus in hardware (4 words, as a firmware timer does not fit IMEM). CSTAT.ETX set means J for at least 1.37 ms since the last packet, and any packet clears it. The host reads it twice, 1.7 ms apart: still set means suspend. Resume shows as K on PIN_IN, and the firmware keeps hunting throughout. Remote wakeup is not implemented, so the device must not advertise it.
 - Host resume (UH_OP = 3): K for UH_N × 256 cycles, then an EOP. J to K goes through the TX unit with DIFF, since only a unit write changes both pins in one edge.
 - Timing (full speed): answer within 7.5 bit times is met by starting the sync before deciding between data and NAK, and by hunting before the CRC setup.
+
+## 13. Protocol support switches
+
+Each protocol beyond UART can be left out of the build. UART is always built.
+
+| Macro (top level) | Default | Leaves out when 0 |
+|---|---|---|
+| `SUPPORT_SPI` | 1 | features only SPI uses, and shared ones nobody else needs |
+| `SUPPORT_I2C` | 1 | the same for I2C |
+| `SUPPORT_USB` | 1 | the same for USB, and the CRC unit |
+
+**How a feature is left out.** Its config field is never written, so it keeps its reset value, 0, as if firmware never set it. A register that never changes is a constant, so synthesis removes it and the logic that depends on it. The instruction set, the register map and the memories are the same in every build.
+
+- **Default build:** with every switch at 1, each module is unchanged. This is proved formally against the version before the switches were added.
+- **Firmware's view:** firmware for a protocol that is not built still loads and runs, but the features it sets up stay off.
+
+What each switch controls (a feature stays if any protocol that uses it is built):
+
+| Block | Field | Needs |
+|---|---|---|
+| TX | PINS CPIN, CEN (clock output); CLK CPOL, CPHA; TICK EXT, EPIN, EEDGE (external clock) | SPI or I2C |
+| TX | CLK STRETCH | I2C |
+| TX | TICK LEAD | SPI |
+| TX | FRAME CHAIN | SPI or USB |
+| TX | LINE (NRZI, EOP, DIFF, D2PIN, STUFFN) | USB |
+| RX | TICK SRC 1, 2 (TX tick, external edge); EPIN, EEDGE, SDLY | SPI or I2C |
+| RX | TICK SRC 3 (clock recovery); PINS I2PIN, DIFF; ODLY NRZI, HUNT, STUFFN | USB |
+| RX | PINS OPIN, OEN (drive mode); ODLY drive delay | I2C |
+| RX | FRAME CHAIN | SPI or USB |
+| ETX, ERX | COND QPIN, QEN, QLVL (qualifier) | I2C or USB |
+| ETX, ERX | COND STOP | USB |
+| ETX, ERX | COND MODE 3 (any edge): a write of 3 leaves MODE as it was | I2C |
+| ETX | AFTER 3 (release): a write of 3 leaves AFTER as it was | USB |
+| CRC | the whole unit: every write is ignored | USB |
+| Host registers | PIN_OD, PIN_FILT (read 0) | I2C |
+
+A UART-only build keeps: the TX unit's own timer, NBITS, MSB and INV; the RX unit's SRC 0 with `pe_vote`, and HOLD; the detectors' level and edge triggers, START, AUTOARM, ETX drive and ERX check.
+
+**Building and testing a reduced chip:**
+
+| What | How |
+|---|---|
+| RTL | `-DSUPPORT_SPI=0` (and so on), for example in a simulator or synthesis command |
+| Chip tests | `make PROTOCOLS=uart,i2c` in `test/`. A test that needs a protocol not built is skipped (`test/common/pe_build.py`) |
+| Model | `PE_PROTOCOLS=uart,i2c` in the environment, or `Config(spi=False, usb=False)` |
+| Conformance | `PE_PROTOCOLS=uart,i2c conformance/run.sh` |
+| z3 proof | `model/tests/test_equiv.py` proves the switched modules for UART only and for each protocol on its own |
+
+Unit benches (`test/unit`) and the `formal/` proofs run the full build only.

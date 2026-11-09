@@ -337,6 +337,10 @@ A host write to a full TX FIFO or a unit push to a full RX FIFO is dropped and f
 - RX counts as busy through the ERX stop-bit check.
 - In CHAIN, the next TX word comes from the FIFO, or the CRC if that is empty and APPEND is set.
 
+### 4.12 Protocol switches
+
+`SUPPORT_SPI`, `SUPPORT_I2C` and `SUPPORT_USB` (top-level macros, default 1) leave a protocol's features out of the build. UART is always built. A feature that is left out keeps its config field at 0, as if firmware never set it, and synthesis removes the logic behind it. To test a reduced build: `make PROTOCOLS=uart,i2c`. Details: `spec/blocks.md` Section 13.
+
 ## 5. The registers
 
 There are five groups, depending on who can see them.
