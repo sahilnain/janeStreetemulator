@@ -51,7 +51,7 @@ Top-level parameters (defaults):
 ## 2. Controller (`pe_ctrl`, `pe_decode`)
 
 ### 2.1 State
-`pc` (AW bits), `r0`–`r7` (16 bits), flags `Z C TO DB`, return stack (STACK_DEPTH × AW, plus a depth counter), stall counter (16 bits). The flags `ETX`, `ERX` live in the detectors, and `RXRDY` and `FERR` in the RX unit and ERX. The controller reads them as inputs.
+`pc` (AW bits), `r0`–`r7` (16 bits), flags `Z C TO DB`, return stack (STACK_DEPTH × AW, plus a depth counter), stall counter (17 bits: `dly` plus a 16-bit `delay` operand). The flags `ETX`, `ERX` live in the detectors, and `RXRDY` and `FERR` in the RX unit and ERX. The controller reads them as inputs.
 
 ### 2.2 Issue timing
 - The front end is v1's with one stream. In the cycle before an issue, `im_raddr = pc`; the word arrives in the issue cycle (registered IMEM read). The controller **issues at most every 2 cycles**. The cycle in which an instruction executes is called **E**. All its effects are written in E.

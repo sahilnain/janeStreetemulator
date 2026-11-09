@@ -4,9 +4,9 @@
  *
  * pe_imem: instruction memory, DEPTH x IW.
  *
- * One write port (host, via pe_regs) and one registered read port (core):
+ * One write port (host, via pe_regs) and one registered read port (pe_ctrl):
  * rdata is valid one cycle after raddr. Every implementation keeps this
- * timing, so an SRAM macro can replace it later without touching pe_core.
+ * timing, so an SRAM macro can replace it later without touching pe_ctrl.
  *
  * IMPL:
  *   0 = flip-flops (default, safe for the flow)
@@ -14,8 +14,8 @@
  *       Write address/data are registered, and a row's latch is open
  *       while clk is low in the cycle after the write.
  *
- * The host may only write while all contexts are halted (enforced in
- * pe_regs), so no read/write collision logic is needed.
+ * The host may only write while the controller is stopped (RUN = 0, enforced
+ * in pe_regs), so no read/write collision logic is needed.
  */
 
 `default_nettype none

@@ -8,8 +8,8 @@
  * taken in cycle t + (j+1)*S. Only samples with k <= j < N-k are counted.
  * `done` is a 1-cycle pulse in cycle t + N*S + 1, with
  *     bit_out = ones > (N - 2k) / 2      (ties give 0, so use an odd N - 2k)
- * `busy` is high from t+1 up to and including the `done` cycle, so the
- * owning context cannot issue while the result is being written back.
+ * `busy` is high from t+1 up to and including the `done` cycle. (pe_rxu
+ * leaves it unconnected: it knows from its own counters when a vote ends.)
  *
  * S = 0 is treated as S = 1. N = 0 is treated as N = 1.
  */

@@ -31,7 +31,7 @@ Controller state:
 | `ETX`, `ERX` | 1 + 1 | sticky event flags of the TX and RX event detectors |
 | `DB` | 1 | host doorbell (set by a host register write) |
 | return stack | STACK_DEPTH × AW (default 4) | for `call` / `ret` |
-| stall counter | 16 bits | loaded by the delay field and `delay` |
+| stall counter | 17 bits | loaded by the delay field and `delay`: up to 7 + 65535 cycles |
 
 Shared resources: TX FIFO, RX FIFO (8-bit entries), data memory (256 × 8), pin fabric.
 

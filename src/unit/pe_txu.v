@@ -2,47 +2,6 @@
  * Copyright (c) 2026 Sahil
  * SPDX-License-Identifier: Apache-2.0
  *
- * pe_txu: TX unit (docs/spec/blocks.md Section 3). Sends one 8-bit packet
- * per start on a data pin, with an optional clock on a second pin.
- *
- * Config (ucfg TX, idx):
- *   0 PINS  [3:0] DPIN [4] DEN [11:8] CPIN [12] CEN
- *   1 BIT   [15:0] B, cycles per bit (0 -> 1)
- *   2 FRAME [0] MSB-first
- *   3 CLK   [0] CPOL [1] CPHA [2] STRETCH
- *   4 TICK  [0] EXT [7:4] EPIN [8] EEDGE (0 rising, 1 falling) [9] LEAD
- * Status (urd TX, 0): [0] busy [6:4] bit index
- *
- * Own timer (EXT = 0), start in cycle S, H = floor(B/2):
- *   data bit i written in S + i*B (on the pad S+1+i*B .. S+(i+1)*B)
- *   CPHA 0: SCK active written in S+i*B+H, idle in S+(i+1)*B (and in S)
- *   CPHA 1: SCK active written in S+i*B, idle in S+i*B+H
- *   stick (sample tick) in S+i*B+H; dtick (shift tick) in S+i*B, i = 1..7
- *   done in D = S+8*B; busy = S+1 .. D
- * Offset `o` runs 1..B within a bit, so cycle S+i*B+o has offset o of bit i
- * (o = B is the boundary to bit i+1).
- *
- * STRETCH: after SCK is written to 1 in cycle w, the timer holds for 2
- * cycles and then until pin_in[CPIN] reads 1 (I2C clock stretching). If
- * that write is the sampling edge (CPOL 0 / CPHA 0, I2C), stick is moved
- * to the cycle SCK is seen high, so the RX unit never samples while a slave
- * still holds SCL low.
- *
- * External clock (EXT = 1): bit 0 in S; bit i (1..7) in the cycle the
- * i-th selected EPIN edge is seen in pin_in; done on the 8th edge (SPI
- * slave CPHA 0: EEDGE = trailing edge).
- * With LEAD = 1 (SPI slave CPHA 1: EEDGE = leading edge): nothing is written
- * in S; bit i is written on selected edge i+1; done on the first opposite
- * edge after bit 7, so bit 7 stays until the master has sampled it.
- *
- * `stop` makes the unit idle in the next cycle without a done pulse; the
- * pins keep their last level.
- */
-
-/*
- * Copyright (c) 2026 Sahil
- * SPDX-License-Identifier: Apache-2.0
- *
  * pe_txu: TX unit (docs/spec/blocks.md Section 3). Sends one packet of 1-16
  * bits per start on a data pin, with an optional clock on a second pin.
  *
