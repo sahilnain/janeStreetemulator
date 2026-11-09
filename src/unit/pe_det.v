@@ -38,6 +38,8 @@
 
 module pe_det #(
     parameter KIND     = 0,
+    parameter SUPPORT_I2C = 1,
+    parameter SUPPORT_USB = 1,
     parameter NUM_PINS = 8
 ) (
     input wire clk,
@@ -89,6 +91,18 @@ module pe_det #(
   reg [ 1:0] c_after;
   wire cfg_trig = cfg_we & (cfg_idx == 3'd0 || cfg_idx == 3'd1);
 
+  // Protocol support (docs/spec/blocks.md Section 13). A config field of a feature that is not built
+  // is never written, so it keeps its reset value, 0, as if the firmware never set it. A register
+  // that never changes is a constant, and synthesis removes it and the logic behind it. With every
+  // SUPPORT_* = 1 each field is written as before: the unit is unchanged.
+  // COND: [12:9] QPIN, [13] QEN, [14] QLVL for I2C or USB, [15] STOP for USB. MODE 3 (any edge) is
+  // only for I2C: without it, a write of MODE 3 leaves MODE as it was. AFTER 3 (ETX release) is only
+  // for USB: without it, a write of 3 leaves AFTER as it was.
+  localparam QUA = (SUPPORT_I2C != 0) || (SUPPORT_USB != 0);
+  localparam STP = (SUPPORT_USB != 0);
+  wire mode_ok = (cfg_data[5:4] != 2'd3) || (SUPPORT_I2C != 0);
+  wire after_ok = (KIND != 0) || (cfg_data[1:0] != 2'd3) || (SUPPORT_USB != 0);
+
   always @(posedge clk) begin
     if (rst) begin
       c_cond  <= 16'd0;
@@ -97,9 +111,14 @@ module pe_det #(
       c_adly  <= 16'd0;
     end else if (cfg_we) begin
       case (cfg_idx)
-        3'd0: c_cond <= cfg_data;
+        3'd0: begin
+          {c_cond[8:6], c_cond[3:0]} <= {cfg_data[8:6], cfg_data[3:0]};
+          if (mode_ok) c_cond[5:4] <= cfg_data[5:4];
+          if (QUA) c_cond[14:9] <= cfg_data[14:9];
+          if (STP) c_cond[15] <= cfg_data[15];
+        end
         3'd1: c_dur <= cfg_data;
-        3'd2: c_after <= cfg_data[1:0];
+        3'd2: if (after_ok) c_after <= cfg_data[1:0];
         3'd3: c_adly <= cfg_data;
         default: ;
       endcase

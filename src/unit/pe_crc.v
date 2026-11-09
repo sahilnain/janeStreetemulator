@@ -23,7 +23,9 @@
 
 `default_nettype none
 
-module pe_crc (
+module pe_crc #(
+    parameter SUPPORT_USB = 1
+) (
     input wire clk,
     input wire rst,
 `ifdef PE_CHIP_FORMAL
@@ -58,7 +60,10 @@ module pe_crc (
   wire b = (c_src == 2'd1) ? tx_bit : rx_bit;
   wire fb = crc[15] ^ b;
   wire [15:0] crc_nx = {crc[14:0], 1'b0} ^ (fb ? c_poly : 16'd0);
-  wire load = cfg_we & (cfg_idx == 3'd2);
+  // Only USB uses the CRC unit. Without it, every config write is ignored, so the register stays 0
+  // and synthesis removes the unit (docs/spec/blocks.md Section 13).
+  wire cwe = cfg_we & (SUPPORT_USB != 0);
+  wire load = cwe & (cfg_idx == 3'd2);
 
   assign app_ok = c_app & ~sent;
   assign value  = ~crc;
@@ -73,8 +78,8 @@ module pe_crc (
       skip   <= 8'd0;
       sent   <= 1'b0;
     end else begin
-      if (cfg_we && cfg_idx == 3'd0) {c_skip, c_app, c_src} <= {cfg_data[15:8], cfg_data[2:0]};
-      if (cfg_we && cfg_idx == 3'd1) c_poly <= cfg_data;
+      if (cwe && cfg_idx == 3'd0) {c_skip, c_app, c_src} <= {cfg_data[15:8], cfg_data[2:0]};
+      if (cwe && cfg_idx == 3'd1) c_poly <= cfg_data;
       if (load) begin
         crc  <= cfg_data;
         skip <= c_skip;

@@ -9,12 +9,13 @@ chip model can use it before the controller. after() gives the after-packet step
 clock() updates the state.
 """
 
-from .blocks import mux
+from .blocks import keep, mux
 
 
 class Det:
     def __init__(self, kind, cfg):
         self.kind = kind                     # 0 ETX, 1 ERX
+        self.cfg = cfg
         self.nm = (1 << cfg.num_pins) - 1
         self.reset()
 
@@ -90,11 +91,17 @@ class Det:
             self.acnt = mux(unit_stop, self.acnt, mux(load, self.adly, mux(self.apend, self.acnt - 1, self.acnt)))
             self.apend = mux(unit_stop, 0, mux(load, 1, mux(last, 0, self.apend)))
         if cfg_we:
+            # Protocol support: a feature that is not built ignores writes (Section 13)
+            c = self.cfg
             if cfg_idx == 0:
-                self.cond = cfg_data
+                m = 0x01CF | (0x7E00 if (c.i2c or c.usb) else 0) | (0x8000 if c.usb else 0)
+                cond = keep(self.cond, cfg_data, 0xFFFF, m)
+                mode_ok = ((cfg_data >> 4) & 3) != 3 if not c.i2c else 1
+                self.cond = (cond & 0xFFCF) | mux(mode_ok, cfg_data & 0x30, self.cond & 0x30)
             elif cfg_idx == 1:
                 self.dur = cfg_data
             elif cfg_idx == 2:
-                self.aft = cfg_data & 3
+                ok = ((cfg_data & 3) != 3) if (self.kind == 0 and not c.usb) else 1
+                self.aft = mux(ok, cfg_data & 3, self.aft)
             elif cfg_idx == 3:
                 self.adly = cfg_data

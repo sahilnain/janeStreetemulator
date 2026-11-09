@@ -9,7 +9,7 @@ external edge or the resynchronised timer), decodes it as Section 4.5 lists, and
 gives the pin write, done and push. clock() updates the state.
 """
 
-from .blocks import Vote, mux
+from .blocks import Vote, keep, mux
 from .txu import field, nbits_of
 
 
@@ -158,11 +158,21 @@ class Rxu:
             self.wcnt = mux(src == 0, own, mux(src == 3, dp, self.wcnt))
             self.wins = mux((src == 0) & more, self.wins + 1, self.wins)
         w = [cfg_we & (cfg_idx == k) for k in range(8)]
-        self.pins = mux(w[0], cfg_data & 0x3FFF, self.pins)
+        # Protocol support: the bits of a feature that is not built keep their value (Section 13)
+        c = self.cfg
+        ext, chn = c.spi or c.i2c, c.spi or c.usb
+        self.pins = mux(w[0], keep(self.pins, cfg_data, 0x3FFF,
+                                   0x000F | (0x20F0 if c.usb else 0) | (0x1F00 if c.i2c else 0)), self.pins)
         self.bit = mux(w[1], cfg_data, self.bit)
-        self.frame = mux(w[2], cfg_data & 0x01FF, self.frame)
+        self.frame = mux(w[2], keep(self.frame, cfg_data, 0x01FF, 0x01F7 | (0x0008 if chn else 0)), self.frame)
         self.vcfg = mux(w[3], cfg_data & 0xFF, self.vcfg)
         self.step = mux(w[4], cfg_data, self.step)
         self.first = mux(w[5], cfg_data, self.first)
-        self.tick = mux(w[6], cfg_data & 0xF1F3, self.tick)
-        self.odly = mux(w[7], cfg_data & 0x0F3F, self.odly)
+        # SRC 0 is always there; 1 and 2 need SPI or I2C, 3 needs USB. A SRC not built is ignored.
+        s_in = cfg_data & 3
+        src_ok = (s_in == 0) | mux(s_in == 3, int(c.usb), int(ext))
+        tick = keep(self.tick, cfg_data, 0xF1F0, 0xF1F0 if ext else 0)
+        src = mux(src_ok, s_in, self.tick & 3) if (ext or c.usb) else (self.tick & 3)
+        self.tick = mux(w[6], (tick & 0xF1F0) | src, self.tick)
+        self.odly = mux(w[7], keep(self.odly, cfg_data, 0x0F3F, (0x000F if c.i2c else 0) | (0x0F30 if c.usb else 0)),
+                        self.odly)

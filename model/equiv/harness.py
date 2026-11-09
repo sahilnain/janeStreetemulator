@@ -47,6 +47,18 @@ from .sym import EquivError, Explorer, Sym, SymList, V
 
 TIMEOUT_S = float(os.environ.get("EQUIV_TIMEOUT", 1800))
 
+ALL = ("uart", "spi", "i2c", "usb")
+
+
+def build(protos, names=("spi", "i2c", "usb")):
+    """Protocol support (docs/spec/blocks.md Section 13): the RTL parameters and the model Config
+    fields for a build with `protos`. Each obligation is built and proved for one build."""
+    protos = set(protos or ALL) | {"uart"}
+    params = {f"SUPPORT_{n.upper()}": int(n in protos) for n in names}
+    flags = {n: n in protos for n in ("spi", "i2c", "usb")}
+    tag = "" if protos == set(ALL) else " [" + ",".join(p for p in ALL if p in protos) + "]"
+    return params, flags, tag
+
 
 def S(e):
     return Sym(e)
@@ -249,21 +261,30 @@ def vote(NUM_PINS=8, N_W=4, S_W=16):
 
 
 # ------------------------------------------------------------------- pe_crc
-def crc():
-    r = Rtl("pe_crc")
+def crc(protos=None):
+    params, flags, tag = build(protos, ("usb",))
+    r = Rtl("pe_crc", params)
+    cfg = Config(**flags)
 
-    def build(ob):
-        m = Crc()
-        m.src, m.app, m.c_skip, m.poly = [S(r.now(n)) for n in ("c_src", "c_app", "c_skip", "c_poly")]
-        m.crc, m.skip, m.sent = [S(r.now(n)) for n in ("crc", "skip", "sent")]
+    regs = ("c_src", "c_app", "c_skip", "c_poly", "crc", "skip", "sent")
+    # In a build without USB, synthesis removes the registers, which never change from 0.
+    gone = [n for n in regs if not r.has(n)]
+
+    def build_(ob):
+        m = Crc(cfg)
+        cur = [S(r.now(n)) if r.has(n) else 0 for n in regs]
+        m.src, m.app, m.c_skip, m.poly, m.crc, m.skip, m.sent = cur
         g = lambda n: S(r.now(n))  # noqa: E731
         out = dict(app_ok=m.app_ok, value=m.value, rd_data=m.read(g("rd_idx")))
         m.clock(g("rst"), g("cfg_we"), g("cfg_idx"), g("cfg_data"), g("tx_v"), g("tx_bit"), g("rx_v"), g("rx_bit"),
                 g("sent_set"))
-        nxt = dict(c_src=m.src, c_app=m.app, c_skip=m.c_skip, c_poly=m.poly, crc=m.crc, skip=m.skip, sent=m.sent)
-        return out, nxt, []
+        new = dict(c_src=m.src, c_app=m.app, c_skip=m.c_skip, c_poly=m.poly, crc=m.crc, skip=m.skip, sent=m.sent)
+        nxt = {k: v for k, v in new.items() if r.has(k)}
+        # a register synthesis removed must stay 0 in the model too
+        extra = [(f"next {k} (removed in the RTL) != 0", V(new[k]) != 0) for k in gone]
+        return out, nxt, extra
 
-    return Ob("pe_crc", r, build)
+    return Ob("pe_crc" + tag, r, build_)
 
 
 # --------------------------------------------------------------- pe_host_if
@@ -291,11 +312,12 @@ def host_if():
 
 
 # ------------------------------------------------------------------ pe_regs
-def regs(IMEM_DEPTH=160, NUM_PINS=8):
-    r = Rtl("pe_regs", dict(IMEM_DEPTH=IMEM_DEPTH, NUM_PINS=NUM_PINS, FIFO_CW=4))
-    cfg = Config(imem_depth=IMEM_DEPTH, num_pins=NUM_PINS)
+def regs(IMEM_DEPTH=160, NUM_PINS=8, protos=None):
+    params, flags, tag = build(protos, ("i2c",))
+    r = Rtl("pe_regs", dict(IMEM_DEPTH=IMEM_DEPTH, NUM_PINS=NUM_PINS, FIFO_CW=4, **params))
+    cfg = Config(imem_depth=IMEM_DEPTH, num_pins=NUM_PINS, **flags)
 
-    def build(ob):
+    def build_(ob):
         g = lambda n: S(r.now(n))  # noqa: E731
         m = Regs(cfg)
         m.run, m.start_pc, m.owner, m.od = g("run"), g("start_pc"), g("pin_owner"), g("pin_od")
@@ -323,7 +345,7 @@ def regs(IMEM_DEPTH=160, NUM_PINS=8):
                    irq_en=m.irq_en, imem_err=m.imem_err, st2=m.st2, dm_addr=m.dm_addr)
         return out, nxt, []
 
-    return Ob(f"pe_regs IMEM_DEPTH={IMEM_DEPTH} NUM_PINS={NUM_PINS}", r, build)
+    return Ob(f"pe_regs IMEM_DEPTH={IMEM_DEPTH} NUM_PINS={NUM_PINS}{tag}", r, build_)
 
 
 # ---------------------------------------------------------------- pe_decode
@@ -404,16 +426,17 @@ def ctrl(op, IMEM_DEPTH=160, NUM_PINS=8, STACK_DEPTH=4):
 
 
 # ------------------------------------------------------------------- pe_det
-def det(KIND, NUM_PINS=8):
-    r = Rtl("pe_det", dict(KIND=KIND, NUM_PINS=NUM_PINS))
-    cfg = Config(num_pins=NUM_PINS)
+def det(KIND, NUM_PINS=8, protos=None):
+    params, flags, tag = build(protos, ("i2c", "usb"))
+    r = Rtl("pe_det", dict(KIND=KIND, NUM_PINS=NUM_PINS, **params))
+    cfg = Config(num_pins=NUM_PINS, **flags)
     apend, acnt, ferr = r.now("apend"), r.now("acnt"), r.now("ferr")
     # A running after-step always has a count left. ETX never has a check, so never an error.
     asm = [z3.Or(apend == 0, acnt != 0)]
     if KIND == 0:
         asm.append(ferr == 0)
 
-    def build(ob):
+    def build_(ob):
         g = lambda n: S(r.now(n))  # noqa: E731
         m = Det(KIND, cfg)
         m.cond, m.dur, m.aft, m.adly = g("c_cond"), g("c_dur"), g("c_after"), ob.opt("c_adly")
@@ -439,7 +462,7 @@ def det(KIND, NUM_PINS=8):
             extra.append(ob.inv("ETX ferr = 0", V(m.ferr) == 0))
         return out, nxt, extra
 
-    return Ob(f"pe_det KIND={KIND}", r, build, asm)
+    return Ob(f"pe_det KIND={KIND}{tag}", r, build_, asm)
 
 
 # ------------------------------------------------------------------- pe_txu
@@ -451,14 +474,15 @@ TX_LINE = [("c_nrzi", 0, 1, 0), ("c_eop", 0, 1, 1), ("c_diff", 0, 1, 2), ("c_d2p
 TX_STATE = ["busy", "sh", "idx", "lf", "sw", "swc", "sp", "crc_pkt", "ones", "eph", "eprev", "lvl"]
 
 
-def txu(NUM_PINS=8):
-    r = Rtl("pe_txu", dict(NUM_PINS=NUM_PINS))
-    cfg = Config(num_pins=NUM_PINS)
+def txu(NUM_PINS=8, protos=None):
+    params, flags, tag = build(protos)
+    r = Rtl("pe_txu", dict(NUM_PINS=NUM_PINS, **params))
+    cfg = Config(num_pins=NUM_PINS, **flags)
     busy, start = r.now("busy"), r.now("start")
     # A start only comes while TX is idle: formal/pe_ctrl (start_mask) and the ETX start in the top level.
     asm = [z3.Or(start == 0, busy == 0)]
 
-    def build(ob):
+    def build_(ob):
         g = lambda n: S(r.now(n))  # noqa: E731
         m = Txu(cfg)
         m.pins, m.frame = fields_now(r, TX_PINS), fields_now(r, TX_FRAME)
@@ -481,7 +505,7 @@ def txu(NUM_PINS=8):
             extra += fields_next(r, val, fields)
         return out, nxt, extra
 
-    return Ob("pe_txu", r, build, asm)
+    return Ob("pe_txu" + tag, r, build_, asm)
 
 
 # ------------------------------------------------------------------- pe_rxu
@@ -497,14 +521,15 @@ RX_REGS = {"busy": "busy", "sh": "word", "od": "od", "rbyte": "rbyte", "data_q":
 RX_VOTE = {f"u_vote.{k}": v for k, v in VOTE_FIELDS.items()}
 
 
-def rxu(NUM_PINS=8):
-    r = Rtl("pe_rxu", dict(NUM_PINS=NUM_PINS))
-    cfg = Config(num_pins=NUM_PINS)
+def rxu(NUM_PINS=8, protos=None):
+    params, flags, tag = build(protos)
+    r = Rtl("pe_rxu", dict(NUM_PINS=NUM_PINS, **params))
+    cfg = Config(num_pins=NUM_PINS, **flags)
     busy, start, hz = r.now("busy"), r.now("start"), r.now("hz")
     # A start only comes while RX is idle (as for TX). The HUNT zero counter saturates at 2.
     asm = [z3.Or(start == 0, busy == 0), z3.ULE(hz, 2)]
 
-    def build(ob):
+    def build_(ob):
         g = lambda n: S(r.now(n))  # noqa: E731
         m = Rxu(cfg)
         m.pins, m.frame = fields_now(r, RX_PINS), fields_now(r, RX_FRAME)
@@ -531,4 +556,4 @@ def rxu(NUM_PINS=8):
         extra.append(ob.inv("hz <= 2", z3.And(V(m.hz) >= 0, V(m.hz) <= 2)))
         return out, nxt, extra
 
-    return Ob("pe_rxu", r, build, asm)
+    return Ob("pe_rxu" + tag, r, build_, asm)

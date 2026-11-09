@@ -53,6 +53,9 @@
 `default_nettype none
 
 module pe_rxu #(
+    parameter SUPPORT_SPI = 1,
+    parameter SUPPORT_I2C = 1,
+    parameter SUPPORT_USB = 1,
     parameter NUM_PINS = 8
 ) (
     input wire clk,
@@ -105,6 +108,18 @@ module pe_rxu #(
   reg [4:0] c_nbits;
   reg [1:0] c_src;
 
+  // Protocol support (docs/spec/blocks.md Section 13). A config field of a feature that is not built
+  // is never written, so it keeps its reset value, 0, as if the firmware never set it. A register
+  // that never changes is a constant, and synthesis removes it and the logic behind it. With every
+  // SUPPORT_* = 1 each field is written as before: the unit is unchanged.
+  localparam EXT = (SUPPORT_SPI != 0) || (SUPPORT_I2C != 0);  // SRC 1 and 2: TX tick, external edge
+  localparam USB = (SUPPORT_USB != 0);  // SRC 3, I2PIN, DIFF, NRZI, HUNT, STUFFN
+  localparam DRV = (SUPPORT_I2C != 0);  // drive mode: OPIN, OEN, ODLY
+  localparam CHN = (SUPPORT_SPI != 0) || USB;  // CHAIN
+  // SRC 0 (own timer) is always there. A write of a SRC that is not built is ignored.
+  wire [1:0] src_in = cfg_data[1:0];
+  wire       src_ok = (src_in == 2'd0) || (src_in == 2'd3 ? USB : EXT);
+
   always @(posedge clk) begin
     if (rst) begin
       c_pins  <= 14'd0;
@@ -128,14 +143,27 @@ module pe_rxu #(
       c_stuffn <= 4'd0;
     end else if (cfg_we) begin
       case (cfg_idx)
-        3'd0: c_pins <= cfg_data[13:0];
+        3'd0: begin
+          c_pins[3:0] <= cfg_data[3:0];
+          if (USB) {c_pins[13], c_pins[7:4]} <= {cfg_data[13], cfg_data[7:4]};  // DIFF, I2PIN
+          if (DRV) c_pins[12:8] <= cfg_data[12:8];  // OEN, OPIN
+        end
         3'd1: c_bit <= cfg_data;
-        3'd2: {c_nbits, c_chain, c_inv, c_hold, c_msb} <= {cfg_data[8:4], cfg_data[3:0]};
+        3'd2: begin
+          {c_nbits, c_inv, c_hold, c_msb} <= {cfg_data[8:4], cfg_data[2:0]};
+          if (CHN) c_chain <= cfg_data[3];
+        end
         3'd3: {c_k, c_n} <= cfg_data[7:0];
         3'd4: c_step <= cfg_data;
         3'd5: c_first <= cfg_data;
-        3'd6: {c_sdly, c_eedge, c_epin, c_src} <= {cfg_data[15:12], cfg_data[8], cfg_data[7:4], cfg_data[1:0]};
-        default: {c_stuffn, c_hunt, c_nrzi, c_odly} <= {cfg_data[11:8], cfg_data[5:0]};  // 3'd7
+        3'd6: begin
+          if (EXT) {c_sdly, c_eedge, c_epin} <= {cfg_data[15:12], cfg_data[8], cfg_data[7:4]};
+          if ((EXT || USB) && src_ok) c_src <= src_in;
+        end
+        default: begin  // 3'd7
+          if (DRV) c_odly <= cfg_data[3:0];
+          if (USB) {c_stuffn, c_hunt, c_nrzi} <= {cfg_data[11:8], cfg_data[5:4]};
+        end
       endcase
     end
   end

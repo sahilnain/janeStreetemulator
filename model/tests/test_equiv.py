@@ -39,6 +39,16 @@ CASES = [
     ("pe_txu", H.txu),
     ("pe_rxu", H.rxu),
 ]
+# Protocol support (docs/spec/blocks.md Section 13): the modules with switches, in reduced builds.
+# UART only, and each protocol on its own, between them take every switch both ways.
+for _p in (("uart",), ("uart", "spi"), ("uart", "i2c"), ("uart", "usb")):
+    _t = ",".join(_p)
+    CASES += [(f"pe_txu [{_t}]", (lambda p=_p: H.txu(protos=p))),
+              (f"pe_rxu [{_t}]", (lambda p=_p: H.rxu(protos=p))),
+              (f"pe_det etx [{_t}]", (lambda p=_p: H.det(0, protos=p))),
+              (f"pe_det erx [{_t}]", (lambda p=_p: H.det(1, protos=p)))]
+CASES += [("pe_crc [uart]", lambda: H.crc(protos=("uart",))),
+          ("pe_regs [uart]", lambda: H.regs(protos=("uart",)))]
 CASES += [(f"pe_ctrl op{op}", (lambda op=op: H.ctrl(op))) for op in H.CTRL_OPS]
 CASES += [("pe_ctrl illegal", lambda: H.ctrl(None))]
 

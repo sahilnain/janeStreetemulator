@@ -54,6 +54,9 @@
 `default_nettype none
 
 module pe_txu #(
+    parameter SUPPORT_SPI = 1,
+    parameter SUPPORT_I2C = 1,
+    parameter SUPPORT_USB = 1,
     parameter NUM_PINS = 8
 ) (
     input wire clk,
@@ -104,6 +107,16 @@ module pe_txu #(
   reg [ 3:0] c_epin, c_d2pin, c_stuffn;
   reg [ 4:0] c_nbits;
 
+  // Protocol support (docs/spec/blocks.md Section 13). A config field of a feature that is not built
+  // is never written, so it keeps its reset value, 0, as if the firmware never set it. A register
+  // that never changes is a constant, and synthesis removes it and the logic behind it. With every
+  // SUPPORT_* = 1 each field is written as before: the unit is unchanged.
+  localparam CLK = (SUPPORT_SPI != 0) || (SUPPORT_I2C != 0);  // clock output, external clock
+  localparam CHN = (SUPPORT_SPI != 0) || (SUPPORT_USB != 0);  // CHAIN
+  localparam STR = (SUPPORT_I2C != 0);  // STRETCH
+  localparam LED = (SUPPORT_SPI != 0);  // LEAD
+  localparam LIN = (SUPPORT_USB != 0);  // NRZI, EOP, DIFF, D2PIN, STUFFN
+
   always @(posedge clk) begin
     if (rst) begin
       c_pins    <= 13'd0;
@@ -126,12 +139,24 @@ module pe_txu #(
       c_stuffn  <= 4'd0;
     end else if (cfg_we) begin
       case (cfg_idx)
-        3'd0: c_pins <= cfg_data[12:0];
+        3'd0: begin
+          c_pins[7:0] <= cfg_data[7:0];
+          if (CLK) c_pins[12:8] <= cfg_data[12:8];  // CPIN, CEN
+        end
         3'd1: c_bit <= cfg_data;
-        3'd2: {c_chain, c_nbits, c_inv, c_msb} <= {cfg_data[9:4], cfg_data[2], cfg_data[0]};
-        3'd3: {c_stretch, c_cpha, c_cpol} <= cfg_data[2:0];
-        3'd4: {c_lead, c_eedge, c_epin, c_ext} <= {cfg_data[9:8], cfg_data[7:4], cfg_data[0]};
-        3'd5: {c_stuffn, c_d2pin, c_diff, c_eop, c_nrzi} <= {cfg_data[11:4], cfg_data[2:0]};
+        3'd2: begin
+          {c_nbits, c_inv, c_msb} <= {cfg_data[8:4], cfg_data[2], cfg_data[0]};
+          if (CHN) c_chain <= cfg_data[9];
+        end
+        3'd3: begin
+          if (CLK) {c_cpha, c_cpol} <= cfg_data[1:0];
+          if (STR) c_stretch <= cfg_data[2];
+        end
+        3'd4: begin
+          if (CLK) {c_eedge, c_epin, c_ext} <= {cfg_data[8], cfg_data[7:4], cfg_data[0]};
+          if (LED) c_lead <= cfg_data[9];
+        end
+        3'd5: if (LIN) {c_stuffn, c_d2pin, c_diff, c_eop, c_nrzi} <= {cfg_data[11:4], cfg_data[2:0]};
         default: ;
       endcase
     end

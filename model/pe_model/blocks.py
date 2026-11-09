@@ -21,6 +21,12 @@ def bits(v, w):
     return v & ((1 << w) - 1)
 
 
+def keep(old, new, width_mask, built):
+    """A config write in a reduced build: the bits in `built` take the new value, the other bits
+    of `width_mask` keep the old one (docs/spec/blocks.md Section 13)."""
+    return (new & built) | (old & (width_mask & ~built))
+
+
 def mux(c, a, b):
     """a if c else b, without a branch when the proof in model/equiv/ runs the model symbolically."""
     return c.mux(a, b) if hasattr(c, "mux") else (a if c else b)
@@ -200,9 +206,10 @@ class Vote:
 
 # ---------------------------------------------------------------- CRC
 class Crc:
-    """pe_crc (docs/spec/blocks.md Section 5a)."""
+    """pe_crc (docs/spec/blocks.md Section 5a). Only USB uses it: without USB, config writes are ignored."""
 
-    def __init__(self):
+    def __init__(self, cfg: Config = None):
+        self.cfg = cfg or Config()
         self.src = self.app = self.c_skip = self.poly = 0
         self.crc = self.skip = self.sent = 0
 
@@ -220,8 +227,10 @@ class Crc:
 
     def clock(self, rst, cfg_we, cfg_idx, cfg_data, tx_v, tx_bit, rx_v, rx_bit, sent_set):
         if rst:
-            self.__init__()
+            self.__init__(self.cfg)
             return
+        if not self.cfg.usb:
+            cfg_we = 0
         if sent_set:
             self.sent = 1
         v = (self.src == 1 and tx_v) or (self.src == 2 and rx_v)
@@ -399,8 +408,9 @@ class Regs:
         for k in range(3):
             self.stage = mux(wr(A_IMDATA + k), byte_in(self.stage, k, 24), self.stage)
         for k in range(2):
-            self.od = mux(wr(A_PIN_OD + k), byte_in(self.od, k, c.num_pins), self.od)
-            self.filt = mux(wr(A_PIN_FILT + k), byte_in(self.filt, k, c.num_pins), self.filt)
+            if c.i2c:                  # open drain and the input filter are for I2C (Section 13)
+                self.od = mux(wr(A_PIN_OD + k), byte_in(self.od, k, c.num_pins), self.od)
+                self.filt = mux(wr(A_PIN_FILT + k), byte_in(self.filt, k, c.num_pins), self.filt)
             self.start_pc = mux(wr(A_START_PC + k), byte_in(self.start_pc, k, c.aw), self.start_pc)
         for k in range(4):
             self.owner = mux(wr(A_OWNER + k), byte_in(self.owner, k, 2 * c.num_pins), self.owner)

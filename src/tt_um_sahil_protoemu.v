@@ -50,6 +50,21 @@ module tt_um_sahil_protoemu (
   localparam STACK_DEPTH = 4;
   localparam NUM_PINS = 8;  // = uio width
 
+  // Protocol support (docs/spec/blocks.md Section 13). UART is always built. Each macro defaults to
+  // 1; define it as 0 (for example -DSUPPORT_USB=0) to leave that protocol's features out.
+`ifndef SUPPORT_SPI
+`define SUPPORT_SPI 1
+`endif
+`ifndef SUPPORT_I2C
+`define SUPPORT_I2C 1
+`endif
+`ifndef SUPPORT_USB
+`define SUPPORT_USB 1
+`endif
+  localparam SUPPORT_SPI = `SUPPORT_SPI;
+  localparam SUPPORT_I2C = `SUPPORT_I2C;
+  localparam SUPPORT_USB = `SUPPORT_USB;
+
   localparam AW = (IMEM_DEPTH > 1) ? $clog2(IMEM_DEPTH) : 1;
   localparam FIFO_CW = $clog2(FIFO_DEPTH + 1);
 
@@ -213,6 +228,7 @@ module tt_um_sahil_protoemu (
 
   // ------------------------------------------------------ registers
   pe_regs #(
+      .SUPPORT_I2C(SUPPORT_I2C),
       .IMEM_DEPTH(IMEM_DEPTH),
       .NUM_PINS  (NUM_PINS),
       .FIFO_CW   (FIFO_CW)
@@ -389,6 +405,9 @@ module tt_um_sahil_protoemu (
 
   // ---------------------------------------------------------- units
   pe_txu #(
+      .SUPPORT_SPI(SUPPORT_SPI),
+      .SUPPORT_I2C(SUPPORT_I2C),
+      .SUPPORT_USB(SUPPORT_USB),
       .NUM_PINS(NUM_PINS)
   ) u_txu (
       .clk       (clk),
@@ -423,6 +442,9 @@ module tt_um_sahil_protoemu (
   );
 
   pe_rxu #(
+      .SUPPORT_SPI(SUPPORT_SPI),
+      .SUPPORT_I2C(SUPPORT_I2C),
+      .SUPPORT_USB(SUPPORT_USB),
       .NUM_PINS(NUM_PINS)
   ) u_rxu (
       .clk       (clk),
@@ -463,6 +485,8 @@ module tt_um_sahil_protoemu (
 
   pe_det #(
       .KIND    (0),
+      .SUPPORT_I2C(SUPPORT_I2C),
+      .SUPPORT_USB(SUPPORT_USB),
       .NUM_PINS(NUM_PINS)
   ) u_etx (
       .clk       (clk),
@@ -500,6 +524,8 @@ module tt_um_sahil_protoemu (
 
   pe_det #(
       .KIND    (1),
+      .SUPPORT_I2C(SUPPORT_I2C),
+      .SUPPORT_USB(SUPPORT_USB),
       .NUM_PINS(NUM_PINS)
   ) u_erx (
       .clk       (clk),
@@ -535,7 +561,9 @@ module tt_um_sahil_protoemu (
       .po_val    (erx_ov)
   );
 
-  pe_crc u_crc (
+  pe_crc #(
+      .SUPPORT_USB(SUPPORT_USB)
+  ) u_crc (
       .clk      (clk),
       .rst      (rst),
 `ifdef PE_CHIP_FORMAL

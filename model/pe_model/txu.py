@@ -10,7 +10,7 @@ cycle after the bit was written, B in the cycle the next write is due.
 """
 
 
-from .blocks import mux
+from .blocks import keep, mux
 
 
 def field(v, hi, lo):
@@ -25,6 +25,7 @@ def nbits_of(frame):
 class Txu:
     def __init__(self, cfg):
         self.nm = (1 << cfg.num_pins) - 1
+        self.cfg = cfg
         self.reset()
 
     def reset(self):
@@ -235,9 +236,13 @@ class Txu:
             self.sw = mux(hit, 1, self.sw)
             self.swc = mux(hit, 2, self.swc)
         w = [cfg_we & (cfg_idx == k) for k in range(6)]
-        self.pins = mux(w[0], cfg_data & 0x1F1F, self.pins)
+        # Protocol support: the bits of a feature that is not built keep their value (Section 13)
+        c = self.cfg
+        clk, chn = c.spi or c.i2c, c.spi or c.usb
+        self.pins = mux(w[0], keep(self.pins, cfg_data, 0x1F1F, 0x001F | (0x1F00 if clk else 0)), self.pins)
         self.bit = mux(w[1], cfg_data, self.bit)
-        self.frame = mux(w[2], cfg_data & 0x03F5, self.frame)
-        self.clk = mux(w[3], cfg_data & 7, self.clk)
-        self.tick = mux(w[4], cfg_data & 0x03F1, self.tick)
-        self.line = mux(w[5], cfg_data & 0x0FF7, self.line)
+        self.frame = mux(w[2], keep(self.frame, cfg_data, 0x03F5, 0x01F5 | (0x0200 if chn else 0)), self.frame)
+        self.clk = mux(w[3], keep(self.clk, cfg_data, 7, (3 if clk else 0) | (4 if c.i2c else 0)), self.clk)
+        self.tick = mux(w[4], keep(self.tick, cfg_data, 0x03F1, (0x01F1 if clk else 0) | (0x0200 if c.spi else 0)),
+                        self.tick)
+        self.line = mux(w[5], keep(self.line, cfg_data, 0x0FF7, 0x0FF7 if c.usb else 0), self.line)

@@ -35,7 +35,7 @@ class Chip:
         self.rx = Rxu(cfg)
         self.etx = Det(0, cfg)
         self.erx = Det(1, cfg)
-        self.crc = Crc()
+        self.crc = Crc(cfg)
         self.pins = Pins(cfg)
         self.cycle = 0
 

@@ -39,6 +39,7 @@
 `default_nettype none
 
 module pe_regs #(
+    parameter SUPPORT_I2C = 1,
     parameter IMEM_DEPTH = 64,
     parameter NUM_PINS   = 8,
     parameter FIFO_CW    = 4,
@@ -220,8 +221,11 @@ module pe_regs #(
         if (addr == A_IMDATA + 0) stage[7:0] <= r_wdata;
         if (addr == A_IMDATA + 1) stage[15:8] <= r_wdata;
         if (addr == A_IMDATA + 2) stage[23:16] <= r_wdata;
-        for (b = 0; b < NUM_PINS; b = b + 1) if (addr == A_PIN_OD + b / 8) pin_od[b] <= r_wdata[b%8];
-        for (b = 0; b < NUM_PINS; b = b + 1) if (addr == A_PIN_FILT + b / 8) pin_filt[b] <= r_wdata[b%8];
+        // Open drain and the input filter are for I2C. Without it these registers stay 0 (Section 13).
+        for (b = 0; b < NUM_PINS; b = b + 1)
+          if (SUPPORT_I2C != 0 && addr == A_PIN_OD + b / 8) pin_od[b] <= r_wdata[b%8];
+        for (b = 0; b < NUM_PINS; b = b + 1)
+          if (SUPPORT_I2C != 0 && addr == A_PIN_FILT + b / 8) pin_filt[b] <= r_wdata[b%8];
         for (b = 0; b < OWN_W; b = b + 1) if (addr == A_OWNER + b / 8) pin_owner[b] <= r_wdata[b%8];
         for (b = 0; b < AW; b = b + 1) if (addr == A_START_PC + b / 8) start_pc[b] <= r_wdata[b%8];
       end
