@@ -30,6 +30,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent / "common"))
 
 import cocotb  # noqa: E402
+import pe_build  # noqa: E402
 import pe_fw  # noqa: E402
 import pe_host as R  # noqa: E402
 import pe_isa as I  # noqa: E402
@@ -195,7 +196,7 @@ async def master_words(chip, words):
     return [raw[2 * i] | raw[2 * i + 1] << 8 for i in range(len(words))]
 
 
-@cocotb.test()
+@pe_build.test("spi")
 async def test_spi_master_words(dut):
     for bits in (4, 5, 7, 9, 12, 16):
         for mode in range(4):
@@ -220,7 +221,7 @@ async def test_spi_master_words(dut):
                 await chip.bus.write(R.RUN, 0)
 
 
-@cocotb.test()
+@pe_build.test("spi")
 async def test_spi_slave_words(dut):
     for bits in (3, 4, 5, 7):
         for mode in range(4):
@@ -245,7 +246,7 @@ async def test_spi_slave_words(dut):
                 await chip.bus.write(R.RUN, 0)
 
 
-@cocotb.test()
+@pe_build.test("spi")
 async def test_tx_inv_spi(dut):
     chip = Chip(dut)
     await chip.reset()

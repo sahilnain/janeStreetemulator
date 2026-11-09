@@ -41,6 +41,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent / "common"))
 
 import cocotb  # noqa: E402
+import pe_build  # noqa: E402
 import i2c  # noqa: E402
 import pe_fw  # noqa: E402
 import pe_host as R  # noqa: E402
@@ -92,7 +93,7 @@ async def write_read(chip, dev, ptr=0x20):
     return data
 
 
-@cocotb.test()
+@pe_build.test("i2c")
 async def test_master_write_read(dut):
     chip, dev = await master_setup(dut)
     await write_read(chip, dev)
@@ -103,7 +104,7 @@ async def test_master_write_read(dut):
     assert await chip.bus.read(R.STATUS) & 0xF0 == 0
 
 
-@cocotb.test()
+@pe_build.test("i2c")
 async def test_master_speeds(dut):
     for mode, B in (("SM", 478), ("FM", 126), ("FM+", 48)):
         chip, dev = await master_setup(dut, B=B)
@@ -112,7 +113,7 @@ async def test_master_speeds(dut):
         assert not (v := i2c.check_timing(chip.samples, SCL, SDA, mode)), f"{mode}: {v}"
 
 
-@cocotb.test()
+@pe_build.test("i2c")
 async def test_master_addr_nack(dut):
     chip, dev = await master_setup(dut)
     st, _ = await request(chip, 0x51, [1, 2])
@@ -120,7 +121,7 @@ async def test_master_addr_nack(dut):
     assert dev.stops == 1 and dev.log == []
 
 
-@cocotb.test()
+@pe_build.test("i2c")
 async def test_master_data_nack(dut):
     chip, dev = await master_setup(dut, nack_after=2)        # pointer + 1 data byte
     st, _ = await request(chip, 0x50, [0x10, 0xAA, 0xBB, 0xCC])
@@ -129,7 +130,7 @@ async def test_master_data_nack(dut):
     assert dev.stops == 1
 
 
-@cocotb.test()
+@pe_build.test("i2c")
 async def test_master_stretch(dut):
     chip, dev = await master_setup(dut, stretch={"addr": 300, "read": 150})
     await write_read(chip, dev, ptr=0x40)
@@ -148,7 +149,7 @@ async def slave_setup(dut, h=60):
     return chip, m
 
 
-@cocotb.test()
+@pe_build.test("i2c")
 async def test_slave_write(dut):
     chip, m = await slave_setup(dut)
     data = [random.getrandbits(8) for _ in range(4)]
@@ -159,7 +160,7 @@ async def test_slave_write(dut):
     assert await chip.bus.dmem_read(0x10, 4) == data
 
 
-@cocotb.test()
+@pe_build.test("i2c")
 async def test_slave_read(dut):
     chip, m = await slave_setup(dut)
     data = [random.getrandbits(8) for _ in range(4)]
@@ -171,7 +172,7 @@ async def test_slave_read(dut):
     assert not (v := i2c.check_timing(chip.samples, SCL, SDA, "SM", only=("su_dat",))), v
 
 
-@cocotb.test()
+@pe_build.test("i2c")
 async def test_slave_wrong_addr(dut):
     chip, m = await slave_setup(dut)
     acks = await m.write(0x43, [0x00, 0x11])
@@ -183,7 +184,7 @@ async def test_slave_wrong_addr(dut):
     assert await chip.bus.dmem_read(0x05, 1) == [0x99]
 
 
-@cocotb.test()
+@pe_build.test("i2c")
 async def test_timing_check(dut):
     for mode, B, name in (("FM", 125, "low"), ("SM", 400, "fscl"), ("FM+", 40, "low")):
         chip, dev = await master_setup(dut, B=B)

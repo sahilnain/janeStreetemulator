@@ -28,6 +28,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent / "common"))
 
 import cocotb  # noqa: E402
+import pe_build  # noqa: E402
 import i2c  # noqa: E402
 import pe_fw  # noqa: E402
 import pe_host as R  # noqa: E402
@@ -406,7 +407,8 @@ def _register():
         r, m = both(fn, *args)
         for suffix, f in (("rtl_to_model", r), ("model_to_rtl", m)):
             f.__name__ = f.__qualname__ = f"test_{name}_{suffix}"
-            g[f.__name__] = cocotb.test()(f)
+            needs = [p for p in ("spi", "i2c", "usb") if name.startswith(p)]
+            g[f.__name__] = pe_build.test(*needs)(f)
 
 
 _register()

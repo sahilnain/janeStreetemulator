@@ -22,6 +22,8 @@ Tests
 8. test_start_pc_deep_stack  START_PC with high bits, 4 nested calls at high addresses.
 9. test_erx_arm_pending      ERX status read through `urd`: arm pending while RX is busy.
 10. test_pc_past_imem        pc and IMEM_ADDR past IMEM_DEPTH: nops, wrap to 0, writes ignored.
+11. test_protocol_switches   what the host and firmware can read shows the features of each
+                             protocol present or absent, as built (blocks.md Section 13).
 """
 
 import sys
@@ -30,6 +32,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent / "common"))
 
 import cocotb  # noqa: E402
+import pe_build  # noqa: E402
 import pe_host as R  # noqa: E402
 import pe_isa as I  # noqa: E402
 from chip import Chip  # noqa: E402
@@ -72,7 +75,7 @@ def idle(a):
     return a.L("idle").jmp("idle")
 
 
-@cocotb.test()
+@pe_build.test("usb", "i2c")            # DIFF and release are USB; RX drive mode is I2C
 async def test_every_pin_units(dut):
     for p in range(8):
         q, d2, r = (p + 1) % 8, (p + 3) % 8, (p + 5) % 8
@@ -142,6 +145,9 @@ async def test_every_pin_controller(dut):
         await chip.bus.write(R.RUN, 0)
 
         await chip.bus.write(R.PIN_OD, mask)
+        if not pe_build.has("i2c"):                 # open drain is part of I2C (blocks.md Section 13)
+            assert await chip.bus.read(R.PIN_OD) == 0
+            continue
         assert await chip.bus.read(R.PIN_OD) == mask
         await chip.bus.start()
         oes = set()
@@ -156,7 +162,8 @@ async def test_every_pin_controller(dut):
 
 @cocotb.test()
 async def test_pin_index_range(dut):
-    for src in (I.SRC_OWN, I.SRC_TXTICK):           # the vote path and the tick path
+    # the vote path, and the tick path if SPI or I2C is built (blocks.md Section 13)
+    for src in (I.SRC_OWN, I.SRC_TXTICK) if (pe_build.has("spi") or pe_build.has("i2c")) else (I.SRC_OWN,):
         chip = Chip(dut)
         await chip.reset()
         a = Asm()
@@ -211,7 +218,7 @@ async def test_rx_fifo_overrun(dut):
     await chip.bus.write(R.RUN, 0)
 
 
-@cocotb.test()
+@pe_build.test("usb")                   # STOP on a detector is a USB feature
 async def test_etx_stop(dut):
     chip = Chip(dut)
     await chip.reset()
@@ -346,3 +353,29 @@ async def test_pc_past_imem(dut):
     assert not st2 & R.S2_ILL, f"a nop is not an illegal opcode: {st2:02x}"
     await chip.bus.write(R.RUN, 0)
 
+
+@cocotb.test()
+async def test_protocol_switches(dut):
+    """Each build has what it was built with (runs in every build). What can be read shows it: without I2C,
+    PIN_OD and PIN_FILT stay 0; without USB, the CRC register stays 0 whatever the firmware writes.
+    The TX, RX and detector config registers cannot be read: the lockstep fuzz covers them, since
+    the model has the same switches, and so does the z3 proof (model/tests/test_equiv.py)."""
+    chip = Chip(dut)
+    await chip.reset()
+    bus = chip.bus
+    for reg in (R.PIN_OD, R.PIN_FILT):
+        await bus.write(reg, 0xFF)
+        assert await bus.read(reg) == (0xFF if pe_build.has("i2c") else 0), hex(reg)
+        await bus.write(reg, 0)
+    # the CRC unit: set it up as USB does and read the register back
+    a = Asm()
+    a.ucfg(I.CRC, I.CRC_CTRL, I.crc_ctrl(I.CRC_TX, append=1)).ucfg(I.CRC, I.CRC_POLY, 0x8005)
+    a.ucfg(I.CRC, I.CRC_INIT, 0xFFFF)
+    a.urd(0, I.CRC, I.CRC_VAL).fput(0, I.FIFO_RX).shr(0, 8).fput(0, I.FIFO_RX)
+    a.L("end").jmp("end")
+    await bus.load_program(a.words())
+    await bus.start()
+    await ClockCycles(dut.clk, 60)
+    got = [await bus.read(R.RXF), await bus.read(R.RXF)]
+    assert got == ([0xFF, 0xFF] if pe_build.has("usb") else [0, 0]), got
+    await bus.write(R.RUN, 0)

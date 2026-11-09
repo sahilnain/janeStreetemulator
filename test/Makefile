@@ -6,6 +6,24 @@
 #   make GATES=yes   gate-level simulation (after the GDS flow)
 # Unit tests for each module live in unit/ (run: cd unit && pytest).
 
+# Protocol support (docs/spec/blocks.md Section 13). UART is always built:
+#   make PROTOCOLS=uart          UART only
+#   make PROTOCOLS=uart,i2c      UART and I2C
+# The RTL gets -DSUPPORT_<P>=0 for each protocol left out, the Python model reads PE_PROTOCOLS, and
+# a test that needs a protocol which is not built is skipped (test/common/pe_build.py).
+PROTOCOLS ?= uart,spi,i2c,usb
+comma := ,
+PROTOCOL_LIST := $(subst $(comma), ,$(PROTOCOLS))
+ifneq ($(filter-out uart spi i2c usb,$(PROTOCOL_LIST)),)
+$(error PROTOCOLS: unknown $(filter-out uart spi i2c usb,$(PROTOCOL_LIST)); known: uart spi i2c usb)
+endif
+export PE_PROTOCOLS := $(PROTOCOLS)
+PROTOCOL_DEFINES := $(if $(filter spi,$(PROTOCOL_LIST)),,-DSUPPORT_SPI=0) \
+                    $(if $(filter i2c,$(PROTOCOL_LIST)),,-DSUPPORT_I2C=0) \
+                    $(if $(filter usb,$(PROTOCOL_LIST)),,-DSUPPORT_USB=0)
+# one build directory per protocol set, so a change of PROTOCOLS never reuses a stale build
+BUILD_TAG := $(subst $(comma),_,$(PROTOCOLS))
+
 # defaults
 SIM ?= icarus
 FST ?= -fst # Use more efficient FST format
@@ -21,8 +39,9 @@ PROJECT_SOURCES = tt_um_sahil_protoemu.v \
 ifneq ($(GATES),yes)
 
 # RTL simulation:
-SIM_BUILD				= sim_build/rtl
+SIM_BUILD				?= sim_build/rtl_$(BUILD_TAG)
 VERILOG_SOURCES += $(addprefix $(SRC_DIR)/,$(PROJECT_SOURCES))
+COMPILE_ARGS    += $(PROTOCOL_DEFINES)
 
 else
 

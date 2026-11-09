@@ -44,6 +44,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent / "common"))
 
 import cocotb  # noqa: E402
+import pe_build  # noqa: E402
 import pe_fw  # noqa: E402
 import pe_host as R  # noqa: E402
 import spi  # noqa: E402
@@ -76,7 +77,7 @@ async def master_xfer(chip, data):
     return await bus.dmem_read(0x80, len(data))
 
 
-@cocotb.test()
+@pe_build.test("spi")
 async def test_master_modes(dut):
     for mode in range(4):
         cpol, cpha = mode >> 1, mode & 1
@@ -97,7 +98,7 @@ async def test_master_modes(dut):
         await chip.bus.write(R.RUN, 0)
 
 
-@cocotb.test()
+@pe_build.test("spi")
 async def test_master_lsb_slow(dut):
     for B in (10, 3):
         chip = await master_setup(dut, B=B, cpol=0, cpha=0, msb=0)
@@ -112,7 +113,7 @@ async def test_master_lsb_slow(dut):
         await chip.bus.write(R.RUN, 0)
 
 
-@cocotb.test()
+@pe_build.test("spi")
 async def test_master_long(dut):
     chip = await master_setup(dut, B=2)
     data = [random.getrandbits(8) for _ in range(64)]
@@ -127,7 +128,7 @@ async def test_master_long(dut):
                   f"{dev.edges[-1] - dev.edges[0]} cycles first to last edge")
 
 
-@cocotb.test()
+@pe_build.test("spi")
 async def test_master_sdly(dut):
     for sdly, ok in ((2, True), (3, True), (4, True), (0, False)):
         chip = await master_setup(dut, B=4, sdly=sdly)
@@ -152,7 +153,7 @@ async def slave_setup(dut, txf, **kw):
     return chip
 
 
-@cocotb.test()
+@pe_build.test("spi")
 async def test_slave_mode0(dut):
     resp = [random.getrandbits(8) for _ in range(6)]
     chip = await slave_setup(dut, resp + [0xEE])      # one extra byte: see pe_fw.spi_slave
@@ -163,7 +164,7 @@ async def test_slave_mode0(dut):
     assert not await chip.bus.read(R.STATUS2) & R.S2_TX_UNDER
 
 
-@cocotb.test()
+@pe_build.test("spi")
 async def test_slave_mode2_lsb(dut):
     resp = [random.getrandbits(8) for _ in range(4)]
     chip = await slave_setup(dut, resp + [0xEE], cpol=1, msb=0)
@@ -173,7 +174,7 @@ async def test_slave_mode2_lsb(dut):
     assert await chip.read_rx(4) == data
 
 
-@cocotb.test()
+@pe_build.test("spi")
 async def test_slave_two_frames(dut):
     r1, r2 = [0x11, 0x22], [0x33, 0x44, 0x55]
     chip = await slave_setup(dut, r1 + [0xE1] + r2 + [0xE2])
@@ -184,7 +185,7 @@ async def test_slave_two_frames(dut):
     assert await chip.read_rx(5) == d1 + d2
 
 
-@cocotb.test()
+@pe_build.test("spi")
 async def test_slave_fast(dut):
     resp = [random.getrandbits(8) for _ in range(5)]
     chip = await slave_setup(dut, resp + [0xEE])
@@ -193,7 +194,7 @@ async def test_slave_fast(dut):
     assert await chip.read_rx(5) == data
 
 
-@cocotb.test()
+@pe_build.test("spi")
 async def test_slave_underrun(dut):
     chip = await slave_setup(dut, [])
     data = [0x12, 0x34]
@@ -202,7 +203,7 @@ async def test_slave_underrun(dut):
     assert await chip.read_rx(2) == data
 
 
-@cocotb.test()
+@pe_build.test("spi")
 async def test_slave_all_modes(dut):
     for mode in range(4):
         for msb in (1, 0):
@@ -219,7 +220,7 @@ async def test_slave_all_modes(dut):
             await chip.bus.write(R.RUN, 0)
 
 
-@cocotb.test()
+@pe_build.test("spi")
 async def test_slave_max_rate(dut):
     for mode in range(4):
         cpol, cpha = mode >> 1, mode & 1
@@ -234,7 +235,7 @@ async def test_slave_max_rate(dut):
         await chip.bus.write(R.RUN, 0)
 
 
-@cocotb.test()
+@pe_build.test("spi")
 async def test_slave_cpha1_underrun(dut):
     chip = await slave_setup(dut, [], cpha=1)
     data = [0x12, 0x34]

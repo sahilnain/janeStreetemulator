@@ -40,6 +40,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent / "common"))
 
 import cocotb  # noqa: E402
+import pe_build  # noqa: E402
 import pe_fw as F  # noqa: E402
 import pe_host as R  # noqa: E402
 import usb  # noqa: E402
@@ -103,7 +104,7 @@ def answer(chip, t0, jp, kp, B, peer_end):
     return pk, (pk[0]["start"] / B + 1 if pk else None)
 
 
-@cocotb.test()
+@pe_build.test("usb")
 async def test_dev_out(dut):
     for speed in SPEEDS:
         chip, peer, B, jp, kp = await device(dut, speed)
@@ -124,7 +125,7 @@ async def test_dev_out(dut):
         dut._log.info(f"{speed}: ACK {turn} bit times after EOP")
 
 
-@cocotb.test()
+@pe_build.test("usb")
 async def test_dev_setup(dut):
     for speed in SPEEDS:
         chip, peer, B, jp, kp = await device(dut, speed)
@@ -137,7 +138,7 @@ async def test_dev_setup(dut):
         assert await chip.bus.dmem_read(F.UD_RXDATA + 1, 8) == setup
 
 
-@cocotb.test()
+@pe_build.test("usb")
 async def test_dev_stuffing(dut):
     for speed in SPEEDS:
         for data in ([0xFF] * 8, [0x7E, 0xFC, 0x3F, 0xFF, 0x00, 0xFF], [0x00] * 8, [0xFF]):
@@ -155,7 +156,7 @@ async def test_dev_stuffing(dut):
             await stopped(chip)
 
 
-@cocotb.test()
+@pe_build.test("usb")
 async def test_dev_handshakes(dut):
     for speed in SPEEDS:
         for hs in (F.PID_NAK, F.PID_STALL):
@@ -187,7 +188,7 @@ async def in_txn(dut, speed, data, inhs=F.PID_NAK, ack=True):
     return chip, peer, B, pk, ack, turn
 
 
-@cocotb.test()
+@pe_build.test("usb")
 async def test_dev_in(dut):
     for speed in SPEEDS:
         for n in (1, 8, 64 if speed == "FS" else 8):
@@ -203,7 +204,7 @@ async def test_dev_in(dut):
             dut._log.info(f"{speed} n={n}: DATA {turn} bit times after EOP")
 
 
-@cocotb.test()
+@pe_build.test("usb")
 async def test_dev_in_zlp(dut):
     for speed in SPEEDS:
         chip, peer, B, pk, _, _ = await in_txn(dut, speed, [])
@@ -211,7 +212,7 @@ async def test_dev_in_zlp(dut):
         await stopped(chip)
 
 
-@cocotb.test()
+@pe_build.test("usb")
 async def test_dev_in_nak(dut):
     for speed in SPEEDS:
         for hs in (F.PID_NAK, F.PID_STALL):
@@ -220,7 +221,7 @@ async def test_dev_in_nak(dut):
             await stopped(chip)
 
 
-@cocotb.test()
+@pe_build.test("usb")
 async def test_dev_in_no_ack(dut):
     for speed in SPEEDS:
         data = [1, 2, 3]
@@ -237,7 +238,7 @@ async def silence(chip, peer, jp, kp, B, end_idx, cycles):
     assert not pk, f"unexpected answer {pk}"
 
 
-@cocotb.test()
+@pe_build.test("usb")
 async def test_dev_ignores(dut):
     for speed in SPEEDS:
         chip, peer, B, jp, kp = await device(dut, speed)
@@ -256,7 +257,7 @@ async def test_dev_ignores(dut):
         await stopped(chip)
 
 
-@cocotb.test()
+@pe_build.test("usb")
 async def test_dev_bad_crc(dut):
     for speed in SPEEDS:
         chip, peer, B, jp, kp = await device(dut, speed)
@@ -272,7 +273,7 @@ async def test_dev_bad_crc(dut):
         await stopped(chip)
 
 
-@cocotb.test()
+@pe_build.test("usb")
 async def test_dev_stuff_error(dut):
     for speed in SPEEDS:
         chip, peer, B, jp, kp = await device(dut, speed)
@@ -283,7 +284,7 @@ async def test_dev_stuff_error(dut):
         await stopped(chip)
 
 
-@cocotb.test()
+@pe_build.test("usb")
 async def test_dev_short_sync(dut):
     for speed in SPEEDS:
         chip, peer, B, jp, kp = await device(dut, speed)
@@ -295,7 +296,7 @@ async def test_dev_short_sync(dut):
         assert await chip.bus.dmem_read(F.UD_RXDATA + 1, 2) == data
 
 
-@cocotb.test()
+@pe_build.test("usb")
 async def test_dev_clock_error(dut):
     for speed, bits in (("FS", (4.1667, 3.88, 4.12)), ("LS", (33.33, 31.04, 32.96))):
         for bit in bits:
@@ -308,7 +309,7 @@ async def test_dev_clock_error(dut):
             assert await chip.bus.dmem_read(F.UD_RXDATA + 1, len(data)) == data, (speed, bit)
 
 
-@cocotb.test()
+@pe_build.test("usb")
 async def test_dev_reset(dut):
     for speed in SPEEDS:
         chip, peer, B, jp, kp = await device(dut, speed)
@@ -366,7 +367,7 @@ async def wait_tx(chip, jp, kp, B, t0, n=1, limit=40000):
     raise AssertionError(f"no packet after {t0}")
 
 
-@cocotb.test()
+@pe_build.test("usb")
 async def test_host_out(dut):
     for speed in SPEEDS:
         for pid, tk in ((F.PID_OUT, tok(F.PID_OUT)), (F.PID_SETUP, tok(F.PID_SETUP, ep=0))):
@@ -385,7 +386,7 @@ async def test_host_out(dut):
             assert r == [F.PID_ACK, F.UH_OK, 1], r
 
 
-@cocotb.test()
+@pe_build.test("usb")
 async def test_host_in(dut):
     for speed in SPEEDS:
         for data in ([1, 2, 3, 4, 5, 6, 7, 8], [], [0xFF] * 4):
@@ -408,7 +409,7 @@ async def test_host_in(dut):
             assert await chip.bus.dmem_read(0x81, len(data)) == data if data else True
 
 
-@cocotb.test()
+@pe_build.test("usb")
 async def test_host_timeout(dut):
     for speed in SPEEDS:
         chip, peer, B, jp, kp = await host(dut, speed)
@@ -418,7 +419,7 @@ async def test_host_timeout(dut):
         assert (await chip.bus.dmem_read(F.UH_STATUS, 1))[0] == F.UH_TIMEOUT
 
 
-@cocotb.test()
+@pe_build.test("usb")
 async def test_host_bad_crc(dut):
     for speed in SPEEDS:
         chip, peer, B, jp, kp = await host(dut, speed)
@@ -436,7 +437,7 @@ async def test_host_bad_crc(dut):
         assert (await chip.bus.dmem_read(F.UH_STATUS, 1))[0] == F.UH_BADPKT
 
 
-@cocotb.test()
+@pe_build.test("usb")
 async def test_host_reset(dut):
     for speed in SPEEDS:
         chip, peer, B, jp, kp = await host(dut, speed)

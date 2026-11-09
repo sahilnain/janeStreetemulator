@@ -48,6 +48,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent / "common"))
 
 import cocotb  # noqa: E402
+import pe_build  # noqa: E402
 import i2c  # noqa: E402
 import pe_fw  # noqa: E402
 import pe_host as R  # noqa: E402
@@ -187,13 +188,13 @@ async def stream(dut, B, n, mode, msb=1):
     await chip.bus.write(R.RUN, 0)
 
 
-@cocotb.test()
+@pe_build.test("spi")
 async def test_spi_stream(dut):
     for mode in range(4):
         await stream(dut, 4, 40, mode, msb=mode & 1)
 
 
-@cocotb.test()
+@pe_build.test("spi")
 async def test_spi_stream_fast(dut):
     for mode in range(4):
         await stream(dut, 2, 9, mode)
@@ -216,7 +217,7 @@ async def test_spi_stream_fast(dut):
     await chip.bus.write(R.RUN, 0)
 
 
-@cocotb.test()
+@pe_build.test("spi")
 async def test_spi_stream_lost(dut):
     chip = await fresh(dut, pe_fw.spi_master_stream(B=4).words(), R.owner_map(p2=R.OWN_TX, p3=R.OWN_TX))
     chip.devices.append(spi.SpiSlave(SCK, MOSI, MISO, CS, tx=[0x5A] * 30))
@@ -240,7 +241,7 @@ async def no_contention(dut, dev, pin):
         assert not (dev.drive is not None and (int(dut.uio_oe.value) >> pin) & 1), "both sides drive DIO"
 
 
-@cocotb.test()
+@pe_build.test("spi")
 async def test_spi_3wire_master(dut):
     for mode in range(4):
         cpol, cpha = mode >> 1, mode & 1
@@ -266,7 +267,7 @@ async def test_spi_3wire_master(dut):
         await chip.bus.write(R.RUN, 0)
 
 
-@cocotb.test()
+@pe_build.test("spi")
 async def test_spi_3wire_slave(dut):
     for mode in range(4):
         cpol, cpha = mode >> 1, mode & 1
@@ -285,7 +286,7 @@ async def test_spi_3wire_slave(dut):
         await chip.bus.write(R.RUN, 0)
 
 
-@cocotb.test()
+@pe_build.test("spi")
 async def test_spi_slave_words(dut):
     for bits in (9, 12, 15, 16):
         for mode in range(4):
@@ -337,7 +338,7 @@ async def i2c_req(chip, addr, wdata=(), nread=0, hi=None):
     return (await chip.bus.dmem_read(0x7F, 1))[0], (await chip.bus.dmem_read(0x80, nread) if nread else [])
 
 
-@cocotb.test()
+@pe_build.test("i2c")
 async def test_i2c_10bit_master(dut):
     A = 0x2A5
     dev = i2c.I2cSlave(SCL, SDA, addr10=A)
@@ -357,7 +358,7 @@ async def test_i2c_10bit_master(dut):
     await chip.bus.write(R.RUN, 0)
 
 
-@cocotb.test()
+@pe_build.test("i2c")
 async def test_i2c_hs_master(dut):
     dev = i2c.I2cSlave(SCL, SDA, 0x50)
     chip = await i2c_master_chip(dut, dev, B=126, hs_B=16, sdly=2)
@@ -404,7 +405,7 @@ class Rival:
         return (line & ~(1 << SDA)) | (bus << SDA)
 
 
-@cocotb.test()
+@pe_build.test("i2c")
 async def test_i2c_arbitration(dut):
     # The chip sends 1011000 W, the rival 1010000 W: the chip reads 0 after sending 1 at bit 4
     rival = Rival(0xA0)
@@ -460,7 +461,7 @@ async def i2c_slave_chip(dut, h=60, **kw):
     return chip, m
 
 
-@cocotb.test()
+@pe_build.test("i2c")
 async def test_i2c_10bit_slave(dut):
     A = 0x1C7
     chip, m = await i2c_slave_chip(dut, addr10=A)
@@ -499,7 +500,7 @@ async def test_i2c_10bit_slave(dut):
     await chip.bus.write(R.RUN, 0)
 
 
-@cocotb.test()
+@pe_build.test("i2c")
 async def test_i2c_slave_stretch(dut):
     hold = 400
     chip, m = await i2c_slave_chip(dut, h=40, addr=0x42, hold=hold)
@@ -518,7 +519,7 @@ async def test_i2c_slave_stretch(dut):
     assert await chip.bus.dmem_read(0x10, 2) == [0xA5, 0x5A]
 
 
-@cocotb.test()
+@pe_build.test("i2c")
 async def test_i2c_stretch_setup(dut):
     # hold is longer than the master's low phase, so the chip's release starts the next clock
     chip, m = await i2c_slave_chip(dut, h=60, addr=0x42, hold=60)
@@ -530,7 +531,7 @@ async def test_i2c_stretch_setup(dut):
     await chip.bus.write(R.RUN, 0)
 
 
-@cocotb.test()
+@pe_build.test("i2c")
 async def test_i2c_general_call(dut):
     chip, m = await i2c_slave_chip(dut, general_call=True)
     await m.start()
@@ -549,7 +550,7 @@ async def test_i2c_general_call(dut):
 
 
 # -------------------------------------------------------------------- USB
-@cocotb.test()
+@pe_build.test("usb")
 async def test_usb_device_suspend(dut):
     F = pe_fw
     for speed in ("FS", "LS"):
@@ -578,7 +579,7 @@ async def test_usb_device_suspend(dut):
         assert await chip.bus.dmem_read(F.UD_RXDATA + 1, 4) == data, speed
 
 
-@cocotb.test()
+@pe_build.test("usb")
 async def test_usb_host_resume(dut):
     F = pe_fw
     for speed in ("FS", "LS"):
@@ -639,7 +640,7 @@ def scl_rises(chip, t0):
     return sum(1 for x, y in zip(tr, tr[1:]) if y and not x)
 
 
-@cocotb.test()
+@pe_build.test("i2c")
 async def test_i2c_filter_spikes(dut):
     """With PIN_FILT on, spikes of up to 3 cycles on either line change nothing.
     With it off, spikes on SDA corrupt what the controller reads."""
@@ -677,7 +678,7 @@ async def test_i2c_filter_spikes(dut):
         await chip.bus.write(R.RUN, 0)
 
 
-@cocotb.test()
+@pe_build.test("i2c")
 async def test_i2c_bus_clear(dut):
     """UM10204 3.1.16: SDA low at a request: clocks until it is released, a STOP, then the request."""
     for arb in (False, True):
@@ -693,7 +694,7 @@ async def test_i2c_bus_clear(dut):
             await chip.bus.write(R.RUN, 0)
 
 
-@cocotb.test()
+@pe_build.test("i2c")
 async def test_i2c_bus_clear_gives_up(dut):
     """Still low after nine clocks: status 4, no START. The next request works once SDA is free."""
     for arb in (False, True):

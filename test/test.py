@@ -42,6 +42,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent / "common"))
 
 import cocotb  # noqa: E402
+import pe_build  # noqa: E402
 import pe_host as R  # noqa: E402
 import pe_isa as I  # noqa: E402
 from chip import Chip  # noqa: E402
@@ -61,11 +62,13 @@ async def test_registers(dut):
     assert await bus.read(R.STATUS) == R.ST_TXF_EMPTY | R.ST_RXF_EMPTY
     assert await bus.read(R.STATUS2) == 0
     assert await bus.read(R.CSTAT) == 0
-    for a, x in ((R.PIN_OD, 0xA5), (R.IRQ_EN, 0x0A), (R.START_PC, 0x2A), (R.START_PC + 1, 0x00),
-                 (R.PIN_OWNER, 0x96), (R.PIN_OWNER + 1, 0x5A), (R.IMEM_ADDR, 0x3C),
-                 (R.DMEM_ADDR, 0xC3), (R.RUN, 0x01), (R.RUN, 0x00)):
+    # PIN_OD is part of I2C: without it, the register ignores writes (blocks.md Section 13)
+    od = 0xA5 if pe_build.has("i2c") else 0x00
+    for a, x, back in ((R.PIN_OD, 0xA5, od), (R.IRQ_EN, 0x0A, 0x0A), (R.START_PC, 0x2A, 0x2A), (R.START_PC + 1, 0x00, 0x00),
+                       (R.PIN_OWNER, 0x96, 0x96), (R.PIN_OWNER + 1, 0x5A, 0x5A), (R.IMEM_ADDR, 0x3C, 0x3C),
+                       (R.DMEM_ADDR, 0xC3, 0xC3), (R.RUN, 0x01, 0x01), (R.RUN, 0x00, 0x00)):
         await bus.write(a, x)
-        assert await bus.read(a) == x, hex(a)
+        assert await bus.read(a) == back, hex(a)
     await bus.write(R.PIN_OD, 0)
     await bus.write(R.IRQ_EN, 0)
     await bus.owners(0)
@@ -91,7 +94,7 @@ async def test_imem_err_irq(dut):
     await bus.write(R.RUN, 0)
 
 
-@cocotb.test()
+@pe_build.test("i2c")
 async def test_open_drain(dut):
     chip = Chip(dut)
     await chip.reset()

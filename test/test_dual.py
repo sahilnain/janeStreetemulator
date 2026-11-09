@@ -29,6 +29,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent / "common"))
 
 import cocotb  # noqa: E402
+import pe_build  # noqa: E402
 import pe_fw  # noqa: E402
 import pe_host as R  # noqa: E402
 import uart  # noqa: E402
@@ -140,7 +141,7 @@ async def test_baud_mismatch(dut):
     assert t2.result() == a
 
 
-@cocotb.test()
+@pe_build.test("spi")
 async def test_spi_all_modes(dut):
     e1, e2 = await setup(dut, "spi")
     for mode in range(4):
@@ -192,7 +193,7 @@ async def usb_txn(e1, e2, tok, dpid=0, data=()):
     await usb_wait(e1, "host")
 
 
-@cocotb.test()
+@pe_build.test("usb")
 async def test_usb_both_speeds(dut):
     F = pe_fw
     for name, B, jp, kp in (("FS", 4, 0, 1), ("LS", 32, 1, 0)):
