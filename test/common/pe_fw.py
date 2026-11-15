@@ -38,7 +38,14 @@ K_LAT = 2
 
 
 def uart_consts(B, N=1, K=0, S=None):
-    """Timing constants for bit period B and an RX vote of N samples, S apart."""
+    """Timing constants for bit period B and an RX vote of N samples, S apart.
+    B      cycles per bit (48 MHz / baud: 115200 baud -> B = 417)
+    N, K   the RX unit takes N samples per bit and votes on the middle N - 2K of them
+    S      cycles between samples (STEP); N samples must fit inside one bit
+    DUR    ERX: the line must stay low for half a bit before a falling edge counts as a start bit
+    FIRST  RX: cycles from its start (when ERX fires, DUR into the start bit) to the window of data bit 0
+    ADLY   ERX: cycles after the last data bit's vote to check the stop bit, in the middle of the stop bit
+    TXDUR  ETX: the start bit length, less the detector-to-unit latency K_LAT"""
     if S is None:
         S = max(1, B // (N + 1))
     assert N * S + 1 <= B, "vote window must fit in a bit"
@@ -48,36 +55,38 @@ def uart_consts(B, N=1, K=0, S=None):
 
 
 def uart(txd=0, rxd=1, B=112, N=9, K=1, S=12, B_rx=None, tx=True, rx=True, stop_lvl=1):
-    """Full-duplex UART: TX on `txd`, RX on `rxd`. Returns an Asm."""
+    """Full-duplex UART, 8N1: TX on `txd`, RX on `rxd`. The host writes bytes to TXF and reads
+    received ones from RXF. B_rx: a different bit time for RX. tx / rx: build one direction only.
+    stop_lvl: the stop and idle level (1 for a normal line). Returns an Asm."""
     # Registers: r0 the received byte. r7 the TX state: 0 waiting for the line to be idle, 1 start bit running.
     # The loop never blocks, so TX and RX are both served by it. Each edge on the line comes from hardware.
     c = uart_consts(B if B_rx is None else B_rx, N, K, S)
     a = Asm()
     # Setup. The TX unit sends the data bits; ETX adds the stop edge the moment the last bit ends.
     if tx:
-        a.ucfg(I.TX, I.TX_PINS, I.tx_pins(txd))
-        a.ucfg(I.TX, I.TX_BIT, B)
-        a.ucfg(I.TX, I.TX_FRAME, 0)
-        a.ucfg(I.ETX_U, I.D_AFTER, I.A_DRIVE1 if stop_lvl else I.A_DRIVE0)
+        a.ucfg(I.TX, I.TX_PINS, I.tx_pins(txd))                  # data on txd, no clock pin
+        a.ucfg(I.TX, I.TX_BIT, B)                                # B cycles per bit
+        a.ucfg(I.TX, I.TX_FRAME, 0)                              # 8 bits, LSB first
+        a.ucfg(I.ETX_U, I.D_AFTER, I.A_DRIVE1 if stop_lvl else I.A_DRIVE0)   # after the packet: drive the stop level
     # RX runs in hardware from here on: ERX finds the start bit and starts the RX unit, the RX unit votes on
     # each bit, ERX checks the stop bit and re-arms itself (AUTOARM). RXRDY means a byte was received and checked.
     if rx:
-        a.ucfg(I.RX, I.RX_PINS, I.rx_pins(rxd))
-        a.ucfg(I.RX, I.RX_BIT, c["B"])
-        a.ucfg(I.RX, I.RX_FRAME, I.rx_frame(hold=1))
-        a.ucfg(I.RX, I.RX_VOTE, I.rx_vote(N, K))
-        a.ucfg(I.RX, I.RX_STEP, c["S"])
-        a.ucfg(I.RX, I.RX_FIRST, c["FIRST"])
+        a.ucfg(I.RX, I.RX_PINS, I.rx_pins(rxd))                  # sample rxd
+        a.ucfg(I.RX, I.RX_BIT, c["B"])                           # one window per bit time
+        a.ucfg(I.RX, I.RX_FRAME, I.rx_frame(hold=1))             # 8 bits, LSB first, hold the byte for urd
+        a.ucfg(I.RX, I.RX_VOTE, I.rx_vote(N, K))                 # N samples a bit, the middle N - 2K vote
+        a.ucfg(I.RX, I.RX_STEP, c["S"])                          # S cycles between samples
+        a.ucfg(I.RX, I.RX_FIRST, c["FIRST"])                     # from the start to data bit 0's window
         # Start bit: a falling edge, then low for half a bit, so a short glitch is not taken for a start.
-        a.ucfg(I.ERX_U, I.D_COND, I.cond(rxd, I.FALL, start=1, autoarm=1))
+        a.ucfg(I.ERX_U, I.D_COND, I.cond(rxd, I.FALL, start=1, autoarm=1))   # starts RX itself, re-arms after
         a.ucfg(I.ERX_U, I.D_DUR, c["DUR"])
-        a.ucfg(I.ERX_U, I.D_AFTER, I.erx_after(1, 1))
-        a.ucfg(I.ERX_U, I.D_ADLY, c["ADLY"])
-        a.evt(I.DET_RX, I.EV_ARM)
+        a.ucfg(I.ERX_U, I.D_AFTER, I.erx_after(1, 1))            # after the packet: check that the stop bit is 1
+        a.ucfg(I.ERX_U, I.D_ADLY, c["ADLY"])                     # ... in the middle of the stop bit
+        a.evt(I.DET_RX, I.EV_ARM)                                # RX is live from here, with no more firmware
     # Idle the line high, and have ETX report when it has been high for one bit time.
     if tx:
-        a.set(txd, I.SRC_1)
-        a.setoe(txd, 1)
+        a.set(txd, I.SRC_1)                                      # idle level first,
+        a.setoe(txd, 1)                                          # then drive the pin, so it never glitches low
         a.ucfg(I.ETX_U, I.D_COND, I.cond(txd, I.LEVEL, 1))       # line idle >= 1 bit
         a.ucfg(I.ETX_U, I.D_DUR, B)
         a.evt(I.DET_TX, I.EV_ARM)
@@ -86,16 +95,16 @@ def uart(txd=0, rxd=1, B=112, N=9, K=1, S=12, B_rx=None, tx=True, rx=True, stop_
     if tx:
         # TX side, state 0: when the line has been idle and a byte is waiting, drive the start bit. ETX then times
         # it, and starts the TX unit by itself after B - k cycles, so the start bit is exact.
-        a.cmp(7, 1)
+        a.cmp(7, 1)                                              # Z = 1: the start bit is already running
         a.jmp("tx_run", I.Z)
         a.jmp("rx_chk", I.NETX)                                  # idle >= 1 bit?
         a.jmp("rx_chk", I.TXF_EMPTY)                             # and a byte?
-        a.evt(I.DET_TX, I.EV_CLR)
-        a.ucfg(I.ETX_U, I.D_COND, I.cond(txd, I.LEVEL, 0, start=1))
+        a.evt(I.DET_TX, I.EV_CLR)                                # the idle flag is used up
+        a.ucfg(I.ETX_U, I.D_COND, I.cond(txd, I.LEVEL, 0, start=1))   # ETX: once low for B - k, start TX
         a.ucfg(I.ETX_U, I.D_DUR, B - K_LAT)
         a.evt(I.DET_TX, I.EV_ARM)
         a.set(txd, I.SRC_0)                                      # start bit
-        a.mov(7, 1)
+        a.mov(7, 1)                                              # state 1: wait for TX to take over
         a.jmp("rx_chk")
         # TX side, state 1: ETX has fired, so the TX unit is sending. Set ETX up to time the stop bit and the idle
         # after it. The arm takes effect after the stop edge, which ETX drives.
@@ -105,14 +114,14 @@ def uart(txd=0, rxd=1, B=112, N=9, K=1, S=12, B_rx=None, tx=True, rx=True, stop_
         a.ucfg(I.ETX_U, I.D_COND, I.cond(txd, I.LEVEL, 1))       # stop + idle >= 1 bit
         a.ucfg(I.ETX_U, I.D_DUR, B)
         a.evt(I.DET_TX, I.EV_ARM)                                # deferred to after stop edge
-        a.mov(7, 0)
+        a.mov(7, 0)                                              # back to state 0: ready for the next byte
     # RX side: take a finished byte. Reading DATA clears RXRDY.
     a.L("rx_chk")
     if rx:
-        a.jmp("loop", I.NRXRDY)
-        a.urd(0, I.RX, I.RX_DATA)
+        a.jmp("loop", I.NRXRDY)                                  # no byte yet
+        a.urd(0, I.RX, I.RX_DATA)                                # r0 = the byte; clears RXRDY
         a.jmp("loop", I.FERR)                                    # bad stop bit: drop
-        a.fput(0, I.FIFO_RX)
+        a.fput(0, I.FIFO_RX)                                     # good byte to the host (blocks if RXF is full)
     a.jmp("loop")
     return a
 
@@ -143,21 +152,25 @@ def uart_ex(txd=0, rxd=1, B=112, N=9, K=1, S=12, bits=8, parity=PAR_NONE, stop_b
     mask = (1 << bits) - 1
     a = Asm()
     # Setup. NBITS is data + parity, so parity needs no framing hardware. The stop time is the idle time ETX waits for.
+    # TX unit: the data bits and the parity bit, as one word; ETX drives the stop level when it ends.
     a.ucfg(I.TX, I.TX_PINS, I.tx_pins(txd))
     a.ucfg(I.TX, I.TX_BIT, B)
-    a.ucfg(I.TX, I.TX_FRAME, I.tx_frame(msb, inv, wbits))
-    a.ucfg(I.ETX_U, I.D_AFTER, I.A_DRIVE0 if inv else I.A_DRIVE1)
+    a.ucfg(I.TX, I.TX_FRAME, I.tx_frame(msb, inv, wbits))       # bit order, inverted line, data + parity bits
+    a.ucfg(I.ETX_U, I.D_AFTER, I.A_DRIVE0 if inv else I.A_DRIVE1)   # stop level after the last bit
+    # RX unit: votes on each bit, as in uart(); the word (data + parity) is held for urd.
     a.ucfg(I.RX, I.RX_PINS, I.rx_pins(rxd))
     a.ucfg(I.RX, I.RX_BIT, B)
     a.ucfg(I.RX, I.RX_FRAME, I.rx_frame(msb, hold=1, inv=inv, nbits=wbits))
     a.ucfg(I.RX, I.RX_VOTE, I.rx_vote(N, K))
     a.ucfg(I.RX, I.RX_STEP, c["S"])
     a.ucfg(I.RX, I.RX_FIRST, c["FIRST"])
+    # ERX: the start edge (rising on an inverted line) starts RX; the stop bit is checked at the idle level.
     a.ucfg(I.ERX_U, I.D_COND, I.cond(rxd, I.RISE if inv else I.FALL, start=1, autoarm=1))
     a.ucfg(I.ERX_U, I.D_DUR, c["DUR"])
     a.ucfg(I.ERX_U, I.D_AFTER, I.erx_after(1, idle))
     a.ucfg(I.ERX_U, I.D_ADLY, c["ADLY"])
     a.evt(I.DET_RX, I.EV_ARM)
+    # The TX line idles, and ETX reports once it has been idle for the stop time (1, 1.5 or 2 bits).
     a.set(txd, I.SRC_0 if inv else I.SRC_1)
     a.setoe(txd, 1)
     a.ucfg(I.ETX_U, I.D_COND, I.cond(txd, I.LEVEL, idle))
@@ -167,37 +180,37 @@ def uart_ex(txd=0, rxd=1, B=112, N=9, K=1, S=12, bits=8, parity=PAR_NONE, stop_b
     a.mov(5, 0)                                  # break count
     # TX side: nothing goes out until ETX says the stop time has passed.
     a.L("loop")
-    a.jmp("rx_chk", I.NETX)
-    a.jmp("brk", I.DB)
-    a.jmp("rx_chk", I.TXF_EMPTY)
+    a.jmp("rx_chk", I.NETX)                      # stop time not over yet: only RX can be served
+    a.jmp("brk", I.DB)                           # the host asked for a break
+    a.jmp("rx_chk", I.TXF_EMPTY)                 # nothing to send
     # Build the word: data, then the parity bit where it goes last on the line.
-    a.fget(0, I.FIFO_TX)
+    a.fget(0, I.FIFO_TX)                         # r0 = the data (low byte)
     if bits > 8:
-        a.fget(1, I.FIFO_TX).shl(1, 8).or_(0, I.R(1))
+        a.fget(1, I.FIFO_TX).shl(1, 8).or_(0, I.R(1))   # high byte from a second FIFO byte
     if parity != PAR_NONE:
         if msb:
             a.shl(0, 1)                          # room for the parity bit, which goes last
         a.par(0)                                 # C = odd number of 1s in the data
         pm = {PAR_EVEN: I.NC, PAR_ODD: I.C}.get(parity)
         if parity == PAR_MARK:
-            a.or_(0, pbit)
+            a.or_(0, pbit)                       # mark: always 1 (space: always 0, nothing to do)
         elif parity != PAR_SPACE:
-            a.jmp("tx_go", pm).or_(0, pbit)
+            a.jmp("tx_go", pm).or_(0, pbit)      # even / odd: set the parity bit when C says so
             a.L("tx_go")
     # Start bit, by instruction timing: set takes 1 cycle, delay(B - 2) takes B - 1.
     a.evt(I.DET_TX, I.EV_CLR)
     a.set(txd, I.SRC_1 if inv else I.SRC_0)      # start bit: the next ustart is B cycles later
     a.delay(B - 2)
-    a.ustart(I.M_TX, I.R(0))
+    a.ustart(I.M_TX, I.R(0))                     # the data and parity bits, from r0
     a.evt(I.DET_TX, I.EV_ARM)                    # deferred to after the stop edge
     # RX side: a bad stop bit goes to ferr, a bad parity bit to p_bad, and only a good frame reaches RXF.
     a.L("rx_chk")
-    a.jmp("loop", I.NRXRDY)
-    a.urd(0, I.RX, I.RX_DATA)
-    a.jmp("ferr", I.FERR)
+    a.jmp("loop", I.NRXRDY)                      # no word yet
+    a.urd(0, I.RX, I.RX_DATA)                    # r0 = data + parity; clears RXRDY
+    a.jmp("ferr", I.FERR)                        # the stop bit was bad
     if parity != PAR_NONE:
         if parity in (PAR_MARK, PAR_SPACE):
-            a.mov(2, I.R(0)).and_(2, pbit)
+            a.mov(2, I.R(0)).and_(2, pbit)       # Z = the parity bit was 0
             a.jmp("p_bad", I.Z if parity == PAR_MARK else I.NZ)
         else:
             a.par(0)                             # data + parity bit: even -> C = 0
@@ -205,25 +218,25 @@ def uart_ex(txd=0, rxd=1, B=112, N=9, K=1, S=12, bits=8, parity=PAR_NONE, stop_b
             a.jmp("p_bad")
             a.L("p_ok")
         if msb:
-            a.shr(0, 1)
+            a.shr(0, 1)                          # drop the parity bit, which came last
     # Good frame: the data bits to RXF. More than 8 bits take a second byte.
-    a.mov(1, I.R(0)).and_(0, mask & 0xFF)
+    a.mov(1, I.R(0)).and_(0, mask & 0xFF)        # r1 keeps the word; r0 = the low data byte
     a.fput(0, I.FIFO_RX)
     if bits > 8:
-        a.shr(1, 8).and_(1, (mask >> 8) & 0xFF).fput(1, I.FIFO_RX)
+        a.shr(1, 8).and_(1, (mask >> 8) & 0xFF).fput(1, I.FIFO_RX)   # the high data bits as a second byte
     a.jmp("loop")
     if parity != PAR_NONE:
-        a.L("p_bad").add(6, 1).mov(1, 1).st(6, 1).jmp("loop")
+        a.L("p_bad").add(6, 1).mov(1, 1).st(6, 1).jmp("loop")   # count it in dmem[1], drop the word
     # a bad stop bit with all data 0 is a break; ERX needs a new edge, so it counts once
-    a.L("ferr").cmp(0, 0).jmp("loop", I.NZ)
-    a.add(5, 1).mov(1, 2).st(5, 1).host_irq().jmp("loop")
+    a.L("ferr").cmp(0, 0).jmp("loop", I.NZ)      # bad stop bit, data not 0: a framing error, dropped
+    a.add(5, 1).mov(1, 2).st(5, 1).host_irq().jmp("loop")   # a break: count it in dmem[2], tell the host
     # send a break, then the stop time (ETX re-arms on the idle level)
-    a.L("brk").dbclr().mov(1, 3).ld(1, 1).evt(I.DET_TX, I.EV_CLR)
-    a.set(txd, I.SRC_1 if inv else I.SRC_0)
+    a.L("brk").dbclr().mov(1, 3).ld(1, 1).evt(I.DET_TX, I.EV_CLR)   # r1 = the length from dmem[3], in bit times
+    a.set(txd, I.SRC_1 if inv else I.SRC_0)      # the line to the active level: the break
     # One bit time a pass: delay(B - 2) takes B - 1, and djnz takes 1.
     a.L("brl").delay(B - 2).djnz(1, "brl")
-    a.set(txd, I.SRC_0 if inv else I.SRC_1)
-    a.evt(I.DET_TX, I.EV_ARM).jmp("rx_chk")
+    a.set(txd, I.SRC_0 if inv else I.SRC_1)      # back to idle
+    a.evt(I.DET_TX, I.EV_ARM).jmp("rx_chk")      # ETX times the stop time again before the next frame
     return a
 
 
@@ -246,34 +259,35 @@ def spi_master_words(B=2, cpol=0, cpha=0, msb=1, sdly=3, bits=16, sck=2, mosi=3,
     each, at dmem[0x80]. Owners: SCK, MOSI -> TX unit."""
     # Registers: r0 word out. r1 pointer to the words. r2 words left. r3 pointer to the replies. r4 scratch.
     a = Asm()
-    a.ucfg(I.TX, I.TX_PINS, I.tx_pins(mosi, 1, sck, 1))
-    a.ucfg(I.TX, I.TX_BIT, B)
-    a.ucfg(I.TX, I.TX_FRAME, I.tx_frame(msb, nbits=bits))
-    a.ucfg(I.TX, I.TX_CLK, I.tx_clk(cpol, cpha))
+    # The TX unit makes SCK and MOSI; the RX unit samples MISO on the TX unit's sample tick, SDLY cycles late.
+    a.ucfg(I.TX, I.TX_PINS, I.tx_pins(mosi, 1, sck, 1))        # data on MOSI, clock on SCK
+    a.ucfg(I.TX, I.TX_BIT, B)                                   # SCK period = B cycles
+    a.ucfg(I.TX, I.TX_FRAME, I.tx_frame(msb, nbits=bits))       # `bits` bits a word
+    a.ucfg(I.TX, I.TX_CLK, I.tx_clk(cpol, cpha))                # SPI mode
     a.ucfg(I.RX, I.RX_PINS, I.rx_pins(miso))
-    a.ucfg(I.RX, I.RX_FRAME, I.rx_frame(msb, hold=1, nbits=bits))
+    a.ucfg(I.RX, I.RX_FRAME, I.rx_frame(msb, hold=1, nbits=bits))   # hold the word for urd
     a.ucfg(I.RX, I.RX_TICK, I.rx_tick(I.SRC_TXTICK, sdly=sdly))
     # SCK idles at CPOL, and CS is high until a request comes.
     a.set(sck, I.SRC_1 if cpol else I.SRC_0).setoe(sck, 1)
     a.set(mosi, I.SRC_0).setoe(mosi, 1)
     a.set(cs, I.SRC_1).setoe(cs, 1)
-    a.L("idle").jmp("idle", I.NDB)
+    a.L("idle").jmp("idle", I.NDB)                              # wait for the doorbell
     a.dbclr()
     # Request: r2 = n from dmem[0], r1 now points at dmem[1]. Then select the device.
-    a.mov(1, 0).ld(2, 1, inc=1).mov(3, 0x80)
-    a.set(cs, I.SRC_0).delay(0)
+    a.mov(1, 0).ld(2, 1, inc=1).mov(3, 0x80)                    # r3 -> the replies at 0x80
+    a.set(cs, I.SRC_0).delay(0)                                 # CS low, then the lead time
     _cs_time(a, B)
     a.L("word")
     # One word: two bytes from DMEM, low first, out and in together. A word over 8 bits comes from a
     # register and is read with urd, because the FIFOs hold bytes. SCK pauses between words, which SPI allows.
-    a.ld(0, 1, inc=1).ld(4, 1, inc=1).shl(4, 8).or_(0, I.R(4))
-    a.ustart(I.M_BOTH, I.R(0))
-    a.uwait(I.M_BOTH)
-    a.urd(4, I.RX, I.RX_DATA)
-    a.st(4, 3, inc=1).shr(4, 8).st(4, 3, inc=1)
-    a.djnz(2, "word")
+    a.ld(0, 1, inc=1).ld(4, 1, inc=1).shl(4, 8).or_(0, I.R(4))  # r0 = low | high << 8
+    a.ustart(I.M_BOTH, I.R(0))                                  # TX sends r0 while RX receives
+    a.uwait(I.M_BOTH)                                           # until both are done
+    a.urd(4, I.RX, I.RX_DATA)                                   # r4 = the word received
+    a.st(4, 3, inc=1).shr(4, 8).st(4, 3, inc=1)                 # stored low byte first
+    a.djnz(2, "word")                                           # next word, until n are done
     # All sent: deselect, and tell the host.
-    _cs_time(a, B)
+    _cs_time(a, B)                                              # the lag time before CS rises
     a.set(cs, I.SRC_1)
     a.host_irq()
     a.jmp("idle")
@@ -289,10 +303,10 @@ def spi_master(B=2, cpol=0, cpha=0, msb=1, sdly=3, sck=2, mosi=3, miso=4, cs=5):
     a = Asm()
     # The TX unit makes SCK and MOSI. The RX unit samples MISO on the TX unit's sample tick, and SDLY covers
     # the trip through the synchroniser and the outside world.
-    a.ucfg(I.TX, I.TX_PINS, I.tx_pins(mosi, 1, sck, 1))
-    a.ucfg(I.TX, I.TX_BIT, B)
-    a.ucfg(I.TX, I.TX_FRAME, msb)
-    a.ucfg(I.TX, I.TX_CLK, I.tx_clk(cpol, cpha))
+    a.ucfg(I.TX, I.TX_PINS, I.tx_pins(mosi, 1, sck, 1))        # data on MOSI, clock on SCK
+    a.ucfg(I.TX, I.TX_BIT, B)                                   # SCK period = B cycles (B = 2: 24 MHz)
+    a.ucfg(I.TX, I.TX_FRAME, msb)                               # 8 bits, MSB or LSB first
+    a.ucfg(I.TX, I.TX_CLK, I.tx_clk(cpol, cpha))                # SPI mode
     a.ucfg(I.RX, I.RX_PINS, I.rx_pins(miso))
     a.ucfg(I.RX, I.RX_FRAME, I.rx_frame(msb, hold=0))          # auto-push
     a.ucfg(I.RX, I.RX_TICK, I.rx_tick(I.SRC_TXTICK, sdly=sdly))
@@ -301,23 +315,23 @@ def spi_master(B=2, cpol=0, cpha=0, msb=1, sdly=3, sck=2, mosi=3, miso=4, cs=5):
     a.set(mosi, I.SRC_0).setoe(mosi, 1)
     a.set(cs, I.SRC_1).setoe(cs, 1)
     # Wait for the host, then select the device.
-    a.L("idle").jmp("idle", I.NDB)
+    a.L("idle").jmp("idle", I.NDB)                              # wait for the doorbell
     a.dbclr()
     a.mov(1, 0).ld(2, 1, inc=1)                                 # r2 = n, r1 -> data
-    a.mov(3, 0x80)
-    a.set(cs, I.SRC_0).delay(0)
+    a.mov(3, 0x80)                                              # r3 -> the replies at 0x80
+    a.set(cs, I.SRC_0).delay(0)                                 # CS low, then the lead time
     _cs_time(a, B)
     # Each byte: both units start in the same cycle, and the byte received goes to DMEM.
     # SCK pauses for a few instructions between bytes, which SPI allows.
     a.L("byte")
-    a.ld(0, 1, inc=1)
+    a.ld(0, 1, inc=1)                                           # r0 = the next byte to send
     a.ustart(I.M_BOTH, I.R(0))                                  # one byte out and in
     a.uwait(I.M_BOTH)
-    a.fget(4, I.FIFO_RX)
+    a.fget(4, I.FIFO_RX)                                        # the byte received (RX pushed it to RXF)
     a.st(4, 3, inc=1)
-    a.djnz(2, "byte")
+    a.djnz(2, "byte")                                           # next byte, until n are done
     # All sent: deselect, and tell the host.
-    _cs_time(a, B)
+    _cs_time(a, B)                                              # the lag time before CS rises
     a.set(cs, I.SRC_1)
     a.host_irq()
     a.jmp("idle")
@@ -335,28 +349,28 @@ def spi_slave(cpol=0, cpha=0, msb=1, bits=0, sck=2, mosi=3, miso=4, cs=5):
     samp_edge = lead if cpha == 0 else 1 - lead
     # The clock comes from the master, so the units use external edges instead of their own timers.
     a = Asm()
-    a.ucfg(I.TX, I.TX_PINS, I.tx_pins(miso))
+    a.ucfg(I.TX, I.TX_PINS, I.tx_pins(miso))                    # TX drives MISO, no clock of its own
     a.ucfg(I.TX, I.TX_FRAME, I.tx_frame(msb, nbits=bits))
     # MISO changes on the edge that does not sample (CPHA 1: bit 0 on the first leading edge)
     a.ucfg(I.TX, I.TX_TICK, I.tx_tick(1, sck, 1 - samp_edge, lead=cpha))
-    a.ucfg(I.RX, I.RX_PINS, I.rx_pins(mosi))
-    a.ucfg(I.RX, I.RX_FRAME, I.rx_frame(msb, hold=0, nbits=bits))
-    a.ucfg(I.RX, I.RX_TICK, I.rx_tick(I.SRC_EXT, sck, samp_edge, 0))
+    a.ucfg(I.RX, I.RX_PINS, I.rx_pins(mosi))                    # RX samples MOSI ...
+    a.ucfg(I.RX, I.RX_FRAME, I.rx_frame(msb, hold=0, nbits=bits))   # ... and pushes each byte to RXF
+    a.ucfg(I.RX, I.RX_TICK, I.rx_tick(I.SRC_EXT, sck, samp_edge, 0))   # on the master's sampling edge
     # CS low starts each unit, and AUTOARM restarts it for the next byte while CS stays low.
     for d in (I.ETX_U, I.ERX_U):
         a.ucfg(d, I.D_COND, I.cond(cs, I.LEVEL, 0, start=1, autoarm=1))
         a.ucfg(d, I.D_DUR, 1)
     # Not selected: MISO is left to the others. OE can only change while TX is idle, so ETX
     # is armed once MISO is on, a few cycles after CS falls (spi_slave_lead_cycles).
-    a.L("idle").setoe(miso, 0).wait(cs, 1)
-    a.evt(I.DET_RX, I.EV_ARM)
-    a.wait(cs, 0).setoe(miso, 1).evt(I.DET_TX, I.EV_ARM)
+    a.L("idle").setoe(miso, 0).wait(cs, 1)                      # release MISO; wait for CS high (deselected)
+    a.evt(I.DET_RX, I.EV_ARM)                                   # ERX starts RX as soon as CS falls
+    a.wait(cs, 0).setoe(miso, 1).evt(I.DET_TX, I.EV_ARM)        # selected: drive MISO, then let ETX start TX
     # Selected: the hardware works by itself. Only CS going high needs the firmware.
     a.L("run").jpin(cs, 1, "end")
     a.jmp("run")
     # Deselected: stop both units in mid-byte if need be, and go back to waiting.
     a.L("end").ustop(I.M_BOTH)
-    a.evt(I.DET_TX, I.EV_DISARM).evt(I.DET_RX, I.EV_DISARM)
+    a.evt(I.DET_TX, I.EV_DISARM).evt(I.DET_RX, I.EV_DISARM)    # no restart while CS is high
     a.evt(I.DET_TX, I.EV_CLR).evt(I.DET_RX, I.EV_CLR)
     a.jmp("idle")
     return a
@@ -374,47 +388,48 @@ def spi_master_stream(B=4, cpol=0, cpha=0, msb=1, sdly=3, sck=2, mosi=3, miso=4,
     # r4 byte in. r5 replies left to take. r6 the status, stored in dmem[0x7F].
     # CHAIN makes each unit go straight on to the next byte, so the only job left is to keep the FIFOs moving.
     a = Asm()
-    a.ucfg(I.TX, I.TX_PINS, I.tx_pins(mosi, 1, sck, 1))
+    a.ucfg(I.TX, I.TX_PINS, I.tx_pins(mosi, 1, sck, 1))        # data on MOSI, clock on SCK
     a.ucfg(I.TX, I.TX_BIT, B)
-    a.ucfg(I.TX, I.TX_FRAME, I.tx_frame(msb, chain=1))
+    a.ucfg(I.TX, I.TX_FRAME, I.tx_frame(msb, chain=1))         # CHAIN: the next TXF byte follows with no gap
     a.ucfg(I.TX, I.TX_CLK, I.tx_clk(cpol, cpha))
     a.ucfg(I.RX, I.RX_PINS, I.rx_pins(miso))
-    a.ucfg(I.RX, I.RX_FRAME, I.rx_frame(msb, chain=1))
+    a.ucfg(I.RX, I.RX_FRAME, I.rx_frame(msb, chain=1))         # CHAIN: RX takes byte after byte into RXF
     a.ucfg(I.RX, I.RX_TICK, I.rx_tick(I.SRC_TXTICK, sdly=sdly))
+    # SCK idles at CPOL, CS high.
     a.set(sck, I.SRC_1 if cpol else I.SRC_0).setoe(sck, 1)
     a.set(mosi, I.SRC_0).setoe(mosi, 1)
     a.set(cs, I.SRC_1).setoe(cs, 1)
-    a.L("idle").jmp("idle", I.NDB)
+    a.L("idle").jmp("idle", I.NDB)                              # wait for the doorbell
     a.dbclr()
     # Request, then fill TXF as far as it goes before the first clock.
     a.mov(1, 0).ld(2, 1, inc=1).mov(5, I.R(2)).mov(3, 0x80).mov(6, 0)    # r2 tx left, r5 rx left
-    a.L("pre").ld(0, 1, inc=1).fput(0, I.FIFO_TX).sub(2, 1).jmp("go", I.Z)
-    a.jmp("go", I.TXF_FULL).jmp("pre")
-    a.L("go").set(cs, I.SRC_0).delay(0)
-    _cs_time(a, B).ustart(I.M_BOTH)
-    a.cmp(2, 0).jmp("drain", I.Z)
+    a.L("pre").ld(0, 1, inc=1).fput(0, I.FIFO_TX).sub(2, 1).jmp("go", I.Z)   # all bytes in TXF already
+    a.jmp("go", I.TXF_FULL).jmp("pre")                          # or TXF is full
+    a.L("go").set(cs, I.SRC_0).delay(0)                         # select, the lead time,
+    _cs_time(a, B).ustart(I.M_BOTH)                             # then both units: they take bytes from here on
+    a.cmp(2, 0).jmp("drain", I.Z)                               # nothing left to queue: only take replies
     # While bytes are left to send, the last reply cannot have come: no test of r5 or r2 here
     # Main loop: empty RXF, refill TXF. This pass is what limits the speed: 9 cycles for one of each.
-    a.L("run").fget(4, I.FIFO_RX, nb=1).jmp("no_rx", I.C)
-    a.st(4, 3, inc=1).sub(5, 1)
-    a.L("no_rx").jmp("late", I.TXU_IDLE).jmp("run", I.TXF_FULL)
-    a.ld(0, 1, inc=1).fput(0, I.FIFO_TX).djnz(2, "run").jmp("drain")
+    a.L("run").fget(4, I.FIFO_RX, nb=1).jmp("no_rx", I.C)       # a reply waiting? (C = 1: RXF empty)
+    a.st(4, 3, inc=1).sub(5, 1)                                 # store it, one fewer to take
+    a.L("no_rx").jmp("late", I.TXU_IDLE).jmp("run", I.TXF_FULL)   # TX stopped: it ran dry. TXF full: loop
+    a.ld(0, 1, inc=1).fput(0, I.FIFO_TX).djnz(2, "run").jmp("drain")   # queue the next byte
     # The FIFO ran dry, so the chain ended and SCK paused. Report it and start TX again.
     a.L("late").mov(6, 1)                                       # TX ended early: start it again
     a.ld(0, 1, inc=1).fput(0, I.FIFO_TX).ustart(I.M_TX).djnz(2, "run")
     # All sent: take the replies that are left
     a.L("drain").fget(4, I.FIFO_RX, nb=1).jmp("dry", I.C)
-    a.st(4, 3, inc=1).sub(5, 1).jmp("end", I.Z).jmp("drain")
-    a.L("dry").jmp("drain", I.TXU_BUSY)
+    a.st(4, 3, inc=1).sub(5, 1).jmp("end", I.Z).jmp("drain")    # end once every reply is in
+    a.L("dry").jmp("drain", I.TXU_BUSY)                         # RXF empty but TX still sending: keep waiting
     # TX is idle: a last reply is at most SDLY away, and after that none will come
     a.delay(20).fget(4, I.FIFO_RX, nb=1).jmp("lost", I.C)
     a.st(4, 3, inc=1).sub(5, 1).jmp("end", I.Z).jmp("dry")
-    a.L("lost").mov(6, 2)
+    a.L("lost").mov(6, 2)                                       # a reply never came: report it
     # Done: let the last bits go, stop RX (a chained RX never ends by itself), deselect and report.
     a.L("end").uwait(I.M_TX).ustop(I.M_RX)
     _cs_time(a, B)
     a.set(cs, I.SRC_1)
-    a.mov(1, 0x7F).st(6, 1)
+    a.mov(1, 0x7F).st(6, 1)                                     # the status to dmem[0x7F]
     a.host_irq()
     a.jmp("idle")
     return a
@@ -427,33 +442,33 @@ def spi_master_3wire(B=8, cpol=0, cpha=0, msb=1, sdly=3, sck=2, dio=3, cs=5):
     # Registers: r0 byte out. r1 pointer to the write data. r2 writes left. r3 pointer to the replies.
     # r4 byte in. r5 reads left.
     a = Asm()
-    a.ucfg(I.TX, I.TX_BIT, B)
+    a.ucfg(I.TX, I.TX_BIT, B)                                   # TX_PINS is set per phase, below
     a.ucfg(I.TX, I.TX_FRAME, msb)
     a.ucfg(I.TX, I.TX_CLK, I.tx_clk(cpol, cpha))
-    a.ucfg(I.RX, I.RX_PINS, I.rx_pins(dio))
-    a.ucfg(I.RX, I.RX_FRAME, I.rx_frame(msb))
+    a.ucfg(I.RX, I.RX_PINS, I.rx_pins(dio))                     # RX reads the shared data pin
+    a.ucfg(I.RX, I.RX_FRAME, I.rx_frame(msb))                   # and pushes each byte to RXF
     a.ucfg(I.RX, I.RX_TICK, I.rx_tick(I.SRC_TXTICK, sdly=sdly))
-    a.set(sck, I.SRC_1 if cpol else I.SRC_0).setoe(sck, 1)
+    a.set(sck, I.SRC_1 if cpol else I.SRC_0).setoe(sck, 1)      # SCK idles at CPOL
     a.set(cs, I.SRC_1).setoe(cs, 1)
-    a.L("idle").jmp("idle", I.NDB)
+    a.L("idle").jmp("idle", I.NDB)                              # wait for the doorbell
     a.dbclr()
     # Request. The TX unit gets the data pin only for the writes.
-    a.mov(1, 0).ld(2, 1, inc=1).ld(5, 1, inc=1).mov(3, 0x80)
-    a.ucfg(I.TX, I.TX_PINS, I.tx_pins(dio, 1, sck, 1))
+    a.mov(1, 0).ld(2, 1, inc=1).ld(5, 1, inc=1).mov(3, 0x80)    # r2 = writes, r5 = reads, r3 -> replies
+    a.ucfg(I.TX, I.TX_PINS, I.tx_pins(dio, 1, sck, 1))          # write phase: TX drives DIO and SCK
     a.setoe(dio, 1)
     a.set(cs, I.SRC_0).delay(0)
     _cs_time(a, B)
-    a.cmp(2, 0).jmp("rd", I.Z)
+    a.cmp(2, 0).jmp("rd", I.Z)                                  # no writes: straight to the reads
     # Write phase: the TX unit drives DIO.
     a.L("wr").ld(0, 1, inc=1).ustart(I.M_TX, I.R(0)).uwait(I.M_TX).djnz(2, "wr")
     a.L("rd").setoe(dio, 0)                                     # turnaround
     a.ucfg(I.TX, I.TX_PINS, I.tx_pins(0, 0, sck, 1))            # the clock only
     a.cmp(5, 0).jmp("fin", I.Z).delay(B)
     # Read phase: the TX unit only makes the clock. Its data goes nowhere, and the RX unit reads DIO.
-    a.L("rl").ustart(I.M_BOTH, 0).uwait(I.M_BOTH)
-    a.fget(4, I.FIFO_RX).st(4, 3, inc=1).djnz(5, "rl")
+    a.L("rl").ustart(I.M_BOTH, 0).uwait(I.M_BOTH)               # 8 clocks; RX takes the byte
+    a.fget(4, I.FIFO_RX).st(4, 3, inc=1).djnz(5, "rl")          # store it, next read
     a.L("fin")
-    _cs_time(a, B).set(cs, I.SRC_1)
+    _cs_time(a, B).set(cs, I.SRC_1)                             # lag time, deselect
     a.host_irq()
     a.jmp("idle")
     return a
@@ -469,33 +484,33 @@ def spi_slave_3wire(cpol=0, cpha=0, msb=1, sck=2, dio=3, cs=5):
     lead = cpol
     samp_edge = lead if cpha == 0 else 1 - lead
     a = Asm()
-    a.ucfg(I.RX, I.RX_PINS, I.rx_pins(dio))
-    a.ucfg(I.RX, I.RX_FRAME, I.rx_frame(msb, hold=1))
+    a.ucfg(I.RX, I.RX_PINS, I.rx_pins(dio))                     # RX reads DIO on the master's sampling edge
+    a.ucfg(I.RX, I.RX_FRAME, I.rx_frame(msb, hold=1))           # held for urd: firmware looks at each byte
     a.ucfg(I.RX, I.RX_TICK, I.rx_tick(I.SRC_EXT, sck, samp_edge, 0))
-    a.ucfg(I.TX, I.TX_PINS, I.tx_pins(dio))
+    a.ucfg(I.TX, I.TX_PINS, I.tx_pins(dio))                     # TX drives DIO only in a read
     a.ucfg(I.TX, I.TX_FRAME, msb)
-    a.ucfg(I.TX, I.TX_TICK, I.tx_tick(1, sck, 1 - samp_edge, lead=cpha))
+    a.ucfg(I.TX, I.TX_TICK, I.tx_tick(1, sck, 1 - samp_edge, lead=cpha))   # on the other edge
     # Not selected: DIO released. The first byte after CS falls is the command.
-    a.L("idle").setoe(dio, 0).wait(cs, 1).wait(cs, 0)
-    a.ustart(I.M_RX)
-    a.call("rx1").jmp("end", I.C)
-    a.fput(0, I.FIFO_RX)
-    a.and_(0, 0x80).jmp("read", I.NZ)
+    a.L("idle").setoe(dio, 0).wait(cs, 1).wait(cs, 0)           # wait for a fresh select
+    a.ustart(I.M_RX)                                            # receive the command
+    a.call("rx1").jmp("end", I.C)                               # CS rose before a full byte
+    a.fput(0, I.FIFO_RX)                                        # the command goes to the host too
+    a.and_(0, 0x80).jmp("read", I.NZ)                           # MSB = 1: a read
     # Write: every byte goes to RXF until CS rises.
     a.L("wl").ustart(I.M_RX).call("rx1").jmp("end", I.C)
-    a.fput(0, I.FIFO_RX).jmp("wl")
+    a.fput(0, I.FIFO_RX).jmp("wl")                              # each written byte to RXF
     # The master drives until it has seen its last bit out: take the pin only after that. About 32 cycles
     # from the command byte's RXRDY: the 9 instructions before this one, and the delay.
     a.L("read").wait(sck, cpol).delay(21).setoe(dio, 1)
     # Read: every byte comes from TXF. An empty FIFO sends 0xFF.
-    a.L("rl").mov(0, 0xFF).fget(0, I.FIFO_TX, nb=1)
+    a.L("rl").mov(0, 0xFF).fget(0, I.FIFO_TX, nb=1)             # r0 = the next TXF byte, or 0xFF if none
     a.ustart(I.M_TX, I.R(0))
-    a.L("rw").jpin(cs, 1, "end").jmp("rw", I.TXU_BUSY).jmp("rl")
-    a.L("end").ustop(I.M_BOTH).jmp("idle")
+    a.L("rw").jpin(cs, 1, "end").jmp("rw", I.TXU_BUSY).jmp("rl")   # until CS rises, one byte after another
+    a.L("end").ustop(I.M_BOTH).jmp("idle")                      # CS high: stop wherever the units are
     # one byte into r0, C = 1 if CS went high first
     a.L("rx1").jpin(cs, 1, "rxe").jmp("rx1", I.NRXRDY)
-    a.urd(0, I.RX, I.RX_DATA).cmp(0, 0).ret()
-    a.L("rxe").mov(0, 0).cmp(0, 1).ret()
+    a.urd(0, I.RX, I.RX_DATA).cmp(0, 0).ret()                   # cmp x, 0 gives C = 0
+    a.L("rxe").mov(0, 0).cmp(0, 1).ret()                        # 0 - 1 borrows: C = 1
     return a
 
 
@@ -510,27 +525,28 @@ def spi_slave_words(bits=12, cpol=0, cpha=0, msb=1, sck=2, mosi=3, miso=4, cs=5)
     lead = cpol
     samp_edge = lead if cpha == 0 else 1 - lead
     a = Asm()
-    a.ucfg(I.TX, I.TX_PINS, I.tx_pins(miso))
-    a.ucfg(I.TX, I.TX_FRAME, I.tx_frame(msb, nbits=bits))
+    a.ucfg(I.TX, I.TX_PINS, I.tx_pins(miso))                    # TX drives MISO on the master's clock
+    a.ucfg(I.TX, I.TX_FRAME, I.tx_frame(msb, nbits=bits))       # `bits` bits a word
     a.ucfg(I.TX, I.TX_TICK, I.tx_tick(1, sck, 1 - samp_edge, lead=cpha))
     a.ucfg(I.RX, I.RX_PINS, I.rx_pins(mosi))
-    a.ucfg(I.RX, I.RX_FRAME, I.rx_frame(msb, hold=1, nbits=bits))
+    a.ucfg(I.RX, I.RX_FRAME, I.rx_frame(msb, hold=1, nbits=bits))   # words over 8 bits: held for urd
     a.ucfg(I.RX, I.RX_TICK, I.rx_tick(I.SRC_EXT, sck, samp_edge, 0))
+    # Not selected: MISO released, the first word ready in r0. Selected: drive MISO.
     a.L("idle").setoe(miso, 0).call("next").wait(cs, 1).wait(cs, 0).setoe(miso, 1)
     # The next word starts at once, and the word just received is stored after that: RX
     # keeps DATA and RXRDY across a start, and the next edge is only half a period away.
     a.L("word").ustart(I.M_BOTH, I.R(0))
-    a.call("store").call("next")
-    a.L("w").jpin(cs, 1, "end").jmp("w", I.TXU_BUSY).jmp("word")
-    a.L("end").ustop(I.M_BOTH).call("store").jmp("idle")
+    a.call("store").call("next")                                # store the last word, fetch the next
+    a.L("w").jpin(cs, 1, "end").jmp("w", I.TXU_BUSY).jmp("word")   # until this word is done, or CS rises
+    a.L("end").ustop(I.M_BOTH).call("store").jmp("idle")        # a word that completed at CS high is kept
     # Subroutine: two RXF bytes from the word received, if there is one.
     a.L("store").jmp("sx", I.NRXRDY)
-    a.urd(4, I.RX, I.RX_DATA).fput(4, I.FIFO_RX).shr(4, 8).fput(4, I.FIFO_RX)
+    a.urd(4, I.RX, I.RX_DATA).fput(4, I.FIFO_RX).shr(4, 8).fput(4, I.FIFO_RX)   # low byte, then high
     a.L("sx").ret()
     # the next word to send, in r0
-    a.L("next").mov(0, 0xFFFF).mov(1, 0xFF)
-    a.fget(2, I.FIFO_TX, nb=1).jmp("nx", I.C)
-    a.fget(1, I.FIFO_TX, nb=1).shl(1, 8).or_(2, I.R(1)).mov(0, I.R(2))
+    a.L("next").mov(0, 0xFFFF).mov(1, 0xFF)                     # all ones if TXF is empty
+    a.fget(2, I.FIFO_TX, nb=1).jmp("nx", I.C)                   # low byte (none: keep 0xFFFF)
+    a.fget(1, I.FIFO_TX, nb=1).shl(1, 8).or_(2, I.R(1)).mov(0, I.R(2))   # high byte (none: 0xFF)
     a.L("nx").ret()
     return a
 
@@ -581,24 +597,24 @@ def i2c_master(B=126, scl=6, sda=7, odly=None, sdly=2, addr10=False, arb=False, 
     a = Asm()
     # Units, when they are used: TX makes SCL and waits for stretching, RX drives or samples SDA on its ticks.
     if not arb:                                                 # with arb, firmware clocks every bit
-        a.ucfg(I.TX, I.TX_PINS, I.tx_pins(0, den=0, cpin=scl, cen=1))
-        a.ucfg(I.TX, I.TX_BIT, B)
-        a.ucfg(I.TX, I.TX_FRAME, 1)
-        a.ucfg(I.TX, I.TX_CLK, I.tx_clk(0, 0, stretch=1))
-        a.ucfg(I.RX, I.RX_FRAME, I.rx_frame(msb=1, hold=1))
-        a.ucfg(I.RX, I.RX_TICK, I.rx_tick(I.SRC_TXTICK, sdly=sdly))
-        a.ucfg(I.RX, I.RX_ODLY, odly)
-    a.set(scl, I.SRC_1).set(sda, I.SRC_1)
+        a.ucfg(I.TX, I.TX_PINS, I.tx_pins(0, den=0, cpin=scl, cen=1))   # TX only makes SCL, no data pin
+        a.ucfg(I.TX, I.TX_BIT, B)                               # SCL period
+        a.ucfg(I.TX, I.TX_FRAME, 1)                             # 8 clocks, MSB first
+        a.ucfg(I.TX, I.TX_CLK, I.tx_clk(0, 0, stretch=1))       # wait while a slave holds SCL low
+        a.ucfg(I.RX, I.RX_FRAME, I.rx_frame(msb=1, hold=1))     # RX: the SDA byte, held for urd
+        a.ucfg(I.RX, I.RX_TICK, I.rx_tick(I.SRC_TXTICK, sdly=sdly))   # sampled on TX's SCL-high tick
+        a.ucfg(I.RX, I.RX_ODLY, odly)                           # a write changes SDA odly after SCL falls
+    a.set(scl, I.SRC_1).set(sda, I.SRC_1)                       # both lines released (open drain: high)
     if arb:
         # The bus is busy from a START to its STOP, whatever the lines show in between (3.1.8).
         # ERX reports both; r6 != 0 means busy, between requests.
         a.ucfg(I.ERX_U, I.D_COND, I.cond(sda, I.ANY, qpin=scl, qen=1, qlvl=1))
         a.ucfg(I.ERX_U, I.D_DUR, 1)
         a.evt(I.DET_RX, I.EV_ARM).mov(6, 0)
-        a.L("idle").jmp("bev", I.ERX).jmp("idle", I.NDB)
-        a.jpin(sda, 0, "low").cmp(6, 0).jmp("idle", I.NZ)
+        a.L("idle").jmp("bev", I.ERX).jmp("idle", I.NDB)        # a START or STOP seen, or wait for a request
+        a.jpin(sda, 0, "low").cmp(6, 0).jmp("idle", I.NZ)       # SDA low (stuck?), or the bus is busy
         a.jpin(scl, 0, "idle").delay(H)                          # bus free time
-        a.jmp("idle", I.ERX)
+        a.jmp("idle", I.ERX)                                    # someone started meanwhile: wait again
     else:
         # Single master: nothing to do but wait for the host.
         a.L("idle").jmp("idle", I.NDB)
@@ -607,121 +623,121 @@ def i2c_master(B=126, scl=6, sda=7, odly=None, sdly=2, addr10=False, arb=False, 
     a.mov(1, 0).ld(4, 1, inc=1).ld(2, 1, inc=1).ld(7, 1, inc=1)    # addr, n_w, n_r
     if addr10:
         a.mov(0, 0x7E).ld(0, 0).shl(0, 8).or_(4, I.R(0))           # r4 = the 10-bit address
-    a.mov(3, 0x80)
+    a.mov(3, 0x80)                                              # r3 -> the read data at 0x80
     if not arb:                                                 # with arb, r6 is 0 to get here
         # SDA low before we even started: a device is stuck in the middle of a byte.
         a.mov(6, 0).jpin(sda, 0, "clr").L("go")
     if hs_B:
-        a.ucfg(I.TX, I.TX_BIT, B)
+        a.ucfg(I.TX, I.TX_BIT, B)                                   # the master code at F/S speed
         a.call("start").mov(0, master_code).call("wbyte")           # no acknowledge expected
-        a.ucfg(I.TX, I.TX_BIT, hs_B)
+        a.ucfg(I.TX, I.TX_BIT, hs_B)                                # everything after it at HS speed
     # START, address + W, then the write bytes.
     a.call("start1" if arb else "start")
     if addr10:
         a.mov(0, I.R(4)).shr(0, 7).and_(0, 0x06).or_(0, 0xF0)       # 11110 A9 A8 W
-        a.call("wbyte").cmp(5, 0).jmp("err_a", I.NZ)
-        a.mov(0, I.R(4)).and_(0, 0xFF)
+        a.call("wbyte").cmp(5, 0).jmp("err_a", I.NZ)            # first address byte NACKed
+        a.mov(0, I.R(4)).and_(0, 0xFF)                          # second address byte: A7..A0
     else:
-        a.mov(0, I.R(4)).shl(0, 1)
+        a.mov(0, I.R(4)).shl(0, 1)                              # 7-bit address, W = 0
     a.call("wbyte")
-    a.cmp(5, 0).jmp("err_a", I.NZ)
-    a.cmp(2, 0).jmp("rd", I.Z)
-    a.L("wl").ld(0, 1, inc=1)
+    a.cmp(5, 0).jmp("err_a", I.NZ)                              # address NACKed (or lost)
+    a.cmp(2, 0).jmp("rd", I.Z)                                  # no data to write
+    a.L("wl").ld(0, 1, inc=1)                                   # the next write byte
     a.call("wbyte")
-    a.cmp(5, 0).jmp("err_d", I.NZ)
+    a.cmp(5, 0).jmp("err_d", I.NZ)                              # data NACKed (or lost)
     a.djnz(2, "wl")
     # Repeated START, address + R, then the reads. The last read byte gets a NACK, so the target lets go.
-    a.L("rd").cmp(7, 0).jmp("fin", I.Z)
+    a.L("rd").cmp(7, 0).jmp("fin", I.Z)                         # no reads: finish with STOP
     a.call("start")                                             # (repeated) START
     if addr10:
         a.mov(0, I.R(4)).shr(0, 7).and_(0, 0x06).or_(0, 0xF1)       # 11110 A9 A8 R
     else:
-        a.mov(0, I.R(4)).shl(0, 1).or_(0, 1)
+        a.mov(0, I.R(4)).shl(0, 1).or_(0, 1)                    # 7-bit address, R = 1
     a.call("wbyte")
     a.cmp(5, 0).jmp("err_a", I.NZ)
     a.L("rl").mov(5, 0).cmp(7, 1).jmp("rk", I.NZ).mov(5, 1)    # NACK the last byte
-    a.L("rk").call("rbyte")
+    a.L("rk").call("rbyte")                                     # r0 = the byte; ACK or NACK per r5
     a.st(0, 3, inc=1)
     a.djnz(7, "rl")
     # End of a request, good or bad: STOP (unless arbitration was lost), store the status, tell the host.
     a.L("fin").call("stop")
-    a.mov(6, 0)
+    a.mov(6, 0)                                                 # status 0: ok
     a.jmp("rep")
-    a.L("err_a").mov(6, 1).jmp("err")
-    a.L("err_d").mov(6, 2)
+    a.L("err_a").mov(6, 1).jmp("err")                           # status 1: address NACK
+    a.L("err_d").mov(6, 2)                                      # status 2: data NACK
     a.L("err")
     if arb:
-        a.cmp(5, 2).jmp("lost", I.Z)
+        a.cmp(5, 2).jmp("lost", I.Z)                            # lost: no STOP, the other master owns the bus
     a.call("stop").jmp("rep")
     if arb:
         a.L("lost").mov(6, 3)                                   # both lines are released already
     a.L("rep")
     if hs_B:
-        a.ucfg(I.TX, I.TX_BIT, B)
-    a.mov(1, 0x7F).st(6, 1)
+        a.ucfg(I.TX, I.TX_BIT, B)                               # back to F/S speed for the next master code
+    a.mov(1, 0x7F).st(6, 1)                                     # the status to dmem[0x7F]
     a.host_irq()
     if arb:
         # After a lost arbitration the bus stays busy. Otherwise our own STOP is behind us, or SDA
         # is still low: bev finds out which.
         a.cmp(6, 3).jmp("lr", I.Z)
-        a.L("bev").evt(I.DET_RX, I.EV_CLR).evt(I.DET_RX, I.EV_ARM)
-        a.mov(6, 1).jpin(sda, 0, "idle").mov(6, 0).jmp("idle")
-        a.L("lr").evt(I.DET_RX, I.EV_CLR).evt(I.DET_RX, I.EV_ARM)
+        a.L("bev").evt(I.DET_RX, I.EV_CLR).evt(I.DET_RX, I.EV_ARM)   # a START or STOP: watch for the next
+        a.mov(6, 1).jpin(sda, 0, "idle").mov(6, 0).jmp("idle")  # SDA low after it: START (busy). High: STOP (free)
+        a.L("lr").evt(I.DET_RX, I.EV_CLR).evt(I.DET_RX, I.EV_ARM)   # lost: busy (r6 = 3) until its STOP
     a.jmp("idle")
     if arb:
         # SDA low with a request waiting. It is stuck only if nothing moves for this long.
         a.L("low").mov(5, stuck)
-        a.L("ll").jpin(sda, 1, "idle").jpin(scl, 0, "idle").delay(2).djnz(5, "ll")
+        a.L("ll").jpin(sda, 1, "idle").jpin(scl, 0, "idle").delay(2).djnz(5, "ll")   # 6 cycles a pass
     # Bus clear (3.1.16). The STOP resets a device that was in the middle of a byte.
-    a.L("clr").mov(5, 9)
-    a.L("cl").set(scl, I.SRC_0).delay(H).set(scl, I.SRC_1).wait(scl, 1).delay(H)
-    a.jpin(sda, 1, "cr").djnz(5, "cl")
-    a.L("stk").dbclr().mov(6, 4).jmp("rep")
-    a.L("cr").set(scl, I.SRC_0).delay(Q).call("stop")
+    a.L("clr").mov(5, 9)                                        # up to nine clock pulses
+    a.L("cl").set(scl, I.SRC_0).delay(H).set(scl, I.SRC_1).wait(scl, 1).delay(H)   # one SCL pulse
+    a.jpin(sda, 1, "cr").djnz(5, "cl")                          # SDA released: the device let go
+    a.L("stk").dbclr().mov(6, 4).jmp("rep")                     # still low after nine: status 4
+    a.L("cr").set(scl, I.SRC_0).delay(Q).call("stop")           # free: a STOP resets the device's state
     if arb:
         a.jmp("bev")                                            # back to idle: the request still waits
     else:
         a.jpin(sda, 1, "go").djnz(5, "cl").jmp("stk")           # the device drove the next bit low
     # START (also repeated START): SDA falls while SCL is high
-    a.L("start").set(sda, I.SRC_1).delay(H).set(scl, I.SRC_1).wait(scl, 1)
-    a.delay(H)
+    a.L("start").set(sda, I.SRC_1).delay(H).set(scl, I.SRC_1).wait(scl, 1)   # SDA, then SCL high (repeated START)
+    a.delay(H)                                                  # START setup time
     # With arb, a first START comes here, right after the bus was seen free: in the time of the
     # phases above, another controller could have started and be in the middle of a bit.
     a.L("start1").set(sda, I.SRC_0)
     if arb:
         a.jmp("hi2")                                            # another controller may go first
     else:
-        a.delay(H).set(scl, I.SRC_0).delay(Q).ret()
+        a.delay(H).set(scl, I.SRC_0).delay(Q).ret()             # START hold time, then SCL low
     # STOP: SDA rises while SCL is high
-    a.L("stop").set(sda, I.SRC_0).delay(H).set(scl, I.SRC_1).wait(scl, 1)
-    a.delay(H).set(sda, I.SRC_1).delay(H).ret()
+    a.L("stop").set(sda, I.SRC_0).delay(H).set(scl, I.SRC_1).wait(scl, 1)   # SDA low, then SCL high
+    a.delay(H).set(sda, I.SRC_1).delay(H).ret()                 # STOP setup, SDA high, bus free time
     # write r0; r5 = 0 ACK / 1 NACK / 2 arbitration lost
     if arb:
         # Subroutine wbyte, multi-master: send r0 bit by bit, reading SDA back after each. The top of r0 shifts into
         # C, which set can drive. r5 counts the 8 bits here, and holds the result on the way out.
-        a.L("wbyte").shl(0, 8).mov(5, 8)
+        a.L("wbyte").shl(0, 8).mov(5, 8)                        # the byte to the top of r0; 8 bits
         a.L("wb").shl(0, 1).set(sda, I.SRC_C).delay(H - Q)     # C = the bit to send; low = H with the Q below
-        a.call("hi1")
+        a.call("hi1")                                           # SCL high; SDA read back here
         a.jmp("wbk", I.NC).jpin(sda, 0, "wlost")               # sent 1, read 0: lost
         a.L("wbk").call("hi2").djnz(5, "wb")
     else:
         # Subroutine wbyte, single master: RX drives SDA and TX clocks SCL for all 8 bits. Then the ACK clock by hand.
-        a.L("wbyte").ucfg(I.RX, I.RX_PINS, I.rx_pins(sda, sda, 1))
-        a.ustart(I.M_BOTH, I.R(0))
+        a.L("wbyte").ucfg(I.RX, I.RX_PINS, I.rx_pins(sda, sda, 1))   # RX drives SDA and reads it back
+        a.ustart(I.M_BOTH, I.R(0))                              # 8 clocks, r0 out on SDA
         a.uwait(I.M_BOTH)
         a.urd(5, I.RX, I.RX_DATA).delay(odly)                   # readback (clears RXRDY); data hold
     a.set(sda, I.SRC_1).delay(H)                                # release SDA for the ACK
     if arb:
         a.call("hi1")
     else:
-        a.set(scl, I.SRC_1).wait(scl, 1).delay(H)
+        a.set(scl, I.SRC_1).wait(scl, 1).delay(H)               # the 9th clock high (the slave may stretch)
     # Read the ACK while SCL is high: low = ACK (r5 = 0), high = NACK (r5 = 1).
     a.mov(5, 0).jpin(sda, 0, "wa").mov(5, 1)
     a.L("wa")
     if arb:
-        a.jmp("hi2")
+        a.jmp("hi2")                                            # hi2 returns for us
     else:
-        a.set(scl, I.SRC_0).delay(Q).ret()
+        a.set(scl, I.SRC_0).delay(Q).ret()                      # 9th clock low, a short hold
     if arb:
         a.L("wlost").set(sda, I.SRC_1).set(scl, I.SRC_1).mov(5, 2).ret()
         # One SCL high phase in clock synchronization (3.1.7). hi1: it starts once SCL is really
@@ -734,22 +750,22 @@ def i2c_master(B=126, scl=6, sda=7, odly=None, sdly=2, addr10=False, arb=False, 
     if arb:
         # Subroutine rbyte, multi-master: 8 SCL clocks by firmware, SDA read at the start of each high phase.
         a.L("rbyte").set(sda, I.SRC_1).mov(0, 0).mov(1, 8)      # r1 is free here: writes are over
-        a.L("rbit").delay(H - Q).call("hi1").shl(0, 1).jpin(sda, 0, "rb0").or_(0, 1)
-        a.L("rb0").call("hi2").djnz(1, "rbit")
+        a.L("rbit").delay(H - Q).call("hi1").shl(0, 1).jpin(sda, 0, "rb0").or_(0, 1)   # SCL high: bit in
+        a.L("rb0").call("hi2").djnz(1, "rbit")                  # SCL low, next bit
     else:
         # Subroutine rbyte, single master: TX clocks SCL for 8 bits and RX samples SDA.
-        a.L("rbyte").ucfg(I.RX, I.RX_PINS, I.rx_pins(sda))
-        a.set(sda, I.SRC_1)
-        a.ustart(I.M_BOTH)
+        a.L("rbyte").ucfg(I.RX, I.RX_PINS, I.rx_pins(sda))      # RX samples SDA, drives nothing
+        a.set(sda, I.SRC_1)                                     # SDA released for the slave
+        a.ustart(I.M_BOTH)                                      # 8 clocks
         a.uwait(I.M_BOTH)
         a.urd(0, I.RX, I.RX_DATA).delay(odly)                   # data hold
     a.cmp(5, 1).set(sda, I.SRC_NC)                             # r5 = 0 borrows: C = 1, SDA low = ACK
-    a.delay(H)
+    a.delay(H)                                                  # data setup before the 9th clock
     if arb:
         a.call("hi1").call("hi2")
     else:
-        a.set(scl, I.SRC_1).wait(scl, 1).delay(H).set(scl, I.SRC_0).delay(Q)
-    a.set(sda, I.SRC_1).ret()
+        a.set(scl, I.SRC_1).wait(scl, 1).delay(H).set(scl, I.SRC_0).delay(Q)   # the 9th clock
+    a.set(sda, I.SRC_1).ret()                                   # release SDA
     return a
 
 
@@ -777,80 +793,80 @@ def i2c_slave(addr=0x42, scl=6, sda=7, addr10=None, general_call=False, hold=0):
     # RX samples SDA on SCL rising, TX shifts SDA out on SCL falling, and ERX catches any SDA edge while SCL
     # is high: that can only be a START or a STOP, so the firmware hears of them even in the middle of a byte.
     a.ucfg(I.RX, I.RX_PINS, I.rx_pins(sda))
-    a.ucfg(I.RX, I.RX_FRAME, I.rx_frame(msb=1, hold=1))
-    a.ucfg(I.RX, I.RX_TICK, I.rx_tick(I.SRC_EXT, scl, 0, 0))
-    a.ucfg(I.TX, I.TX_PINS, I.tx_pins(sda))
-    a.ucfg(I.TX, I.TX_FRAME, 1)
+    a.ucfg(I.RX, I.RX_FRAME, I.rx_frame(msb=1, hold=1))         # 8 bits MSB first, held for urd
+    a.ucfg(I.RX, I.RX_TICK, I.rx_tick(I.SRC_EXT, scl, 0, 0))    # sample SDA on SCL rising
+    a.ucfg(I.TX, I.TX_PINS, I.tx_pins(sda))                     # TX drives SDA in a read
+    a.ucfg(I.TX, I.TX_FRAME, 1)                                 # 8 bits MSB first
     a.ucfg(I.TX, I.TX_TICK, I.tx_tick(1, scl, 1))                  # shift on SCL falling
-    a.ucfg(I.ERX_U, I.D_COND, I.cond(sda, I.ANY, qpin=scl, qen=1, qlvl=1))
+    a.ucfg(I.ERX_U, I.D_COND, I.cond(sda, I.ANY, qpin=scl, qen=1, qlvl=1))   # any SDA edge while SCL is high
     a.ucfg(I.ERX_U, I.D_DUR, 1)
-    a.set(sda, I.SRC_1).set(scl, I.SRC_1)
+    a.set(sda, I.SRC_1).set(scl, I.SRC_1)                       # both released
     if addr10 is not None:
         a.mov(6, 0)                                             # r6 = 1: 10-bit address matched
     # Wait for a START. The SDA level after the edge tells them apart: high means it was a STOP.
-    a.L("idle").set(scl, I.SRC_1).evt(I.DET_RX, I.EV_ARM)
+    a.L("idle").set(scl, I.SRC_1).evt(I.DET_RX, I.EV_ARM)       # SCL released, watch for START / STOP
     a.evt(I.DET_RX, I.EV_WAITC)                                 # START or STOP
-    a.jpin(sda, 1, "stop")
+    a.jpin(sda, 1, "stop")                                      # SDA high now: it was a STOP
     # Address byte. If it is not ours, ignore everything up to the next START.
-    a.L("addr").evt(I.DET_RX, I.EV_ARM)
-    a.call("rx8").jmp("ev", I.C)
+    a.L("addr").evt(I.DET_RX, I.EV_ARM)                         # catch a START / STOP inside the byte
+    a.call("rx8").jmp("ev", I.C)                                # r0 = address byte, or C = 1 on an event
     if general_call:
-        a.cmp(0, 0).jmp("gc", I.Z)
+        a.cmp(0, 0).jmp("gc", I.Z)                              # address 0 + W: the general call
     if addr10 is None:
         a.mov(1, I.R(0)).shr(1, 1).cmp(1, addr).jmp("idle", I.NZ)  # not us: wait for START
         a.call("ack").jmp("ev", I.C)
-        a.and_(0, 1).jmp("rd", I.NZ)
+        a.and_(0, 1).jmp("rd", I.NZ)                            # R/W bit = 1: a read
     else:
-        first = 0xF0 | ((addr10 >> 7) & 0x06)
-        a.mov(1, I.R(0)).and_(1, 0xFE).cmp(1, first).jmp("idle", I.NZ)
-        a.and_(0, 1).jmp("r10", I.NZ)
+        first = 0xF0 | ((addr10 >> 7) & 0x06)                   # 11110 A9 A8, the first byte of a 10-bit address
+        a.mov(1, I.R(0)).and_(1, 0xFE).cmp(1, first).jmp("idle", I.NZ)   # not our A9 A8
+        a.and_(0, 1).jmp("r10", I.NZ)                           # a read: allowed only after our write
         a.call("ack").jmp("ev", I.C)
-        a.call("rx8").jmp("ev", I.C)
+        a.call("rx8").jmp("ev", I.C)                            # the second byte: A7..A0
         a.cmp(0, addr10 & 0xFF).jmp("nom", I.NZ)
-        a.call("ack").jmp("ev", I.C).mov(6, 1).jmp("wstart")
+        a.call("ack").jmp("ev", I.C).mov(6, 1).jmp("wstart")    # matched: remember it for a later read
         a.L("nom").mov(6, 0).jmp("idle")
         a.L("r10").cmp(6, 1).jmp("idle", I.NZ)                  # a read must follow our write
         a.call("ack").jmp("ev", I.C).jmp("rd")
         a.L("wstart")
     # Write: the first byte sets the pointer, the others are stored at pointer++.
     a.mov(2, 1)                                                 # r2 = 1: next byte is the pointer
-    a.L("wr").call("rx8").jmp("ev", I.C)
+    a.L("wr").call("rx8").jmp("ev", I.C)                        # until a STOP or repeated START
     a.call("ack").jmp("ev", I.C)
     a.cmp(2, 1).jmp("wd", I.NZ)
-    a.mov(3, I.R(0)).mov(2, 0).jmp("wr")
-    a.L("wd").st(0, 3, inc=1).jmp("wr")
+    a.mov(3, I.R(0)).mov(2, 0).jmp("wr")                        # first byte: the register pointer
+    a.L("wd").st(0, 3, inc=1).jmp("wr")                         # the rest: stored at pointer++
     if general_call:
-        a.L("gc").call("ack").jmp("ev", I.C).mov(3, I2C_GC_MEM).mov(2, 0).host_irq().jmp("wr")
+        a.L("gc").call("ack").jmp("ev", I.C).mov(3, I2C_GC_MEM).mov(2, 0).host_irq().jmp("wr")   # data to 0xF0..
     # Read: hold SCL low while the byte is set up, then release it and let the master clock it out.
-    a.L("rd").ld(0, 3, inc=1)
+    a.L("rd").ld(0, 3, inc=1)                                   # r0 = dmem[pointer++]
     a.ustart(I.M_TX, I.R(0))                                    # bit 7 now, then on SCL falls
     a.delay(62)                                                 # tr(max) + tSU;DAT = 1250 ns (Table 11 note 4)
     a.set(scl, I.SRC_1)                                         # the data is ready: release
-    a.uwait(I.M_TX)
+    a.uwait(I.M_TX)                                             # the master has clocked out 8 bits
     a.set(sda, I.SRC_1)                                         # release for the master ACK
-    a.wait(scl, 1).jpin(sda, 1, "nak")
+    a.wait(scl, 1).jpin(sda, 1, "nak")                          # 9th clock high: SDA high = NACK, the read ends
     a.wait(scl, 0).set(scl, I.SRC_0).jmp("rd")                  # hold SCL while fetching
-    a.L("nak").evt(I.DET_RX, I.EV_CLR).jmp("idle")
+    a.L("nak").evt(I.DET_RX, I.EV_CLR).jmp("idle")              # wait for the STOP
     # A START or STOP came in the middle of a byte: drop the byte and act on the event.
     a.L("ev").evt(I.DET_RX, I.EV_CLR).ustop(I.M_RX)            # START/STOP inside a byte
-    a.jpin(sda, 1, "stop").jmp("addr")
+    a.jpin(sda, 1, "stop").jmp("addr")                          # SDA high: STOP. Low: repeated START, an address follows
     a.L("stop")
     if addr10 is not None:
-        a.mov(6, 0)
+        a.mov(6, 0)                                             # a STOP ends the 10-bit match
     a.jmp("idle")
     # receive one byte into r0; C = 1 if a START/STOP came instead
-    a.L("rx8").ustart(I.M_RX).set(scl, I.SRC_1)
-    a.L("rx_w").jmp("rx_ev", I.ERX).jmp("rx_w", I.NRXRDY)
+    a.L("rx8").ustart(I.M_RX).set(scl, I.SRC_1)                 # RX ready first, then release SCL
+    a.L("rx_w").jmp("rx_ev", I.ERX).jmp("rx_w", I.NRXRDY)       # an event, or wait for the byte
     a.urd(0, I.RX, I.RX_DATA).cmp(0, 0).ret()                   # cmp x,0 -> C = 0
     a.L("rx_ev").urd(0, I.RX, I.RX_DATA).mov(0, 0).cmp(0, 1).ret()   # 0 - 1 borrows -> C = 1
     # ACK: SDA low for the 9th clock, then hold SCL low until the next byte is set up
     # C = 1: a START or STOP came right after bit 8, so there is no ACK (r1 is free here)
-    a.L("ack").jmp("ack_ev", I.ERX).jpin(scl, 1, "ack").set(sda, I.SRC_0)
-    a.wait(scl, 1).wait(scl, 0).set(scl, I.SRC_0).set(sda, I.SRC_1)
+    a.L("ack").jmp("ack_ev", I.ERX).jpin(scl, 1, "ack").set(sda, I.SRC_0)   # wait for SCL low, then SDA low
+    a.wait(scl, 1).wait(scl, 0).set(scl, I.SRC_0).set(sda, I.SRC_1)   # 9th clock; then hold SCL low, release SDA
     if hold:
-        a.delay(hold)
-    a.cmp(0, 0).ret()
-    a.L("ack_ev").mov(1, 0).cmp(1, 1).ret()
+        a.delay(hold)                                           # extra stretching, for slow processing
+    a.cmp(0, 0).ret()                                           # C = 0: acknowledged
+    a.L("ack_ev").mov(1, 0).cmp(1, 1).ret()                     # C = 1: an event instead
     return a
 
 
@@ -913,7 +929,7 @@ def _crc_tx(a, skip=16):
 
 def _rx_go(a, jp):
     """Hunt for the next packet: the bus has left SE0, ERX armed, RX started."""
-    a.wait(jp, 1).evt(I.DET_RX, I.EV_ARM).ustart(I.M_RX)
+    a.wait(jp, 1).evt(I.DET_RX, I.EV_ARM).ustart(I.M_RX)   # J (not SE0), ERX watches for the EOP, RX hunts
 
 
 def _tx_on(a, jp, kp, turn=0):
@@ -935,7 +951,7 @@ CRC5_DRIB, CRC16_DRIB = _next_crc(CRC5_RES, CRC5_POLY), _next_crc(CRC16_RES, CRC
 
 def _crc_good(a, res, drib, ok, bad):
     """Compare r4 with the residual: to `ok` if good (the usual case is the short one), else `bad`."""
-    a.cmp(4, res).jmp(ok, I.Z).cmp(4, drib).jmp(bad, I.NZ)
+    a.cmp(4, res).jmp(ok, I.Z).cmp(4, drib).jmp(bad, I.NZ)   # the residual, or the residual after a dribble bit
 
 
 def usb_device(B=4, jp=0, kp=1, turn=None):
@@ -960,23 +976,23 @@ def usb_device(B=4, jp=0, kp=1, turn=None):
     a = Asm()
     # Setup, and ETX as the suspend timer: it fires after USB_IDLE cycles of J. It only sets a flag, for the host.
     _usb_setup(a, B, jp, kp)
-    a.ucfg(I.ETX_U, I.D_COND, I.cond(jp, I.LEVEL, 1))
-    a.ucfg(I.ETX_U, I.D_DUR, USB_IDLE)
+    a.ucfg(I.ETX_U, I.D_COND, I.cond(jp, I.LEVEL, 1))           # ETX: the bus in J (idle) ...
+    a.ucfg(I.ETX_U, I.D_DUR, USB_IDLE)                          # ... for USB_IDLE cycles
     # Everything ends here, with whatever it had going stopped. The hunt comes first: the next
     # packet may start 2 bit times after the last one, and no bit reaches the FIFO or the CRC unit
     # until the hunt ends, so the rest has time.
-    a.L("idle").ustop(I.M_RX).evt(I.DET_RX, I.EV_DISARM).evt(I.DET_RX, I.EV_CLR)
+    a.L("idle").ustop(I.M_RX).evt(I.DET_RX, I.EV_DISARM).evt(I.DET_RX, I.EV_CLR)   # stop RX, clear the EOP flag
     _rx_go(a, jp)
     a.L("dr").fget(0, I.FIFO_RX, nb=1).jmp("dr", I.NC)           # drain
-    _crc_rx(a, CRC5_POLY, CRC5_INIT)
+    _crc_rx(a, CRC5_POLY, CRC5_INIT)                             # a token comes next: check its CRC5
     a.evt(I.DET_TX, I.EV_CLR).evt(I.DET_TX, I.EV_ARM)            # the idle timer starts again
-    a.mov(3, UD_ADDR).ld(7, 3)
-    a.mov(3, UD_INLEN).ld(5, 3)
-    a.mov(6, 0)
+    a.mov(3, UD_ADDR).ld(7, 3)                                   # r7 = our address (the host side may change it)
+    a.mov(3, UD_INLEN).ld(5, 3)                                  # r5 = the IN packet waiting, if any
+    a.mov(6, 0)                                                  # r6 = 0: no PID yet
     # Receive a token, wait for its EOP, and check it: PID in r6, then the second byte, then CRC5.
     a.evt(I.DET_RX, I.EV_WAITC)                                  # SE0: RX is stopped
-    a.fget(6, I.FIFO_RX, nb=1).fget(1, I.FIFO_RX, nb=1)
-    a.urd(4, I.CRC, I.CRC_VAL)
+    a.fget(6, I.FIFO_RX, nb=1).fget(1, I.FIFO_RX, nb=1)          # r6 = PID, r1 = second byte
+    a.urd(4, I.CRC, I.CRC_VAL)                                   # r4 = the CRC register after the packet
     _crc_good(a, CRC5_RES, CRC5_DRIB, "t_ok", "t_bad")
     # Good token: address in the low 7 bits of the second byte. IN goes straight to the answer: it has the least time.
     a.L("t_ok").mov(4, I.R(1)).and_(4, 0x7F).cmp(4, I.R(7)).jmp("idle", I.NZ)
@@ -984,35 +1000,35 @@ def usb_device(B=4, jp=0, kp=1, turn=None):
     # OUT / SETUP: the data packet follows soon. No bit reaches the CRC unit until the hunt ends.
     # OUT or SETUP: start hunting at once for the data packet, then read the token's last byte.
     _rx_go(a, jp)
-    a.ucfg(I.CRC, I.CRC_POLY, CRC16_POLY).ucfg(I.CRC, I.CRC_INIT, CRC16_INIT)
-    a.fget(2, I.FIFO_RX, nb=1)
+    a.ucfg(I.CRC, I.CRC_POLY, CRC16_POLY).ucfg(I.CRC, I.CRC_INIT, CRC16_INIT)   # the data packet has CRC16
+    a.fget(2, I.FIFO_RX, nb=1)                                   # r2 = third token byte
     a.cmp(6, PID_OUT).jmp("o_ok", I.Z)
-    a.cmp(6, PID_SETUP).jmp("idle", I.NZ)
+    a.cmp(6, PID_SETUP).jmp("idle", I.NZ)                        # any other token: ignore
     # Report PID and endpoint. EP = 3 bits of the third byte, then the top bit of the second.
     a.L("o_ok").mov(3, UD_TOKEN).st(6, 3, inc=1)                 # UD_EP comes next
-    a.and_(2, 7).shl(2, 1).shr(1, 7).or_(2, I.R(1)).st(2, 3)
+    a.and_(2, 7).shl(2, 1).shr(1, 7).or_(2, I.R(1)).st(2, 3)     # EP = byte3[2:0] : byte2[7]
     a.mov(3, UD_OUTHS).ld(1, 3)                                  # handshake ready in r1
-    a.cmp(6, PID_SETUP).jmp("o_hs", I.NZ).mov(1, PID_ACK)
-    a.L("o_hs").mov(3, UD_RXDATA)
+    a.cmp(6, PID_SETUP).jmp("o_hs", I.NZ).mov(1, PID_ACK)        # SETUP is always ACKed
+    a.L("o_hs").mov(3, UD_RXDATA)                                # r3 -> where the data goes
     # The first byte must be a good DATA PID. The slow checks are done here, as bytes arrive:
     # after the EOP only the CRC and the stuff flag stand between us and the handshake.
-    a.L("op").jmp("idle", I.ERX).fget(0, I.FIFO_RX, nb=1).jmp("op", I.C)
-    a.st(0, 3, inc=1).cmp(0, PID_DATA0).jmp("rl", I.Z).cmp(0, PID_DATA1).jmp("idle", I.NZ).jmp("rl")
+    a.L("op").jmp("idle", I.ERX).fget(0, I.FIFO_RX, nb=1).jmp("op", I.C)   # an EOP before any byte: drop
+    a.st(0, 3, inc=1).cmp(0, PID_DATA0).jmp("rl", I.Z).cmp(0, PID_DATA1).jmp("idle", I.NZ).jmp("rl")   # DATA0/1 only
     # The EOP is looked for every 2 instructions: the time from here to the handshake is the tightest
     # in the firmware.
     a.L("rl").jmp("rle0", I.ERX).jmp("rl", I.RXF_EMPTY).fget(0, I.FIFO_RX).st(0, 3, inc=1).jmp("rl")
     # EOP seen. Answer only if CRC16 and stuffing are good; otherwise stay silent, so the host retries.
-    a.L("rle0").urd(4, I.CRC, I.CRC_VAL)
+    a.L("rle0").urd(4, I.CRC, I.CRC_VAL)                        # r4 = the CRC register
     _crc_good(a, CRC16_RES, CRC16_DRIB, "rc2", "idle")
-    a.L("rc2").urd(4, I.RX, I.RX_STAT).and_(4, I.RX_ST_SERR).jmp("idle", I.NZ)
-    _tx_on(a, jp, kp, turn)
-    a.call("hsend")
+    a.L("rc2").urd(4, I.RX, I.RX_STAT).and_(4, I.RX_ST_SERR).jmp("idle", I.NZ)   # a stuff error: silent
+    _tx_on(a, jp, kp, turn)                                      # sync out, after the turnaround
+    a.call("hsend")                                              # the handshake from UD_OUTHS (ACK for SETUP)
     # At full speed the last byte can reach the FIFO just before the EOP, and the loop above leaves
     # as soon as it sees the EOP. The CRC unit has it already, so answer first and store it now.
     # At low speed the EOP takes far longer to detect than the loop takes to go round.
     if B <= 8:
         a.fget(0, I.FIFO_RX, nb=1).jmp("rle", I.C).st(0, 3, inc=1).L("rle")
-    a.mov(0, I.R(3)).sub(0, UD_RXDATA).mov(3, UD_RXLEN).st(0, 3)
+    a.mov(0, I.R(3)).sub(0, UD_RXDATA).mov(3, UD_RXLEN).st(0, 3)   # length = how far r3 moved
     a.mov(0, EV_OUT).jmp("ev")
     # Subroutine: send the handshake in r1. The CRC unit must not add anything to it.
     a.L("hsend").fput(1, I.FIFO_TX).ucfg(I.CRC, I.CRC_CTRL, 0).uwait(I.M_TX).ret()
@@ -1025,27 +1041,27 @@ def usb_device(B=4, jp=0, kp=1, turn=None):
     # INIT takes effect 5 cycles after the sync started (4-6 all work): the bits already gone do not count.
     _crc_tx(a, skip=16 - (5 // B + 1))
     # Data: PID, then the bytes. The chain must not run dry: the loop is far faster than the bytes go out.
-    a.mov(3, UD_INPID).ld(0, 3).fput(0, I.FIFO_TX)
-    a.mov(3, UD_INDATA).sub(5, 1).jmp("txe", I.Z)
+    a.mov(3, UD_INPID).ld(0, 3).fput(0, I.FIFO_TX)               # the DATA PID from the host side
+    a.mov(3, UD_INDATA).sub(5, 1).jmp("txe", I.Z)                # r5 = data bytes (UD_INLEN counts the PID)
     a.L("txl").ld(0, 3, inc=1).fput(0, I.FIFO_TX).djnz(5, "txl")
-    a.L("txe").uwait(I.M_TX)
+    a.L("txe").uwait(I.M_TX)                                     # TXF empty: the CRC unit appends CRC16, EOP
     # the host's handshake: its packet must start before 18 bit times
-    a.ucfg(I.CRC, I.CRC_CTRL, 0)
+    a.ucfg(I.CRC, I.CRC_CTRL, 0)                                 # CRC off: a handshake has none
     a.fget(1, I.FIFO_RX, nb=1)                                   # the last byte of the token
     _rx_go(a, jp)
-    a.mov(5, wait_h)
+    a.mov(5, wait_h)                                             # 2 cycles a pass of the loop below
     # Wait for K, the start of the handshake. No answer in time means the host did not get the data: it stays in DMEM.
     a.L("ha").jpin(kp, 1, "hb").djnz(5, "ha")
     a.L("nk").mov(0, EV_IN_NOACK).jmp("ev")
     # A handshake came. ACK clears UD_INLEN, and the host side can fill the next packet.
-    a.L("hb").evt(I.DET_RX, I.EV_WAITC).fget(1, I.FIFO_RX, nb=1)
-    a.cmp(1, PID_ACK).jmp("nk", I.NZ)
+    a.L("hb").evt(I.DET_RX, I.EV_WAITC).fget(1, I.FIFO_RX, nb=1)   # wait for its EOP; r1 = its PID
+    a.cmp(1, PID_ACK).jmp("nk", I.NZ)                            # not an ACK: as if none came
     a.mov(3, UD_INLEN).mov(0, 0).st(0, 3).mov(0, EV_IN_ACK).jmp("ev")
     # NAK or STALL, as the host side chose in UD_INHS.
     a.L("nak").mov(3, UD_INHS).ld(1, 3).call("hsend").jmp("idle")
     # A packet shorter than a token, or a bus reset: SE0 still there after 2 us (the limit is 2.5).
-    a.L("t_bad").cmp(6, 0).jmp("idle", I.NZ)
-    a.delay(81).jpin(jp, 1, "idle").mov(0, EV_RESET)
+    a.L("t_bad").cmp(6, 0).jmp("idle", I.NZ)                     # a PID came: just a bad token, ignore
+    a.delay(81).jpin(jp, 1, "idle").mov(0, EV_RESET)             # 2 us after the SE0 began: still SE0 = reset
     # Every event ends here: tell the host what happened.
     a.L("ev").mov(3, UD_EVENT).st(0, 3).host_irq().jmp("idle")
     return a
@@ -1073,12 +1089,12 @@ def usb_host(B=4, jp=0, kp=1, gap=None, timeout=None):
     _usb_setup(a, B, jp, kp)
     # Wait for the doorbell, then branch on UH_OP. Each operation ends at fin0.
     a.L("idle").jmp("idle", I.NDB).dbclr()
-    a.mov(3, UH_OP).ld(0, 3).cmp(0, 0).jmp("tok", I.Z)
-    a.cmp(0, 3).jmp("resu", I.Z)
-    a.cmp(0, 1).jmp("keep", I.NZ)
+    a.mov(3, UH_OP).ld(0, 3).cmp(0, 0).jmp("tok", I.Z)           # 0: a transaction
+    a.cmp(0, 3).jmp("resu", I.Z)                                 # 3: resume
+    a.cmp(0, 1).jmp("keep", I.NZ)                                # 2: keep-alive; 1 falls through: reset
     # Bus reset: SE0 for n * 256 cycles, and then the end of an EOP.
-    a.call("gn")
-    a.set(jp, I.SRC_0).setoe(jp, 1).setoe(kp, 1)
+    a.call("gn")                                                 # r5 = the length, in 256-cycle turns
+    a.set(jp, I.SRC_0).setoe(jp, 1).setoe(kp, 1)                 # drive both lines low: SE0
     a.L("rl").delay(254).djnz(5, "rl")                           # 256 cycles a turn
     a.jmp("rel")
     # Keep-alive, or the end of a resume: SE0 for 2 bit times, then J for 1 bit, then release.
@@ -1090,32 +1106,32 @@ def usb_host(B=4, jp=0, kp=1, gap=None, timeout=None):
     # resume: K, then the EOP that "keep" ends with. J to K changes two pins: only a TX unit
     # write with DIFF changes both in one edge, with no glitch of SE0 between them.
     a.L("resu").call("gn")
-    a.ucfg(I.TX, I.TX_LINE, I.tx_line(diff=1, d2pin=kp))
-    a.ucfg(I.TX, I.TX_FRAME, I.tx_frame(nbits=1))
-    a.ucfg(I.ETX_U, I.D_AFTER, I.A_NONE)
+    a.ucfg(I.TX, I.TX_LINE, I.tx_line(diff=1, d2pin=kp))         # plain differential, no NRZI / EOP
+    a.ucfg(I.TX, I.TX_FRAME, I.tx_frame(nbits=1))                # a single bit
+    a.ucfg(I.ETX_U, I.D_AFTER, I.A_NONE)                         # and keep driving after it
     a.setoe(jp, 1).setoe(kp, 1)                                  # J, as the pull-ups had it
-    a.ustart(I.M_TX, 0).uwait(I.M_TX)
-    a.L("rk").delay(254).djnz(5, "rk")
-    a.ucfg(I.TX, I.TX_LINE, I.tx_line(nrzi=1, eop=1, diff=1, d2pin=kp, stuffn=6))
+    a.ustart(I.M_TX, 0).uwait(I.M_TX)                            # a 0 bit: both lines flip to K together
+    a.L("rk").delay(254).djnz(5, "rk")                           # K for n * 256 cycles
+    a.ucfg(I.TX, I.TX_LINE, I.tx_line(nrzi=1, eop=1, diff=1, d2pin=kp, stuffn=6))   # back to packet coding
     a.ucfg(I.TX, I.TX_FRAME, I.tx_frame(chain=1))
     a.ucfg(I.ETX_U, I.D_AFTER, I.A_RELEASE)
-    a.set(kp, I.SRC_0).jmp("eop")
+    a.set(kp, I.SRC_0).jmp("eop")                                # K -> SE0, then the EOP's J and release
     # token
     a.L("tok")                      # the CRC unit is off or on RX here: neither adds to a TX packet
     _tx_on(a, jp, kp)
     # The 3 bytes of the token. The host side worked out its CRC5.
     a.mov(3, UH_TOK0).ld(0, 3, inc=1).fput(0, I.FIFO_TX).ld(0, 3, inc=1).fput(0, I.FIFO_TX)
-    a.ld(0, 3).fput(0, I.FIFO_TX).uwait(I.M_TX)
+    a.ld(0, 3).fput(0, I.FIFO_TX).uwait(I.M_TX)                  # CHAIN sends them; EOP when TXF runs out
     # No data PID means an IN, and the next thing is the device's answer.
     a.mov(3, UH_DPID).ld(6, 3).cmp(6, 0).jmp("rxp", I.Z)
     # data stage (OUT / SETUP)
-    _crc_tx(a)
-    a.delay(2 * B)
+    _crc_tx(a)                                                   # the data packet gets CRC16, appended by hardware
+    a.delay(2 * B)                                               # the gap between token and data
     _tx_on(a, jp, kp)
-    a.fput(6, I.FIFO_TX)
-    a.mov(3, UH_N).ld(5, 3).mov(3, 0x10).cmp(5, 0).jmp("dte", I.Z)
+    a.fput(6, I.FIFO_TX)                                         # the DATA PID
+    a.mov(3, UH_N).ld(5, 3).mov(3, 0x10).cmp(5, 0).jmp("dte", I.Z)   # r5 = data bytes at 0x10; none: zero-length
     a.L("dtl").ld(0, 3, inc=1).fput(0, I.FIFO_TX).djnz(5, "dtl")
-    a.L("dte").uwait(I.M_TX)
+    a.L("dte").uwait(I.M_TX)                                     # data, CRC16 and EOP sent
     # receive a packet (handshake or data) into 0x80. Its start must come in time.
     a.L("rxp")
     _crc_rx(a, CRC16_POLY, CRC16_INIT)
@@ -1123,32 +1139,32 @@ def usb_host(B=4, jp=0, kp=1, gap=None, timeout=None):
     # r3 stores from 0x80. The status starts as OK.
     a.mov(3, 0x80).mov(5, timeout).mov(1, UH_OK)
     # K means a packet has started. Nothing in time means a time-out.
-    a.L("rw").jpin(kp, 1, "sop").djnz(5, "rw")
-    a.ustop(I.M_RX).evt(I.DET_RX, I.EV_DISARM).mov(1, UH_TIMEOUT).jmp("done")
+    a.L("rw").jpin(kp, 1, "sop").djnz(5, "rw")                   # 2 cycles a pass
+    a.ustop(I.M_RX).evt(I.DET_RX, I.EV_DISARM).mov(1, UH_TIMEOUT).jmp("done")   # no answer: time-out
     # The first byte decides. Only a good DATA PID in answer to an IN goes on to the ACK path, where
     # time is short: the other checks are made here, as bytes arrive.
     # A byte can reach the FIFO between finding it empty and seeing the EOP, so nothing is decided
     # from the FIFO being empty. A one-byte packet is read once more before it is judged (sope). On
     # the way to the ACK there is no time for that, but the CRC unit has seen the byte already: the
     # end ("hs") stores what is left, or it would pass as the next packet's PID.
-    a.L("sop").fget(0, I.FIFO_RX, nb=1).jmp("s1", I.NC).jmp("sope", I.ERX).jmp("sop")
-    a.L("s1").st(0, 3, inc=1).cmp(6, 0).jmp("rx", I.NZ)
-    a.cmp(0, PID_DATA0).jmp("rd", I.Z).cmp(0, PID_DATA1).jmp("rd", I.Z)
+    a.L("sop").fget(0, I.FIFO_RX, nb=1).jmp("s1", I.NC).jmp("sope", I.ERX).jmp("sop")   # wait for the first byte
+    a.L("s1").st(0, 3, inc=1).cmp(6, 0).jmp("rx", I.NZ)          # stored; after an OUT / SETUP, no ACK to give
+    a.cmp(0, PID_DATA0).jmp("rd", I.Z).cmp(0, PID_DATA1).jmp("rd", I.Z)   # an IN answered with data
     # anything else gets no ACK: with the CRC unit off the check below cannot pass, and that costs
     # the ACK no time. One byte is a handshake; more is a bad packet.
     a.L("rx").ucfg(I.CRC, I.CRC_CTRL, 0).jmp("rd")
     a.L("rs").st(0, 3, inc=1)
-    a.L("rd").fget(0, I.FIFO_RX, nb=1).jmp("rs", I.NC).jmp("rd", I.NERX)
-    a.urd(4, I.CRC, I.CRC_VAL)
+    a.L("rd").fget(0, I.FIFO_RX, nb=1).jmp("rs", I.NC).jmp("rd", I.NERX)   # store bytes until the EOP
+    a.urd(4, I.CRC, I.CRC_VAL)                                   # r4 = the CRC register
     _crc_good(a, CRC16_RES, CRC16_DRIB, "rc2", "sope")
     # PID and CRC good. ACK it if the stuffing is good too.
     a.L("rc2").urd(4, I.RX, I.RX_STAT).and_(4, I.RX_ST_SERR).jmp("bad", I.NZ)
     if gap:
         a.delay(gap)
     _tx_on(a, jp, kp)
-    a.mov(0, PID_ACK).fput(0, I.FIFO_TX).uwait(I.M_TX)
+    a.mov(0, PID_ACK).fput(0, I.FIFO_TX).uwait(I.M_TX)           # the ACK handshake
     a.jmp("hs")
-    a.L("sope").fget(0, I.FIFO_RX, nb=1).jmp("s1", I.NC)
+    a.L("sope").fget(0, I.FIFO_RX, nb=1).jmp("s1", I.NC)         # a byte that came with the EOP: judge it now
     # A packet with no ACK: one byte is a handshake, reported as OK. Anything else is a bad packet.
     a.L("rn").cmp(3, 0x81).jmp("hs", I.Z)
     a.L("bad").mov(1, UH_BADPKT)
@@ -1157,6 +1173,6 @@ def usb_host(B=4, jp=0, kp=1, gap=None, timeout=None):
         a.fget(0, I.FIFO_RX, nb=1).jmp("hse", I.C).st(0, 3, inc=1).jmp("hs").L("hse")
     # The length is how far r3 moved from 0x80.
     a.evt(I.DET_RX, I.EV_CLR).sub(3, 0x80).mov(0, I.R(3)).mov(3, UH_RXLEN).st(0, 3)
-    a.L("done").mov(3, UH_STATUS).st(1, 3)
+    a.L("done").mov(3, UH_STATUS).st(1, 3)                       # the status for the host
     a.L("fin0").host_irq().jmp("idle")
     return a
