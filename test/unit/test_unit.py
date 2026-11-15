@@ -45,8 +45,13 @@ CASES = [
     ("pe_fifo", "d1_w5", dict(W=5, DEPTH=1), []),
     ("pe_imem", "flop_w32", dict(IW=32, DEPTH=64, IMPL=0), []),
     ("pe_imem", "latch_w32", dict(IW=32, DEPTH=16, IMPL=1), []),
+    ("pe_imem", "cg_d162_w29", dict(IW=29, DEPTH=162, IMPL=0, CG=1), []),   # the chip's IMEM
+    ("pe_imem", "cg_w32", dict(IW=32, DEPTH=64, IMPL=0, CG=1), []),
+    ("pe_imem", "flop_d162_w29", dict(IW=29, DEPTH=162, IMPL=0), []),
     ("pe_dmem", "d256", dict(DEPTH=256), []),
     ("pe_dmem", "d64", dict(DEPTH=64), []),
+    ("pe_dmem", "cg_d256", dict(DEPTH=256, CG=1), []),                      # the chip's DMEM
+    ("pe_dmem", "cg_d64", dict(DEPTH=64, CG=1), []),
     ("pe_pins", "p8", dict(NUM_PINS=8), []),
     ("pe_pins", "p16", dict(NUM_PINS=16), []),
     ("pe_vote", "default", dict(NUM_PINS=8, N_W=4, S_W=16), []),

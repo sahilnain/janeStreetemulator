@@ -158,12 +158,21 @@ class Lockstep:
         for i in range(len(mem)):
             mem[i] = res(handle[i])
 
+    def _copy_rows(self, inst, cg_scope, mem):
+        """A memory's contents: the `mem` array, or with clock gating (MEM_CLOCK_GATE) one register per row."""
+        try:
+            self._copy_mem(inst.mem, mem)
+        except AttributeError:
+            rows = getattr(inst, cg_scope).g_row
+            for i in range(len(mem)):
+                mem[i] = res(rows[i].q)
+
     def arm(self):
         """Start comparing: the reset is over and both sides are in reset state."""
         up, m = self.up, self.chip
         if self.internal:
-            self._copy_mem(up.u_imem.mem, m.imem.mem)
-            self._copy_mem(up.u_dmem.mem, m.dmem.mem)
+            self._copy_rows(up.u_imem, "g_flop_cg", m.imem.mem)
+            self._copy_rows(up.u_dmem, "g_cg", m.dmem.mem)
             self._copy_mem(up.u_txf.mem, m.txf.mem)
             self._copy_mem(up.u_rxf.mem, m.rxf.mem)
             m.imem.rdata = res(up.u_imem.rdata)

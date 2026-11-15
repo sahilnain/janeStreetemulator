@@ -13,6 +13,10 @@
  *   1 = latches (smaller; EXPERIMENTAL, not yet checked in the IHP flow).
  *       Write address/data are registered, and a row's latch is open
  *       while clk is low in the cycle after the write.
+ * CG (flip-flops only): 1 = each row's flip-flops are clocked by their own
+ *   clock gate (pe_icg), enabled only by a write to that row, so they hold
+ *   their value without a 2:1 multiplexer per bit. Same behaviour as CG = 0.
+ *   Formal proofs (sby, single clock) always use CG = 0.
  *
  * The host may only write while the controller is stopped (RUN = 0, enforced
  * in pe_regs), so no read/write collision logic is needed.
@@ -24,6 +28,7 @@ module pe_imem #(
     parameter IW    = 24,
     parameter DEPTH = 64,
     parameter IMPL  = 0,
+    parameter CG    = 0,
     // derived, do not override
     parameter AW    = (DEPTH > 1) ? $clog2(DEPTH) : 1
 ) (
@@ -35,7 +40,13 @@ module pe_imem #(
     output reg  [IW-1:0] rdata
 );
 
+  // Storage. With CG the rows are separate registers (g_flop_cg) and `mem` is unused.
+  /* verilator lint_off UNDRIVEN */
+  /* verilator lint_off UNUSEDSIGNAL */
   reg [IW-1:0] mem[0:DEPTH-1];
+  /* verilator lint_on UNUSEDSIGNAL */
+  /* verilator lint_on UNDRIVEN */
+  wire [IW-1:0] rword[0:DEPTH-1];  // the word in each row, whichever way it is stored
 
   // AW can address more words than DEPTH (160 words, 8 bits). An address past the end reads
   // as 0 (nop) and a write there does nothing, so a runaway pc behaves the same on every chip.
@@ -47,15 +58,41 @@ module pe_imem #(
   /* verilator lint_on UNSIGNED */
 
   always @(posedge clk) begin
-    rdata <= rd_in ? mem[raddr] : {IW{1'b0}};
+    rdata <= rd_in ? rword[raddr] : {IW{1'b0}};
   end
 
+`ifdef FORMAL
+  localparam USE_CG = 0;
+`else
+  localparam USE_CG = (CG != 0);
+`endif
+
   generate
-    if (IMPL == 0) begin : g_flop
+    if (IMPL == 0 && USE_CG) begin : g_flop_cg
+      // one clock gate per row: a row's flip-flops only see a clock edge when it is written
+      genvar i;
+      for (i = 0; i < DEPTH; i = i + 1) begin : g_row
+        wire gclk;
+        pe_icg u_icg (
+            .clk (clk),
+            .en  (we & wr_in & (waddr == i[AW-1:0])),
+            .gclk(gclk)
+        );
+        reg [IW-1:0] q;
+        always @(posedge gclk) q <= wdata;
+        assign rword[i] = q;
+      end
+    end else begin : g_rows
+      genvar i;
+      for (i = 0; i < DEPTH; i = i + 1) begin : g_row
+        assign rword[i] = mem[i];
+      end
+    end
+    if (IMPL == 0 && !USE_CG) begin : g_flop
       always @(posedge clk) begin
         if (we && wr_in) mem[waddr] <= wdata;
       end
-    end else begin : g_latch
+    end else if (IMPL != 0) begin : g_latch
       reg          we_q;
       reg [AW-1:0] waddr_q;
       reg [IW-1:0] wdata_q;

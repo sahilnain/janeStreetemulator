@@ -229,7 +229,7 @@ The host's register map (Section 5.3). It holds RUN, the pin configuration and t
 
 ### 4.3 `pe_imem` (5,152): the program
 
-162 words of 29 bits, one write port for the host and one read port for the controller. The read is registered: the word arrives one cycle after the address, so the controller sends the address of the *next* instruction (section 4.4). The 32 extra flip-flops are that output register. It is built from flip-flops; a latch version exists but is not verified (`docs/area.md`).
+162 words of 29 bits, one write port for the host and one read port for the controller. The read is registered: the word arrives one cycle after the address, so the controller sends the address of the *next* instruction (section 4.4). The extra flip-flops are that output register. It is built from flip-flops. With `MEM_CLOCK_GATE` = 1 (the default) each word's flip-flops are clocked through their own clock gate (`pe_icg`), which only lets a clock edge through when that word is written. A plain flip-flop takes its D input on every edge, so without the gate each bit would need a 2:1 multiplexer to feed its own value back; the IHP library has no flip-flop with an enable. A latch version also exists but is not verified (`docs/area.md`).
 
 ### 4.4 `pe_ctrl` (194) and `pe_decode` (0): the processor
 
@@ -327,7 +327,7 @@ Everything that touches a wire goes through here.
 
 A host write to a full TX FIFO or a unit push to a full RX FIFO is dropped and flagged.
 
-**DMEM** is the mailbox. The host has priority, and a controller `ld` or `st` in the same cycle retries.
+**DMEM** is the mailbox. The host has priority, and a controller `ld` or `st` in the same cycle retries. Like IMEM, each byte has its own clock gate when `MEM_CLOCK_GATE` = 1.
 
 ### 4.11 The top level
 

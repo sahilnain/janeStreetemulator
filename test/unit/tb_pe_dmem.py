@@ -13,11 +13,22 @@ A shadow memory runs alongside. Every cycle:
    dropped).
 2. fill_and_alias: every address written by the controller and read by the
    host; addresses >= DEPTH alias onto addr % DEPTH.
+3. edge_cases (with and without clock gating, CG):
+   - the first and the last byte; every bit on its own, all-0 / all-1
+   - a write never disturbs the bytes next to it
+   - the read is combinational: the old byte before the edge, the new one
+     right after it (a `st` and then an `ld` of the same byte, back to back)
+   - back-to-back writes to one byte: the last one wins
+   - host and controller write in the same cycle: the host's byte is kept
+   - write enable only during the high half of the clock: no write; set in
+     the low half and dropped right after the edge: the write happens. With
+     CG this checks that the clock gate cannot glitch.
 """
 
 import random
 
 import cocotb
+from cocotb.triggers import FallingEdge, RisingEdge, Timer
 from tbutil import fall, param, settle, start, v
 
 DEPTH = param("DEPTH", 256)
@@ -66,3 +77,63 @@ async def fill_and_alias(dut):
         await cycle(dut, mem, 1, 0, a, 0, 0, 0, 0)
     for a in range(DEPTH):
         assert mem[a] == ((a + (256 - DEPTH)) * 7 + 3) & 0xFF if DEPTH < 256 else mem[a] == (a * 7 + 3) & 0xFF
+
+
+@cocotb.test(timeout_time=10, timeout_unit="ms")
+async def edge_cases(dut):
+    mem = await init(dut)
+    for a in range(DEPTH):                               # known contents: byte a holds a
+        await cycle(dut, mem, 0, 0, 0, 0, 1, a, a & 0xFF)
+    last = DEPTH - 1
+    # first and last byte, every bit on its own, all-0 / all-1; the host reads each back
+    for a in (0, last):
+        for x in [0x00, 0xFF, 0x55, 0xAA] + [1 << i for i in range(8)] + [0xFF ^ (1 << i) for i in range(8)]:
+            await cycle(dut, mem, 1, 1, a, x, 0, 0, 0)       # host write
+            await cycle(dut, mem, 1, 0, a, 0, 0, 0, 0)       # host read (checked in cycle())
+            await cycle(dut, mem, 0, 0, 0, 0, 1, a, x ^ 0xFF)   # controller write
+            await cycle(dut, mem, 0, 0, 0, 0, 0, a, 0)       # controller read
+    # neighbours untouched
+    for a in (1, DEPTH // 2, last - 1):
+        await cycle(dut, mem, 0, 0, 0, 0, 1, a, 0xC3)
+        for b in (a - 1, a + 1):
+            await cycle(dut, mem, 1, 0, b, 0, 0, 0, 0)
+    # combinational read: old byte before the edge, new byte straight after it
+    a = DEPTH // 3
+    dut.h_acc.value, dut.c_we.value, dut.c_addr.value, dut.c_wdata.value = 0, 1, a, mem[a] ^ 0x5A
+    await settle()
+    assert v(dut.rdata) == mem[a], "before the edge the read must show the old byte"
+    await fall(dut)
+    mem[a] ^= 0x5A
+    dut.c_we.value = 0
+    await settle()
+    assert v(dut.rdata) == mem[a], "st then ld of the same byte: the ld must see the new byte"
+    # back-to-back writes, last one wins
+    for x in (0x11, 0x22, 0x33):
+        await cycle(dut, mem, 0, 0, 0, 0, 1, a, x)
+    await cycle(dut, mem, 0, 0, 0, 0, 0, a, 0)
+    assert mem[a] == 0x33
+    # host and controller write in the same cycle (the controller to another byte): only the host's lands
+    await cycle(dut, mem, 1, 1, a, 0x99, 1, a + 1, 0x77)
+    await cycle(dut, mem, 1, 0, a + 1, 0, 0, 0, 0)
+    await cycle(dut, mem, 1, 0, a, 0, 0, 0, 0)
+    # write enable only while clk is high: no write
+    a = DEPTH // 5
+    dut.h_acc.value, dut.h_we.value = 0, 0               # the controller has the port
+    await RisingEdge(dut.clk)
+    await Timer(3, unit="ns")
+    dut.c_we.value, dut.c_addr.value, dut.c_wdata.value = 1, a, mem[a] ^ 0xFF
+    await Timer(3, unit="ns")
+    dut.c_we.value = 0
+    await FallingEdge(dut.clk)
+    await cycle(dut, mem, 0, 0, 0, 0, 0, a, 0)           # checks the byte did not change
+    # set in the low half, dropped just after the edge: written
+    dut.c_we.value, dut.c_addr.value, dut.c_wdata.value = 1, a, mem[a] ^ 0xFF
+    await RisingEdge(dut.clk)
+    await Timer(1, unit="ns")
+    dut.c_we.value = 0
+    mem[a] ^= 0xFF
+    await FallingEdge(dut.clk)
+    await cycle(dut, mem, 0, 0, 0, 0, 0, a, 0)
+    # every byte, at the end
+    for a in range(DEPTH):
+        await cycle(dut, mem, 1, 0, a, 0, 0, 0, 0)

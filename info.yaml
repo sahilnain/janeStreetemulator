@@ -20,6 +20,7 @@ project:
     - "tt_um_sahil_protoemu.v"
     - "host/pe_host_if.v"
     - "host/pe_regs.v"
+    - "mem/pe_icg.v"
     - "mem/pe_imem.v"
     - "mem/pe_fifo.v"
     - "mem/pe_dmem.v"

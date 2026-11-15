@@ -18,7 +18,7 @@ Status: implemented, tested and formally proved (see Section 10). Instruction se
 | `tt_um_sahil_protoemu` | top level, pin map | rewired; pin map unchanged |
 | `pe_host_if` | 4-bit host bus | **unchanged** |
 | `pe_regs` | host register map | rewritten (Section 9) |
-| `pe_imem` | instruction memory | unchanged, IW = 32 |
+| `pe_imem` | instruction memory | IW = 29; optional clock gate per word (`MEM_CLOCK_GATE`) |
 | `pe_ctrl` | controller: fetch, issue, state, execute | new, built from `pe_core` + `pe_ctx` + `pe_exec` |
 | `pe_decode` | 29-bit instruction decode | rewritten |
 | `pe_txu` | TX unit | new |
@@ -27,7 +27,7 @@ Status: implemented, tested and formally proved (see Section 10). Instruction se
 | `pe_crc` | CRC unit | new |
 | `pe_pins` | pin fabric | changed: 3 write ports, 2-bit owners, busy rule |
 | `pe_fifo` | TX FIFO, RX FIFO | **unchanged**, depth 8 |
-| `pe_dmem` | data memory | new |
+| `pe_dmem` | data memory | new; optional clock gate per byte (`MEM_CLOCK_GATE`) |
 | `pe_sync` | synchroniser | **unchanged** |
 
 Top-level parameters (defaults):
@@ -38,6 +38,7 @@ Top-level parameters (defaults):
 | `DMEM_DEPTH` | 256 | ≤ 256; may be reduced if area is short |
 | `FIFO_DEPTH` | 8 | ≤ 15 (FIFO_CNT is 4 bits per FIFO) |
 | `STACK_DEPTH` | 4 | return stack |
+| `MEM_CLOCK_GATE` | 1 | macro. 1: every IMEM word and DMEM byte is clocked through its own clock gate (`pe_icg`, the IHP cell `sg13g2_lgcp_1`), enabled only by a write to it, so the flip-flops hold without a 2:1 multiplexer per bit. Same behaviour, about 152,000 µm² less. 0 rolls back (`-DMEM_CLOCK_GATE=0`, or `make MEM_CG=0` in test/). Formal proofs use the ungated form |
 | `NUM_PINS` | 8 | = uio width; pin fields are 4 bits (room for 16) |
 
 ```
@@ -279,7 +280,7 @@ These numbers become the firmware constants (`pe_fw.py`) and cycle-exact unit-te
 
 A unit or host access never waits. A host write to a full TXF, or a unit push to a full RXF, is dropped and sets the v1 overrun flag.
 
-**Data memory** (`pe_dmem`, DMEM_DEPTH × 8, flip-flops, combinational read, one write per cycle).
+**Data memory** (`pe_dmem`, DMEM_DEPTH × 8, flip-flops, combinational read, one write per cycle; with `MEM_CLOCK_GATE` each byte has its own clock gate).
 - Controller: `ld`/`st` with address `ra[7:0]` (upper bits ignored when DMEM_DEPTH < 256).
 - Host: DMEM_ADDR / DMEM_DATA registers (Section 9). Each DMEM_DATA access auto-increments the address. The host has priority; a controller `ld`/`st` in the same cycle blocks and retries.
 

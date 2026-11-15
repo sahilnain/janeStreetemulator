@@ -27,8 +27,16 @@ Tests
 12. test_one_instruction_per_cycle  the pipelined fetch: one instruction a cycle in straight
                              code, through a taken branch, call and ret, and a blocked wait
                              retries every cycle (seen on the pins, cycle by cycle).
+13. test_memories            IMEM and DMEM through the chip, with every word and byte used:
+                             all 162 IMEM words hold a program whose result depends on every bit
+                             of every word (loaded twice, so every word is also rewritten); all
+                             256 DMEM bytes written by the host, inverted by the firmware with a
+                             read straight after each write, and read back by the host, while the
+                             host also reads DMEM during the run (arbitration). Run with and
+                             without MEM_CLOCK_GATE.
 """
 
+import random
 import sys
 from pathlib import Path
 
@@ -451,3 +459,59 @@ async def test_one_instruction_per_cycle(dut):
         lat.add(rise[-1] - t0)
         await chip.bus.write(R.RUN, 0)
     assert len(lat) == 1, f"wait answers after {sorted(lat)} cycles: not one try a cycle"
+
+
+@cocotb.test()
+async def test_memories(dut):
+    rng = random.Random(1234)
+
+    # IMEM: every word in use. Words 0..157 xor a random 16-bit value into r1 (0 after RESTART), so a
+    # wrong bit anywhere changes the result; 158..160 send r1 to RXF; 161, the last word, loops.
+    for rnd in range(2):                                  # the second load rewrites every word
+        vals = [rng.getrandbits(16) for _ in range(R.IMEM_WORDS - 4)]
+        a = Asm()
+        for x in vals:
+            a.xor(1, x)
+        a.fput(1, I.FIFO_RX).shr(1, 8).fput(1, I.FIFO_RX)
+        a.L("e").jmp("e")
+        assert len(a.words()) == R.IMEM_WORDS
+        exp = 0
+        for x in vals:
+            exp ^= x
+        chip = Chip(dut)
+        await chip.reset()
+        await chip.bus.load_program(a.words())
+        await chip.bus.start()
+        await ClockCycles(dut.clk, R.IMEM_WORDS + 40)
+        got = await chip.bus.read(R.RXF) | (await chip.bus.read(R.RXF) << 8)
+        assert got == exp, f"IMEM round {rnd}: result {got:#06x}, expected {exp:#06x}"
+        await chip.bus.write(R.RUN, 0)
+
+    # DMEM: the host fills all 256 bytes; the firmware inverts each one and reads it back in the very
+    # next instruction (st then ld of the same byte); it counts mismatches and sends the count to RXF.
+    chip = Chip(dut)
+    await chip.reset()
+    a = Asm().mov(1, 0).mov(3, 0)                         # r1 address, r3 mismatches
+    a.L("l").ld(0, 1).xor(0, 0xFF).st(0, 1).ld(2, 1)      # invert, write, read straight back
+    a.cmp(2, I.R(0)).jmp("ok", I.Z).add(3, 1)
+    a.L("ok").add(1, 1).cmp(1, 256).jmp("l", I.NZ)        # bytes 0 .. 255
+    a.fput(3, I.FIFO_RX).host_irq()
+    idle(a)
+    await chip.bus.load_program(a.words())
+    data = [rng.getrandbits(8) for _ in range(256)]
+    data[0], data[255] = 0x00, 0xFF                       # the first and last byte, both extremes
+    await chip.bus.dmem_write(0, data)
+    assert await chip.bus.dmem_read(0, 256) == data, "host write and read back of all 256 bytes"
+    await chip.bus.start()
+    # The host reads byte 0 while the firmware runs: the host wins the port and the firmware retries.
+    for _ in range(20):
+        b0 = (await chip.bus.dmem_read(0, 1))[0]
+        assert b0 in (0x00, 0xFF), f"byte 0 read during the run: {b0:#04x}"
+    for _ in range(200):
+        if await chip.bus.read(R.STATUS2) & R.S2_IRQ:
+            break
+    else:
+        raise AssertionError("the DMEM firmware never finished")
+    assert await chip.bus.read(R.RXF) == 0, "a byte read straight after its write was wrong"
+    assert await chip.bus.dmem_read(0, 256) == [x ^ 0xFF for x in data], "DMEM after the firmware pass"
+    await chip.bus.write(R.RUN, 0)

@@ -9,6 +9,7 @@
 # Protocol support (docs/spec/blocks.md Section 13). UART is always built:
 #   make PROTOCOLS=uart          UART only
 #   make PROTOCOLS=uart,i2c      UART and I2C
+#   make MEM_CG=0                memories without clock gating (the roll-back build)
 # The RTL gets -DSUPPORT_<P>=0 for each protocol left out, the Python model reads PE_PROTOCOLS, and
 # a test that needs a protocol which is not built is skipped (test/common/pe_build.py).
 PROTOCOLS ?= uart,spi,i2c,usb
@@ -21,8 +22,14 @@ export PE_PROTOCOLS := $(PROTOCOLS)
 PROTOCOL_DEFINES := $(if $(filter spi,$(PROTOCOL_LIST)),,-DSUPPORT_SPI=0) \
                     $(if $(filter i2c,$(PROTOCOL_LIST)),,-DSUPPORT_I2C=0) \
                     $(if $(filter usb,$(PROTOCOL_LIST)),,-DSUPPORT_USB=0)
-# one build directory per protocol set, so a change of PROTOCOLS never reuses a stale build
-BUILD_TAG := $(subst $(comma),_,$(PROTOCOLS))
+# Memory clock gating (MEM_CLOCK_GATE in src/tt_um_sahil_protoemu.v): make MEM_CG=0 builds the memories
+# without clock gates, as before.
+MEM_CG ?= 1
+ifneq ($(filter-out 0 1,$(MEM_CG)),)
+$(error MEM_CG must be 0 or 1)
+endif
+# one build directory per protocol set and gating choice, so a change never reuses a stale build
+BUILD_TAG := $(subst $(comma),_,$(PROTOCOLS))$(if $(filter 0,$(MEM_CG)),_nocg,)
 
 # defaults
 SIM ?= icarus
@@ -31,7 +38,7 @@ TOPLEVEL_LANG ?= verilog
 SRC_DIR = $(PWD)/../src
 PROJECT_SOURCES = tt_um_sahil_protoemu.v \
                   host/pe_host_if.v host/pe_regs.v \
-                  mem/pe_imem.v mem/pe_fifo.v mem/pe_dmem.v \
+                  mem/pe_icg.v mem/pe_imem.v mem/pe_fifo.v mem/pe_dmem.v \
                   io/pe_sync.v io/pe_pins.v \
                   core/pe_ctrl.v core/pe_decode.v core/pe_vote.v \
                   unit/pe_txu.v unit/pe_rxu.v unit/pe_det.v unit/pe_crc.v
@@ -41,7 +48,7 @@ ifneq ($(GATES),yes)
 # RTL simulation:
 SIM_BUILD				?= sim_build/rtl_$(BUILD_TAG)
 VERILOG_SOURCES += $(addprefix $(SRC_DIR)/,$(PROJECT_SOURCES))
-COMPILE_ARGS    += $(PROTOCOL_DEFINES)
+COMPILE_ARGS    += $(PROTOCOL_DEFINES) -DMEM_CLOCK_GATE=$(MEM_CG)
 
 else
 

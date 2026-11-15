@@ -4,6 +4,10 @@
  *
  * pe_dmem: data memory, DEPTH x 8 flip-flops (docs/spec/blocks.md Section 8).
  *
+ * CG = 1: each byte's flip-flops are clocked by their own clock gate (pe_icg),
+ * enabled only by a write to that byte, so they hold without a 2:1
+ * multiplexer per bit. Same behaviour as CG = 0. Formal (sby) uses CG = 0.
+ *
  * One address, combinational read, one write per cycle. Two users:
  *   host (pe_regs DMEM_DATA access, h_acc = read or write strobe) has
  *   priority; the controller (ld / st) gets c_gnt = !h_acc and blocks
@@ -14,6 +18,7 @@
 
 module pe_dmem #(
     parameter DEPTH = 256,
+    parameter CG    = 0,
     // derived, do not override
     parameter MW    = (DEPTH > 1) ? $clog2(DEPTH) : 1
 ) (
@@ -30,7 +35,13 @@ module pe_dmem #(
     output wire [7:0] rdata
 );
 
+  // Storage. With CG the bytes are separate registers (g_cg) and `mem` is unused.
+  /* verilator lint_off UNDRIVEN */
+  /* verilator lint_off UNUSEDSIGNAL */
   reg [7:0] mem[0:DEPTH-1];
+  /* verilator lint_on UNUSEDSIGNAL */
+  /* verilator lint_on UNDRIVEN */
+  wire [7:0] rbyte[0:DEPTH-1];  // the byte at each address, whichever way it is stored
 
   wire [7:0] a = h_acc ? h_addr : c_addr;
   wire [MW-1:0] ai = a[MW-1:0];
@@ -38,11 +49,38 @@ module pe_dmem #(
   wire [7:0] wd = h_acc ? h_wdata : c_wdata;
 
   assign c_gnt = ~h_acc;
-  assign rdata = mem[ai];
+  assign rdata = rbyte[ai];
 
-  always @(posedge clk) begin
-    if (we) mem[ai] <= wd;
-  end
+`ifdef FORMAL
+  localparam USE_CG = 0;
+`else
+  localparam USE_CG = (CG != 0);
+`endif
+
+  generate
+    if (USE_CG) begin : g_cg
+      genvar i;
+      for (i = 0; i < DEPTH; i = i + 1) begin : g_row
+        wire gclk;
+        pe_icg u_icg (
+            .clk (clk),
+            .en  (we & (ai == i[MW-1:0])),
+            .gclk(gclk)
+        );
+        reg [7:0] q;
+        always @(posedge gclk) q <= wd;
+        assign rbyte[i] = q;
+      end
+    end else begin : g_ff
+      always @(posedge clk) begin
+        if (we) mem[ai] <= wd;
+      end
+      genvar i;
+      for (i = 0; i < DEPTH; i = i + 1) begin : g_row
+        assign rbyte[i] = mem[i];
+      end
+    end
+  endgenerate
 
   wire _unused = &{1'b0, a};
 

@@ -66,6 +66,14 @@ module tt_um_sahil_protoemu (
   localparam SUPPORT_I2C = `SUPPORT_I2C;
   localparam SUPPORT_USB = `SUPPORT_USB;
 
+  // Memory clock gating (docs/area.md): 1 = each IMEM word and DMEM byte is clocked by its own clock
+  // gate instead of holding through a 2:1 multiplexer per bit. Same behaviour, less area. To roll
+  // back, define it as 0: -DMEM_CLOCK_GATE=0, or VERILOG_DEFINES in src/config.json for the flow.
+`ifndef MEM_CLOCK_GATE
+`define MEM_CLOCK_GATE 1
+`endif
+  localparam MEM_CLOCK_GATE = `MEM_CLOCK_GATE;
+
   localparam AW = (IMEM_DEPTH > 1) ? $clog2(IMEM_DEPTH) : 1;
   localparam FIFO_CW = $clog2(FIFO_DEPTH + 1);
 
@@ -292,7 +300,8 @@ module tt_um_sahil_protoemu (
   pe_imem #(
       .IW   (IW),
       .DEPTH(IMEM_DEPTH),
-      .IMPL (IMEM_IMPL)
+      .IMPL (IMEM_IMPL),
+      .CG   (MEM_CLOCK_GATE)
   ) u_imem (
       .clk  (clk),
       .we   (im_we),
@@ -303,7 +312,8 @@ module tt_um_sahil_protoemu (
   );
 
   pe_dmem #(
-      .DEPTH(DMEM_DEPTH)
+      .DEPTH(DMEM_DEPTH),
+      .CG   (MEM_CLOCK_GATE)
   ) u_dmem (
       .clk    (clk),
       .h_acc  (h_dm_acc),
