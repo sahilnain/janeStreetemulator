@@ -39,7 +39,34 @@ The current goal is maximum speed for every protocol regardless of area. That ne
 - The `pe_ctx`, `pe_decode` and `pe_exec` split: the same per-context state, decode and execute blocks drop into a per-engine design unchanged.
 - The Python model (`model/pe_model/core.py`), the lockstep test and the equivalence harness all take NUM_CTX as a parameter.
 
-## 2. Other parked ideas
+## 2. Complex instructions to shrink IMEM
+
+### The idea
+IMEM and DMEM are most of the chip: after the `dly` removal, IMEM (162 × 29) is about 415,000 µm² and DMEM (256 × 8) about 177,000 µm², of about 721,000 µm² in all. IMEM costs about **2,600 µm² per word**, and its depth is set by the largest program (the full-speed USB device, 162 words). Instructions that do the work of two common pairs would make programs shorter, so IMEM could be shallower. The decoder and the controller get more complex, but they are small (`pe_ctrl` with `pe_decode` is about 32,000 µm², 4% of the chip), so a little more logic there can pay for many IMEM words.
+
+### Where the words go (counted over the firmware, 2026-11-15)
+| Pair | All 15 programs | USB device (162) | USB host (159) | I2C multi-master (155) |
+|---|---|---|---|---|
+| `cmp` + `jmp` (compare and branch) | 61 | 14 | 11 | 9 |
+| `mov rB, #addr` + `ld`/`st` (fixed DMEM address) | 34 | 8 | 7 | 2 |
+| `ucfg` + `ucfg` on the same unit | 110 | 14 | 14 | 1 |
+| `set` + `delay` | 27 | 0 | 1 | 9 |
+| `setoe` + `setoe` | 11 | 2 | 7 | 0 |
+
+### Candidates, and whether they fit the 29-bit word
+- **`ld`/`st` with an absolute address** (`ld rd, [imm8]`): fits. imm16 has room for the address, so one word replaces `mov` + `ld`/`st`. USB device saves 8 words.
+- **Compare and branch** (`jeq/jne rA, #imm, target`): imm16 already holds the condition (5 bits) and the target (8 used of 10), so the compare value needs another place. 6 bits (A unused, I, B) give compares against 0-63, which covers most uses (PIDs and status codes do not fit; small counts and flags do). USB device saves up to 14.
+- **`set` with a delay** brings back part of what `dly` did, but only for `set`. Worth it for I2C (9 in the multi-master build), not for USB.
+- **Two `ucfg` in one word** is not possible: each carries a 16-bit value.
+
+With the first two, the USB device would be about 140 words: IMEM 162 → 140 saves about 57,000 µm² (8% of the chip). IMEM depth must still cover the largest program, so the saving is set by USB, the protocol that is tight on space.
+
+### Things to keep in mind
+- This shrinks IMEM only. DMEM's size is set by the host buffers (USB packets of up to 64 bytes in and out, I2C and SPI transfers), not by the firmware. Shrinking DMEM (for example to 128 bytes) is a separate decision about the largest transfer.
+- Every new instruction needs the RTL, the model, the z3 obligation, the assembler and the firmware changed together, as in the `dly` removal.
+- Timing: compare and branch puts a 16-bit compare into the next-pc path, which now also drives the IMEM read address. That path had 11 ns of slack at the slow corner (after CTS); check it again.
+
+## 3. Other parked ideas
 - `assist` opcode (15) for CRC, NRZI/Manchester and bit stuffing: needed for the stretch goals (low-speed USB, 10BASE-T).
 - Timestamp counter and capture FIFO.
 - SRAM-based instruction memory instead of flip-flops (area).
