@@ -54,9 +54,10 @@ Top-level parameters (defaults):
 `pc` (AW bits), `r0`–`r7` (16 bits), flags `Z C TO DB`, return stack (STACK_DEPTH × AW, plus a depth counter), stall counter (17 bits: `dly` plus a 16-bit `delay` operand). The flags `ETX`, `ERX` live in the detectors, and `RXRDY` and `FERR` in the RX unit and ERX. The controller reads them as inputs.
 
 ### 2.2 Issue timing
-- The front end is v1's with one stream. In the cycle before an issue, `im_raddr = pc`; the word arrives in the issue cycle (registered IMEM read). The controller **issues at most every 2 cycles**. The cycle in which an instruction executes is called **E**. All its effects are written in E.
-- `dly` d (or `delay`): the next issue is at E + 2·ceil((d+1)/2).
-- **Blocking.** A blocked instruction has no effect, and is retried at E+2, E+4, … until its condition holds. Blocking instructions: `wait`, `fget`/`fput` (empty/full, or lost arbitration), `ld`/`st` (lost arbitration to the host), `ustart` (unit busy, or TX FIFO empty when a byte is needed), `uwait`, `evt wait/waitc`.
+- One stream, pipelined fetch. The cycle in which an instruction executes is called **E**; all its effects are written in E. In E, IMEM is addressed with the next pc (`im_raddr = pc_n`: pc + 1, the jump target, the return address, or pc again when blocked), so the next word arrives in E+1 (registered IMEM read) on every path. The controller **issues up to one instruction per cycle**. Invariant: `pc` equals the previous cycle's `im_raddr`, so `im_rdata` is always IMEM[pc].
+- Start: an instruction issues only if RUN was also 1 in the cycle before (`run_q`), so the first word after RUN rises is fetched once IMEM can no longer be written. RESTART addresses IMEM with START_PC in the same cycle.
+- `dly` d (or `delay`): the next issue is at E + 1 + d.
+- **Blocking.** A blocked instruction has no effect, and is retried at E+1, E+2, … until its condition holds. Blocking instructions: `wait`, `fget`/`fput` (empty/full, or lost arbitration), `ld`/`st` (lost arbitration to the host), `ustart` (unit busy, or TX FIFO empty when a byte is needed), `uwait`, `evt wait/waitc`.
 - RUN = 0: no issue. A blocked instruction is abandoned and re-executed when RUN returns to 1. RESTART (host): `pc ← START_PC`; r0–r7, flags, stack and stall counter are cleared; both units are aborted (as `ustop`); both detectors are disarmed and their flags, FERR and RXRDY cleared.
 
 ### 2.3 Outputs to the other blocks (combinational in E)
@@ -356,7 +357,7 @@ The functional behaviour seen from the host bus is the same as v1. The tests kee
 **UART break (`pe_fw.uart_ex`).** A frame of all zeros with a bad stop bit counts in dmem[2] and raises the controller IRQ. ERX needs a new edge, so a long break counts once. A doorbell sends a break of dmem[3] bit times between frames. With an odd B (115200 baud at 48 MHz is B = 417), the start bit is B + 1 cycles, and every other edge stays on the bit grid.
 
 **SPI, more forms.**
-- `spi_master_stream`: no pause between bytes, using TX and RX CHAIN. A pass that refills TXF and empties RXF takes 18 cycles, so any length runs with no pause at B ≥ 3 (16 Mbit/s). At B = 2 (24 Mbit/s) short streams run with no pause, and longer ones pause SCK and report it. dmem[0x7F] = 0 ok, 1 SCK paused, 2 a reply was lost; the firmware always ends and raises the IRQ.
+- `spi_master_stream`: no pause between bytes, using TX and RX CHAIN. A pass that refills TXF and empties RXF takes 9 cycles, so any length runs with no pause, up to B = 2 (24 Mbit/s). If SCK ever pauses, it is reported. dmem[0x7F] = 0 ok, 1 SCK paused, 2 a reply was lost; the firmware always ends and raises the IRQ.
 - `spi_master_3wire`, `spi_slave_3wire`: one data pin. The master writes, releases the pin, then reads, within one CS frame. For the slave the first byte is a command with MSB = 1 for a read; it takes the pin only after the master's last clock edge plus 10 cycles. SCK half period ≥ 16 cycles.
 - `spi_slave_words`: words of 1–16 bits, as two FIFO bytes each, low first. SCK half period ≥ 12 cycles.
 - Every slave prepares the next word before its first clock, so at CS high that word has already left the FIFO and is lost. Load one extra word, or none if only reading.

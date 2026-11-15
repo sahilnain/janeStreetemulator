@@ -4,8 +4,8 @@ tb_pe_ctrl: unit test for src/core/pe_ctrl.v (the controller).
 
 What is checked
 ---------------
-`Ctrl` is a cycle model of docs/spec/isa.md + blocks.md Section 2: slot
-issue every 2 cycles, stall counter, blocking (no side effects), all 35
+`Ctrl` is a cycle model of docs/spec/isa.md + blocks.md Section 2: one
+issue per cycle with a pipelined fetch (im_raddr = next pc), stall counter, blocking (no side effects), all 35
 opcodes, the 27 jump conditions, reserved opcodes (ill_err), stack
 overflow / underflow (stk_err), restart, RUN and the doorbell. The
 testbench emulates pe_imem's registered read (im_rdata = prog[im_raddr of
@@ -16,10 +16,11 @@ not gated, so the register file is checked continuously as well.
    so that every opcode (and reserved ones) occurs; the environment (FIFO
    flags and data, grants, unit busy/need, flags, pins, DMEM data, urd data,
    run, restart, doorbell) is random every cycle.
-2. timing: issue spacing is 2 cycles; dly d costs 2*ceil((d+1)/2); delay
-   rX loads the stall from a register.
-3. restart_run: RESTART loads START_PC and clears state; the stale fetch is
-   not issued; RUN = 0 holds the controller.
+2. timing: issue spacing is 1 cycle; dly d costs d+1; delay rX loads the
+   stall from a register.
+3. restart_run: RESTART loads START_PC and clears state; the word at
+   START_PC is fetched in the same cycle; RUN = 0 holds the controller, and
+   after RUN rises the first issue waits one cycle for the fetch.
 4. stack: call depth = STACK_DEPTH works, one more -> stk_err (nop);
    ret with an empty stack -> stk_err.
 """
@@ -50,7 +51,7 @@ OUTS = ("im_raddr", "pw_mask", "pw_val", "po_mask", "po_val", "txf_rd", "rxf_rd"
 
 class Ctrl:
     def __init__(self):
-        self.slot = 0
+        self.run_q = 0
         self.pc = 0
         self.r = [0] * 8
         self.z = self.c = self.to = self.db = 0
@@ -77,7 +78,7 @@ class Ctrl:
         pbit = (e["pin_in"] >> pin) & 1 if pin < NP else 0
         onem = (1 << pin) & PM if pin < NP else 0
         tgt = imm & 0x3FF & AM
-        ready = e["run"] and not self.slot and self.stall == 0
+        ready = e["run"] and self.run_q and self.stall == 0
         o = {k: 0 for k in OUTS}
         o.update(im_raddr=self.pc, f_wdata=r[a] & 0xFF, dm_addr=r[b] & 0xFF, dm_wdata=r[a] & 0xFF,
                  cfg_unit=a, cfg_idx=b, cfg_data=op2, rd_unit=b, rd_idx=imm & 7, start_imm=b & 1,
@@ -242,7 +243,17 @@ class Ctrl:
             o.update(fx)
             o["ill_err"], o["stk_err"] = x["ill"], x["stk"]
         x.update(ready=ready, op=op, a=a, dly=dly, op2=op2, tgt=tgt)
+        o["im_raddr"] = e["start_pc"] if e["restart"] else (self.next_pc(x) if ready else self.pc)
         return o, x
+
+    def next_pc(self, x):
+        if not x["done"]:
+            return self.pc
+        if x["pop"]:
+            return self.stack[-1]
+        if x["jump"]:
+            return x["tgt"]
+        return (self.pc + 1) & AM
 
     def step(self, x, e):
         db_set, restart = e["db_set"], e["restart"]
@@ -250,24 +261,17 @@ class Ctrl:
             self.db = 1
         elif x["ready"] and x["dbclr"]:
             self.db = 0
-        self.slot ^= 1
+        self.run_q = int(bool(e["run"]))
         if restart:
             self.pc = e["start_pc"]
             self.z = self.c = self.to = 0
             self.stack = []
-            self.stall = 1
+            self.stall = 0
             self.blocked = 0
             self.r = [0] * 8
         elif x["ready"]:
             done = x["done"]
-            if not done:
-                pc_n = self.pc
-            elif x["pop"]:
-                pc_n = self.stack[-1]
-            elif x["jump"]:
-                pc_n = x["tgt"]
-            else:
-                pc_n = (self.pc + 1) & AM
+            pc_n = self.next_pc(x)
             if x["push"]:
                 self.stack.append((self.pc + 1) & AM)
             if x["pop"]:
@@ -422,15 +426,15 @@ async def timing(dut):
         a.L("e").jmp("e")
         times, _ = await issue_times(dut, a.words(), 80)
         gaps = [y - x for x, y in zip(times, times[1:4])]
-        exp = 2 * ((d + 1 + 1) // 2)
+        exp = d + 1
         assert gaps == [exp] * 3, (d, gaps, exp)
     a = I.Asm().mov(3, 9).delay(I.R(3)).nop().L("e").jmp("e")
     times, _ = await issue_times(dut, a.words(), 60)
-    assert times[2] - times[1] == 2 * ((9 + 1 + 1) // 2), times
+    assert times[2] - times[1] == 9 + 1, times
     # the longest stall: delay 0xFFFF with dly 7 (17-bit stall counter)
     a = I.Asm().delay(0xFFFF, dly=7).nop().L("e").jmp("e")
     times, _ = await issue_times(dut, a.words(), 0xFFFF + 7 + 20)
-    assert times[1] - times[0] == 2 * ((0xFFFF + 7 + 2) // 2), times
+    assert times[1] - times[0] == 0xFFFF + 7 + 1, times
 
 
 @cocotb.test()

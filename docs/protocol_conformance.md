@@ -70,7 +70,7 @@ I could not get a copy of the Motorola SPI Block Guide. The mode definitions com
 | All 4 modes, MSB and LSB first, as master and slave | sigrok on both data lines | Pass |
 | Master at bit time 2 to 48 | sigrok, data both ways | Pass |
 | Word sizes: master 1–16; slave 1–8 and 9–16 | sigrok `wordsize` | Pass |
-| Stream with no pause (B ≥ 3) | No gap in SCK | Pass |
+| Stream with no pause (B ≥ 2) | No gap in SCK | Pass |
 | 3-wire, master and slave | sigrok, no bus contention | Pass |
 | SCK at CPOL whenever CS changes; even number of edges; right count | `check_frames` | Pass |
 | Data changes only on the shift edge, never on or after a sampling edge | `check_frames` | Pass |

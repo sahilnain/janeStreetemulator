@@ -4,23 +4,29 @@
  *
  * pe_ctrl: the controller (docs/spec/blocks.md Section 2).
  *
- * One instruction stream. The front end is v1's: pe_imem has a registered
- * read, so the controller fetches in one cycle and executes in the next. A
- * slot bit alternates every cycle and the controller may only issue in
- * slot 0, so it issues at most every 2 cycles (cycle E = execute cycle).
+ * One instruction stream, one instruction per cycle. pe_imem has a
+ * registered read, so the fetch is pipelined: in the cycle an instruction
+ * executes (cycle E), IMEM is addressed with the NEXT pc (pc_n: pc+1, the
+ * jump target, the return address, or pc again when blocked). The next word
+ * is then ready in E+1 on every path, with no bubble. Invariant: pc always
+ * equals the previous cycle's im_raddr, so im_rdata is always IMEM[pc].
+ * The only fetch cycle that cannot overlap is the first one: an instruction
+ * issues only when RUN was also 1 in the cycle before (run_q), so the word
+ * is fetched once IMEM can no longer be written (IMEM writes need RUN = 0).
  *
  * State: pc, r0-r7 (16 bits), flags Z C TO DB, return stack, stall counter.
  * Every effect of an instruction (registers, pins, FIFOs, unit commands) is
  * written in E. An instruction that cannot complete is "blocked": it has no
- * effect at all and is retried at E+2 (wait, fget/fput, ld/st, ustart,
+ * effect at all and is retried at E+1 (wait, fget/fput, ld/st, ustart,
  * uwait, evt wait). A blocked `wait` with a timeout still counts rd down.
  *
  * Stall: `dly` d (plus op2 for `delay`) loads the stall counter, which
- * counts down every cycle; the next issue is at E + 2*ceil((d+1)/2).
+ * counts down every cycle; the next issue is at E + 1 + d.
  *
- * restart (host RESTART): pc <- start_pc, registers/flags/stack cleared,
- * stall = 1 so the word already fetched from the old pc is not issued.
- * DB is a host doorbell: set by db_set, cleared by `host dbclr`.
+ * restart (host RESTART): pc <- start_pc, registers/flags/stack cleared.
+ * IMEM is addressed with start_pc in the same cycle, so the first word is
+ * ready the cycle after. DB is a host doorbell: set by db_set, cleared by
+ * `host dbclr`.
  */
 
 `default_nettype none
@@ -137,15 +143,14 @@ module pe_ctrl #(
   localparam [5:0] OP_UWAIT = 6'd31, OP_EVT = 6'd32, OP_HOST = 6'd33, OP_PAR = 6'd34;
 
   // ---------------------------------------------------------------- state
-  reg                slot;
+  reg                run_q;  // RUN in the previous cycle: the word at pc is fetched
   reg  [       15:0] r        [0:7];
   reg                z, c, to, db;
   reg  [   AW-1:0]   stack    [0:STACK_DEPTH-1];
   reg  [   SP_W-1:0] sp;
   reg  [STALL_W-1:0] stall;
 
-  wire               ready = run & ~slot & (stall == {STALL_W{1'b0}});
-  assign im_raddr = pc;
+  wire               ready = run & run_q & (stall == {STALL_W{1'b0}});
 
   // --------------------------------------------------------------- decode
   wire [5:0] opcode;
@@ -506,11 +511,14 @@ module pe_ctrl #(
   wire [SP_W-1:0] sp_dec = sp - 1'b1;
   wire [AW-1:0] pc_n = !done ? pc : pop ? stack[sp_dec[SI_W-1:0]] : jump ? target : pc_inc;
 
+  // Pipelined fetch: address IMEM with the pc of the next cycle.
+  assign im_raddr = restart ? start_pc : ready ? pc_n : pc;
+
   // ------------------------------------------------------------ registers
   integer i;
   always @(posedge clk) begin
     if (rst) begin
-      slot    <= 1'b0;
+      run_q   <= 1'b0;
       pc      <= {AW{1'b0}};
       z       <= 1'b0;
       c       <= 1'b0;
@@ -521,7 +529,7 @@ module pe_ctrl #(
       blocked <= 1'b0;
       for (i = 0; i < 8; i = i + 1) r[i] <= 16'd0;
     end else begin
-      slot <= ~slot;
+      run_q <= run;
       if (db_set) db <= 1'b1;
       else if (ready && db_clr) db <= 1'b0;
       if (restart) begin
@@ -530,7 +538,7 @@ module pe_ctrl #(
         c       <= 1'b0;
         to      <= 1'b0;
         sp      <= {SP_W{1'b0}};
-        stall   <= {{(STALL_W - 1) {1'b0}}, 1'b1};
+        stall   <= {STALL_W{1'b0}};
         blocked <= 1'b0;
         for (i = 0; i < 8; i = i + 1) r[i] <= 16'd0;
       end else if (ready) begin
@@ -566,7 +574,8 @@ module pe_ctrl #(
   // ------------------------------------------------------------ formal
   // im_rdata, pins, FIFO flags, grants and all environment inputs are FREE,
   // so these hold for ANY program in ANY environment.
-  // * No effect without an issue; issues are at least 2 cycles apart.
+  // * No effect without an issue. Fetch: pc is always the previous cycle's
+  //   im_raddr (so im_rdata = IMEM[pc]); no issue unless RUN was 1 before.
   // * A blocked instruction has no side effects, keeps pc and flags, loads no
   //   stall; only wait / fget / fput / ld / st / ustart / uwait / evt can block.
   // * FIFO, DMEM requests only when allowed (never pop empty, never lose an
@@ -576,7 +585,7 @@ module pe_ctrl #(
   //   the pc after the matching `call` (one solver-chosen level is tracked).
   // * A solver-chosen register changes only on a write that targets it.
   // * pc: stays while blocked; pc+1 unless jump / pop. Stall counts down by 1.
-  // * restart: pc = start_pc, state cleared, stall = 1.
+  // * restart: pc = start_pc, state cleared, stall = 0.
 `ifdef PE_CTRL_TOP
   initial assume (rst);
 `endif
@@ -662,10 +671,10 @@ module pe_ctrl #(
 
   always @(posedge clk) begin
     if (f_past_ok && f_ok) begin
-      if ($past(ready)) assert (!ready);
-      assert (slot == !$past(slot));
+      assert (pc == $past(im_raddr));
+      if (ready) assert ($past(run));
       if ($past(restart)) begin
-        assert (pc == $past(start_pc) && stall == 1 && sp == 0 && !z && !c && !to && !blocked);
+        assert (pc == $past(start_pc) && stall == 0 && sp == 0 && !z && !c && !to && !blocked);
         assert (r[f_ri] == 16'd0);
       end else if ($past(ready)) begin
         assert (pc == $past(pc_n) && z == $past(z_n) && c == $past(c_n) && to == $past(to_n));

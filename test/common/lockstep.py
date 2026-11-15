@@ -62,7 +62,7 @@ class Lockstep:
         rx_on = lambda m: m.rx.busy      # noqa: E731
         h = [
             ("ctrl.pc", c.pc, lambda m: m.ctrl.pc, always),
-            ("ctrl.slot", c.slot, lambda m: m.ctrl.slot, always),
+            ("ctrl.run_q", c.run_q, lambda m: m.ctrl.run_q, always),
             ("ctrl.z", c.z, lambda m: m.ctrl.z, always),
             ("ctrl.c", c.c, lambda m: m.ctrl.c, always),
             ("ctrl.to", c.to, lambda m: m.ctrl.to, always),

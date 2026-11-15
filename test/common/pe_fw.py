@@ -16,12 +16,11 @@ Every program has the same shape:
 4. host irq       Report the result, and go back to the idle loop.
 
 The hardware does the bits and the firmware does the rules. The controller runs one instruction per
-2 clock cycles (42 ns at 48 MHz), far too slow to time the bits of a fast protocol, so the units
-time them. The firmware decides what happens between packets: START, STOP, ACK, error checks.
+clock cycle (21 ns at 48 MHz), too slow to time the bits of a fast protocol, so the units time them. The firmware decides what happens between packets: START, STOP, ACK, error checks.
 
 Conventions
 -----------
-* Timing: an instruction takes 2 cycles. delay(n) or dly=n takes 2 * ceil((n + 1) / 2) in total.
+* Timing: an instruction takes 1 cycle. delay(n), or any instruction with dly=n, takes n + 1 in total.
 * The host talks to a DMEM-driven program through DMEM: it writes a request, writes DOORBELL, and
   gets the IRQ when the result is there. Each program's docstring gives its DMEM map.
 * Carry as a result: several subroutines return C = 1 for "something else happened". cmp(x, 0)
@@ -132,7 +131,7 @@ def uart_ex(txd=0, rxd=1, B=112, N=9, K=1, S=12, bits=8, parity=PAR_NONE, stop_b
     Break: a frame of all zeros with a bad stop bit counts in dmem[2] and raises the
     controller IRQ. A doorbell sends a break of dmem[3] bit times (> 0), between frames.
     The start bit is timed by the instruction stream, because a word with parity or 9
-    bits comes from a register, not the FIFO: with an odd B it is B + 1 cycles long."""
+    bits comes from a register, not the FIFO."""
     # Registers: r0 the word being sent or received. r1 scratch: second FIFO byte, DMEM pointer, break length.
     # r2 parity test. r5 break count, kept in dmem[2]. r6 parity error count, kept in dmem[1].
     # Unlike uart(), a word with parity or 9 bits comes from a register, so the start bit is timed by instructions.
@@ -185,10 +184,10 @@ def uart_ex(txd=0, rxd=1, B=112, N=9, K=1, S=12, bits=8, parity=PAR_NONE, stop_b
         elif parity != PAR_SPACE:
             a.jmp("tx_go", pm).or_(0, pbit)
             a.L("tx_go")
-    # Start bit, by instruction timing: set takes 2 cycles, delay(B - 3) takes B - 2 for an even B.
+    # Start bit, by instruction timing: set takes 1 cycle, delay(B - 2) takes B - 1.
     a.evt(I.DET_TX, I.EV_CLR)
     a.set(txd, I.SRC_1 if inv else I.SRC_0)      # start bit: the next ustart is B cycles later
-    a.delay(B - 3)
+    a.delay(B - 2)
     a.ustart(I.M_TX, I.R(0))
     a.evt(I.DET_TX, I.EV_ARM)                    # deferred to after the stop edge
     # RX side: a bad stop bit goes to ferr, a bad parity bit to p_bad, and only a good frame reaches RXF.
@@ -221,8 +220,8 @@ def uart_ex(txd=0, rxd=1, B=112, N=9, K=1, S=12, bits=8, parity=PAR_NONE, stop_b
     # send a break, then the stop time (ETX re-arms on the idle level)
     a.L("brk").dbclr().mov(1, 3).ld(1, 1).evt(I.DET_TX, I.EV_CLR)
     a.set(txd, I.SRC_1 if inv else I.SRC_0)
-    # One bit time a pass: delay(B - 4) takes B - 2 for an even B, and djnz takes 2.
-    a.L("brl").delay(B - 4).djnz(1, "brl")
+    # One bit time a pass: delay(B - 2) takes B - 1, and djnz takes 1.
+    a.L("brl").delay(B - 2).djnz(1, "brl")
     a.set(txd, I.SRC_0 if inv else I.SRC_1)
     a.evt(I.DET_TX, I.EV_ARM).jmp("rx_chk")
     return a
@@ -233,9 +232,11 @@ SPI_PINS = dict(sck=2, mosi=3, miso=4, cs=5)
 
 
 def _cs_time(a, B):
-    """CS lead and lag: at least half an SCK period, after CS falls and before it rises."""
-    if B // 2 > 3:
-        a.delay(B // 2 - 3)
+    """CS lead and lag: at least half an SCK period, after CS falls and before it rises.
+    The lead: set(cs, dly=1) takes 2 cycles, and delay(n) n + 1."""
+    n = (B + 1) // 2 - 3
+    if n >= 0:
+        a.delay(n)
     return a
 
 
@@ -365,8 +366,8 @@ def spi_master_stream(B=4, cpol=0, cpha=0, msb=1, sdly=3, sck=2, mosi=3, miso=4,
     """SPI master with no gap between bytes (TX and RX CHAIN), DMEM-driven: dmem[0] = n,
     dmem[1..n] = data; the replies go to dmem[0x80..]. dmem[0x7F] = 0 ok, 1 the firmware fell
     behind and SCK paused, 2 a reply was lost (RXF overran, or the host took a byte from it).
-    A pass that refills TXF and empties RXF takes 18 cycles, so any length runs with no pause
-    at B >= 3; at B = 2 only short streams do. Whatever happens, the firmware ends and raises the
+    A pass that refills TXF and empties RXF takes 9 cycles, and a byte at B = 2 lasts 16, so any
+    length runs with no pause. Whatever happens, the firmware ends and raises the
     IRQ: once TX is idle it does not wait for a reply that is not there.
     Owners: SCK, MOSI -> TX unit."""
     # Registers: r0 byte out. r1 pointer to the data. r2 bytes left to send. r3 pointer to the replies.
@@ -393,7 +394,7 @@ def spi_master_stream(B=4, cpol=0, cpha=0, msb=1, sdly=3, sck=2, mosi=3, miso=4,
     _cs_time(a, B).ustart(I.M_BOTH)
     a.cmp(2, 0).jmp("drain", I.Z)
     # While bytes are left to send, the last reply cannot have come: no test of r5 or r2 here
-    # Main loop: empty RXF, refill TXF. This pass is what limits the speed: 18 cycles for one of each.
+    # Main loop: empty RXF, refill TXF. This pass is what limits the speed: 9 cycles for one of each.
     a.L("run").fget(4, I.FIFO_RX, nb=1).jmp("no_rx", I.C)
     a.st(4, 3, inc=1).sub(5, 1)
     a.L("no_rx").jmp("late", I.TXU_IDLE).jmp("run", I.TXF_FULL)
@@ -483,8 +484,9 @@ def spi_slave_3wire(cpol=0, cpha=0, msb=1, sck=2, dio=3, cs=5):
     # Write: every byte goes to RXF until CS rises.
     a.L("wl").ustart(I.M_RX).call("rx1").jmp("end", I.C)
     a.fput(0, I.FIFO_RX).jmp("wl")
-    # the master drives until it has seen its last bit out: take the pin only after that
-    a.L("read").wait(sck, cpol).delay(10).setoe(dio, 1)
+    # The master drives until it has seen its last bit out: take the pin only after that. About 32 cycles
+    # from the command byte's RXRDY: the 9 instructions before this one, and the delay.
+    a.L("read").wait(sck, cpol).delay(21).setoe(dio, 1)
     # Read: every byte comes from TXF. An empty FIFO sends 0xFF.
     a.L("rl").mov(0, 0xFF).fget(0, I.FIFO_TX, nb=1)
     a.ustart(I.M_TX, I.R(0))
@@ -559,7 +561,7 @@ def i2c_master(B=126, scl=6, sda=7, odly=None, sdly=2, addr10=False, arb=False, 
              STOP and reports 3. Written bits are clocked by firmware, not by the units, because
              a unit would keep driving the rest of its byte: B >= 48.
              SDA low may be another master's transfer, so bus clear starts only if SDA low and SCL
-             high last, with no change, for `stuck` passes of a 3-instruction loop (about 8 ms).
+             high last, with no change, for `stuck` passes of a 6-cycle loop (about 8 ms).
     hs_B     HS mode: the master code at B (F/S speed), which nobody acknowledges, then a repeated
              START, and all data bytes at hs_B. ACK clocks stay at F/S length, which is legal."""
     # Registers
@@ -669,7 +671,7 @@ def i2c_master(B=126, scl=6, sda=7, odly=None, sdly=2, addr10=False, arb=False, 
     if arb:
         # SDA low with a request waiting. It is stuck only if nothing moves for this long.
         a.L("low").mov(5, stuck)
-        a.L("ll").jpin(sda, 1, "idle").jpin(scl, 0, "idle").djnz(5, "ll")
+        a.L("ll").jpin(sda, 1, "idle").jpin(scl, 0, "idle").djnz(5, "ll", dly=3)
     # Bus clear (3.1.16). The STOP resets a device that was in the middle of a byte.
     a.L("clr").mov(5, 9)
     a.L("cl").set(scl, I.SRC_0).delay(H).set(scl, I.SRC_1).wait(scl, 1).delay(H)
@@ -726,7 +728,8 @@ def i2c_master(B=126, scl=6, sda=7, odly=None, sdly=2, addr10=False, arb=False, 
         # high. SDA is read here: another controller may end the phase at any moment. hi2: it ends
         # after H, or as soon as another controller pulls SCL low, and then SCL goes low. Uses r6.
         a.L("hi1").set(scl, I.SRC_1).wait(scl, 1).ret()
-        a.L("hi2").mov(6, max(1, H // 2)).wait(scl, 0, rd=6).set(scl, I.SRC_0).delay(Q).ret()
+        # wait with a time-out: one try a cycle, so r6 = k gives k + 1 cycles
+        a.L("hi2").mov(6, 2 * (H // 2) + 2).wait(scl, 0, rd=6).set(scl, I.SRC_0).delay(Q).ret()
     # read into r0; r5 = 0 -> ACK, 1 -> NACK
     if arb:
         # Subroutine rbyte, multi-master: 8 SCL clocks by firmware, SDA read at the start of each high phase.
@@ -821,7 +824,7 @@ def i2c_slave(addr=0x42, scl=6, sda=7, addr10=None, general_call=False, hold=0):
     # Read: hold SCL low while the byte is set up, then release it and let the master clock it out.
     a.L("rd").ld(0, 3, inc=1)
     a.ustart(I.M_TX, I.R(0))                                    # bit 7 now, then on SCL falls
-    a.delay(60)                                                 # tr(max) + tSU;DAT = 1250 ns (Table 11 note 4)
+    a.delay(62)                                                 # tr(max) + tSU;DAT = 1250 ns (Table 11 note 4)
     a.set(scl, I.SRC_1)                                         # the data is ready: release
     a.uwait(I.M_TX)
     a.set(sda, I.SRC_1)                                         # release for the master ACK
@@ -913,9 +916,12 @@ def _rx_go(a, jp):
     a.wait(jp, 1).evt(I.DET_RX, I.EV_ARM).ustart(I.M_RX)
 
 
-def _tx_on(a, jp, kp):
+def _tx_on(a, jp, kp, turn=0):
     # Drive the bus and send the sync. CHAIN then takes the next bytes from TXF.
-    a.setoe(jp, 1).setoe(kp, 1).ustart(I.M_TX, USB_SYNC)
+    # `turn` extra cycles first: a small one rides in the dly field and costs no IMEM word.
+    if turn > 6:
+        a.delay(turn)
+    a.setoe(jp, 1).setoe(kp, 1, dly=turn + 1 if 0 < turn <= 6 else 0).ustart(I.M_TX, USB_SYNC)
 
 
 def _next_crc(r, poly, bit=1):
@@ -950,8 +956,8 @@ def usb_device(B=4, jp=0, kp=1, turn=None):
     #   r4 CRC value, RX status      r5 UD_INLEN, then a time-out count
     #   r6 the PID, 0 if none came   r7 our address
     if turn is None:
-        turn = 0 if B <= 8 else 3 * B
-    wait_h = max(1, (33 * B // 2 - 14) // 4)                # handshake: give up before 18 bit times
+        turn = 6 if B <= 8 else 3 * B + 9                   # the answer at least 2 bit times after the EOP
+    wait_h = max(1, (33 * B // 2 - 7) // 2)                 # handshake: give up before 18 bit times
     a = Asm()
     # Setup, and ETX as the suspend timer: it fires after USB_IDLE cycles of J. It only sets a flag, for the host.
     _usb_setup(a, B, jp, kp)
@@ -1000,9 +1006,7 @@ def usb_device(B=4, jp=0, kp=1, turn=None):
     a.L("rle0").urd(4, I.CRC, I.CRC_VAL)
     _crc_good(a, CRC16_RES, CRC16_DRIB, "rc2", "idle")
     a.L("rc2").urd(4, I.RX, I.RX_STAT).and_(4, I.RX_ST_SERR).jmp("idle", I.NZ)
-    if turn:
-        a.delay(turn)
-    _tx_on(a, jp, kp)
+    _tx_on(a, jp, kp, turn)
     a.call("hsend")
     # At full speed the last byte can reach the FIFO just before the EOP, and the loop above leaves
     # as soon as it sees the EOP. The CRC unit has it already, so answer first and store it now.
@@ -1016,13 +1020,11 @@ def usb_device(B=4, jp=0, kp=1, turn=None):
     # IN: answer within 6.5 bit times. Sync goes out first; it is the same for both
     # answers, and it gives the time to decide and to set up the CRC.
     a.L("in_tok")
-    if turn:
-        a.delay(turn)
-    _tx_on(a, jp, kp)
+    _tx_on(a, jp, kp, turn)
     # r5 = UD_INLEN, the PID and the data. 0 means nothing is ready: NAK.
     a.cmp(5, 0).jmp("nak", I.Z)
-    # INIT is written 8 cycles after the sync started: the bits already gone do not count.
-    _crc_tx(a, skip=16 - (8 // B + 1))
+    # INIT takes effect 5 cycles after the sync started (4-6 all work): the bits already gone do not count.
+    _crc_tx(a, skip=16 - (5 // B + 1))
     # Data: PID, then the bytes. The chain must not run dry: the loop is far faster than the bytes go out.
     a.mov(3, UD_INPID).ld(0, 3).fput(0, I.FIFO_TX)
     a.mov(3, UD_INDATA).sub(5, 1).jmp("txe", I.Z)
@@ -1044,7 +1046,7 @@ def usb_device(B=4, jp=0, kp=1, turn=None):
     a.L("nak").mov(3, UD_INHS).ld(1, 3).call("hsend").jmp("idle")
     # A packet shorter than a token, or a bus reset: SE0 still there after 2 us (the limit is 2.5).
     a.L("t_bad").cmp(6, 0).jmp("idle", I.NZ)
-    a.delay(70).jpin(jp, 1, "idle").mov(0, EV_RESET)
+    a.delay(81).jpin(jp, 1, "idle").mov(0, EV_RESET)
     # Every event ends here: tell the host what happened.
     a.L("ev").mov(3, UD_EVENT).st(0, 3).host_irq().jmp("idle")
     return a
@@ -1065,9 +1067,9 @@ def usb_host(B=4, jp=0, kp=1, gap=None, timeout=None):
     #   r3 DMEM pointer               r4 CRC value, RX status
     #   r5 count, time-out            r6 UH_DPID (0 for an IN), also the high byte of a count
     if gap is None:
-        gap = max(0, 4 * B - 24)        # >= 2 bit times after SE0 ends, measured from SE0
+        gap = max(7, 4 * B - 15)        # >= 2 bit times after SE0 ends, measured from SE0
     if timeout is None:
-        timeout = max(1, (35 * B // 2 - 30 - B) // 4)    # the answer must start before 18 bit times
+        timeout = max(1, (35 * B // 2 - 15 - B) // 2)    # the answer must start before 18 bit times
     a = Asm()
     _usb_setup(a, B, jp, kp)
     # Wait for the doorbell, then branch on UH_OP. Each operation ends at fin0.
@@ -1078,12 +1080,12 @@ def usb_host(B=4, jp=0, kp=1, gap=None, timeout=None):
     # Bus reset: SE0 for n * 256 cycles, and then the end of an EOP.
     a.call("gn")
     a.set(jp, I.SRC_0).setoe(jp, 1).setoe(kp, 1)
-    a.L("rl").delay(252).djnz(5, "rl")                           # 256 cycles a turn
+    a.L("rl").delay(254).djnz(5, "rl")                           # 256 cycles a turn
     a.jmp("rel")
     # Keep-alive, or the end of a resume: SE0 for 2 bit times, then J for 1 bit, then release.
     a.L("keep").set(jp, I.SRC_0).setoe(jp, 1).setoe(kp, 1)
-    a.L("eop").delay(2 * B - 6)
-    a.L("rel").set(jp, I.SRC_1).delay(max(0, B - 3)).setoe(jp, 0).setoe(kp, 0).jmp("fin0")
+    a.L("eop").delay(2 * B - 3)
+    a.L("rel").set(jp, I.SRC_1).delay(max(0, B - 2)).setoe(jp, 0).setoe(kp, 0).jmp("fin0")
     # Subroutine: the 16-bit count from UH_N and UH_N + 1, into r5.
     a.L("gn").mov(3, UH_N).ld(5, 3, inc=1).ld(6, 3).shl(6, 8).or_(5, I.R(6)).ret()
     # resume: K, then the EOP that "keep" ends with. J to K changes two pins: only a TX unit
@@ -1094,7 +1096,7 @@ def usb_host(B=4, jp=0, kp=1, gap=None, timeout=None):
     a.ucfg(I.ETX_U, I.D_AFTER, I.A_NONE)
     a.setoe(jp, 1).setoe(kp, 1)                                  # J, as the pull-ups had it
     a.ustart(I.M_TX, 0).uwait(I.M_TX)
-    a.L("rk").delay(252).djnz(5, "rk")
+    a.L("rk").delay(254).djnz(5, "rk")
     a.ucfg(I.TX, I.TX_LINE, I.tx_line(nrzi=1, eop=1, diff=1, d2pin=kp, stuffn=6))
     a.ucfg(I.TX, I.TX_FRAME, I.tx_frame(chain=1))
     a.ucfg(I.ETX_U, I.D_AFTER, I.A_RELEASE)

@@ -10,14 +10,15 @@ wires from the testbench. test_cross.py runs the same firmware between the RTL a
 Tests
 -----
 UART
-1. test_uart_odd_b           uart_ex with B = 35 and 417: the line stays on the bit grid.
+1. test_uart_odd_b           uart_ex with B = 35 and 417: the line stays on the bit grid, start bit exactly B.
 2. test_uart_break_rx        a long low line counts one break, with an IRQ; a 0x00 frame with a good
                              stop bit does not, nor does a bad stop bit with data.
 3. test_uart_break_tx        a doorbell sends a break of n bit times, and frames still work after it.
 SPI
 4. test_spi_stream           CHAIN master: 40 bytes at B = 4 in all modes, SCK with no pause.
 5. test_spi_stream_fast      9 bytes at B = 2 (24 MHz), SCK with no pause; 126 bytes at B = 3 (16 MHz)
-                             in all modes, no pause; 126 bytes at B = 2, where SCK may pause, data intact.
+                             in all modes, no pause; 126 bytes at B = 2, no pause either (a firmware
+                             pass is 9 cycles, a byte 16).
    test_spi_stream_lost      error on purpose: the firmware is stopped mid-stream and RXF overruns.
                              It reports status 2 and raises the IRQ, instead of hanging.
 6. test_spi_3wire_master     one data pin: write, then read, against a Spi3Slave; no contention.
@@ -94,7 +95,7 @@ async def test_uart_odd_b(dut):
         data = [0x55, 0xA3, 0x00, 0xFF]
         assert await chip.transfer(data, n_rx=len(data), limit=40000) == data, B
         await ClockCycles(dut.clk, 2 * B)
-        wire = uart.decode_ex(chip.trace(0, t0), B, 9, start=B + 1)
+        wire = uart.decode_ex(chip.trace(0, t0), B, 9, start=B)                       # start bit exactly B, odd or even
         assert [w & 0xFF for w in wire] == data, (B, wire)
         await chip.bus.write(R.RUN, 0)
 
@@ -199,7 +200,7 @@ async def test_spi_stream_fast(dut):
     for mode in range(4):
         await stream(dut, 2, 9, mode)
         await stream(dut, 3, 126, mode)
-    # 126 bytes at 24 MHz: the firmware cannot keep up all the way, so SCK may pause, but no byte is lost
+    # 126 bytes at 24 MHz: a pass of the firmware (9 cycles) is shorter than a byte (16), so SCK never pauses
     chip = await fresh(dut, pe_fw.spi_master_stream(B=2).words(), R.owner_map(p2=R.OWN_TX, p3=R.OWN_TX))
     up = [random.getrandbits(8) for _ in range(126)]
     dev = spi.SpiSlave(SCK, MOSI, MISO, CS, tx=list(up))
@@ -211,7 +212,7 @@ async def test_spi_stream_fast(dut):
     await chip.bus.write(R.DOORBELL, 0)
     await wait_irq(chip, "stream B=2")
     st = (await chip.bus.dmem_read(0x7F, 1))[0]
-    assert st in (0, 1), f"status {st}"
+    assert st == 0, f"status {st}: SCK paused"
     dut._log.info(f"stream B=2, 126 bytes: status {st}")
     assert dev.rx == down and await chip.bus.dmem_read(0x80, 126) == up
     await chip.bus.write(R.RUN, 0)

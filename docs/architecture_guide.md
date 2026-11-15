@@ -12,7 +12,7 @@ A protocol such as UART, SPI, I2C or USB has two parts:
 The chip splits the work the same way:
 
 - **Small hardware units do the bits.** They know nothing about any protocol. A unit is told "send 8 bits, 4 cycles each, with these options" and it does so with exact timing.
-- **A small processor does the rules, in firmware.** It runs one instruction every 2 cycles (42 ns at 48 MHz), far too slow to time fast bits itself. It only has to act between packets.
+- **A small processor does the rules, in firmware.** It runs one instruction per cycle (21 ns at 48 MHz), too slow to time fast bits itself. It only has to act between packets.
 
 So UART, SPI, I2C and USB are all just different programs. No block in the hardware is specific to one of them. The closest are generic options such as NRZI coding or a CRC register, which firmware can switch on.
 
@@ -124,9 +124,9 @@ This is what the assembler in `test/common/pe_isa.py` does. In firmware it is wr
 
 ### 3.3 Timing
 
-- **Every instruction takes 2 cycles.** The memory read takes one cycle and execution the next.
-- **A delay** of `n` extra cycles takes `2 × ceil((n + 1) / 2)` in total, so delays round up to an even number.
-- **A blocked instruction** has no effect and is tried again every 2 cycles. `wait`, `uwait`, `evt wait`, and `fget` or `fput` when the FIFO is empty or full all block. This is how firmware idles: there is no halt instruction.
+- **Every instruction takes 1 cycle.** The memory read takes a cycle, but it overlaps with execution: while one instruction executes, the next one is fetched (section 4.4).
+- **A delay** of `n` extra cycles takes `n + 1` in total.
+- **A blocked instruction** has no effect and is tried again every cycle. `wait`, `uwait`, `evt wait`, and `fget` or `fput` when the FIFO is empty or full all block. This is how firmware idles: there is no halt instruction.
 
 ### 3.4 The instructions
 
@@ -230,13 +230,14 @@ The host's register map (Section 5.3). It holds RUN, the pin configuration and t
 
 ### 4.3 `pe_imem` (5,152): the program
 
-160 words of 32 bits, one write port for the host and one read port for the controller. The read is registered: the word arrives one cycle after the address, which is why an instruction takes 2 cycles. The 32 extra flip-flops are that output register. It is built from flip-flops; a latch version exists but is not verified (`docs/area.md`).
+160 words of 32 bits, one write port for the host and one read port for the controller. The read is registered: the word arrives one cycle after the address, so the controller sends the address of the *next* instruction (section 4.4). The 32 extra flip-flops are that output register. It is built from flip-flops; a latch version exists but is not verified (`docs/area.md`).
 
 ### 4.4 `pe_ctrl` (194) and `pe_decode` (0): the processor
 
 `pe_decode` is pure logic that splits a word into its fields. `pe_ctrl` does everything else:
 
-- **Issue:** a `slot` bit alternates each cycle, and an instruction can only start in one of the two. This is the 2-cycle rhythm.
+- **Fetch:** while an instruction executes, IMEM is addressed with the pc it leads to: pc + 1, a jump target, a return address, or the same pc if it blocks. The next word is ready one cycle later on every path, so one instruction issues per cycle with no bubble after a jump. The only cycle lost is the first fetch after RUN rises (`run_q`).
+- **Issue:** when RUN is 1 (and was 1 the cycle before) and the stall counter is 0.
 - **Execute:** all effects happen in one cycle, called E: registers, pins, FIFOs and unit commands.
 - **Block:** if an instruction cannot finish, it has no effect at all and is retried, so a blocked `fget` can never half-happen. A blocked `wait` with a timeout is the one exception: it counts its register down.
 - **Stall:** `dly` or `delay` loads the stall counter.
@@ -486,7 +487,7 @@ These cannot be accessed directly, apart from what the status registers show. Th
 
 | Module | Registers |
 |---|---|
-| `pe_ctrl` | `pc`, `r[0:7]`, `z c to db`, `stack`, `sp`, `stall`, `slot`, `blocked` |
+| `pe_ctrl` | `pc`, `r[0:7]`, `z c to db`, `stack`, `sp`, `stall`, `run_q`, `blocked` |
 | `pe_txu` | `sh` shift register, `idx` bit index, `o` cycle within the bit, `sw swc` stretch wait, `sp` sample tick pending, `lvl` last NRZI level, `ones` 1s in a row, `eph` EOP phase, `crc_pkt` sending the CRC, `lf` LEAD state, `eprev` last level of the external clock pin |
 | `pe_rxu` | `sh` shift register, `od` word to drive, `data_q` held word, `nbits` bits taken, `wcnt` cycles to the next sample, `wins` windows started, `tq oq` delay lines, `lp` last NRZI sample, `hunting hz` sync hunt, `rones` 1s in a row, `serr` stuff error, `rxrdy`, `overrun`, `eprev iprev` last pin levels |
 | `pe_vote` | `running`, `sel`, `n_l k_l s_l` latched settings, `idx`, `ones`, `scnt` |

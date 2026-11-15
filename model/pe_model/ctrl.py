@@ -4,10 +4,13 @@ ctrl: the controller (pe_ctrl + pe_decode, docs/spec/isa.md, docs/spec/blocks.md
 
 What this file does
 -------------------
-One instruction stream. A slot bit alternates every cycle and an instruction may
-only issue in slot 0 with the stall counter at 0. comb() computes everything the
-instruction does in this cycle from the current state and inputs; clock() applies
-it. A blocked instruction has no effect (only a timed `wait` counts rd down).
+One instruction stream, one instruction per cycle. An instruction issues when RUN
+is 1 and was 1 in the cycle before (run_q) and the stall counter is 0. The fetch is
+pipelined: IMEM (registered read) is addressed with the next pc (fetch_addr), so
+the word for pc is always ready. comb() computes everything the instruction does in
+this cycle from the current state and inputs; clock() applies it. A blocked
+instruction has no effect (only a timed `wait` counts rd down) and retries in the
+next cycle.
 """
 
 OP_NOP, OP_JMP, OP_DJNZ, OP_CALL, OP_RET = 0, 1, 2, 3, 4
@@ -33,11 +36,11 @@ class Ctrl:
         self.reset()
 
     def reset(self):
-        self.slot = self.pc = self.z = self.c = self.to = self.db = self.sp = self.stall = self.blocked = 0
+        self.run_q = self.pc = self.z = self.c = self.to = self.db = self.sp = self.stall = self.blocked = 0
         self.r = [0] * 8
 
     def ready(self, run):
-        return bool(run and not self.slot and self.stall == 0)
+        return bool(run and self.run_q and self.stall == 0)
 
     def _cond(self, code, s):
         table = (1, self.z, self.z ^ 1, self.c, self.c ^ 1, self.to, self.to ^ 1, s["erx"], s["erx"] ^ 1,
@@ -248,17 +251,23 @@ class Ctrl:
         e["done"] = done
         return e
 
-    def clock(self, rst, restart, start_pc, db_set, e):
+    def fetch_addr(self, restart, start_pc, e):
+        """IMEM read address this cycle: the pc of the next cycle."""
+        if restart:
+            return start_pc
+        return e["nxt"]["pc"] if e["ready"] else self.pc
+
+    def clock(self, rst, run, restart, start_pc, db_set, e):
         if rst:
             self.reset()
             return
-        self.slot ^= 1
+        self.run_q = int(bool(run))
         if db_set:
             self.db = 1
         elif e["db_clr"] and e["ready"]:
             self.db = 0
         if restart:
-            self.pc, self.z, self.c, self.to, self.sp, self.stall, self.blocked = start_pc, 0, 0, 0, 0, 1, 0
+            self.pc, self.z, self.c, self.to, self.sp, self.stall, self.blocked = start_pc, 0, 0, 0, 0, 0, 0
             self.r = [0] * 8
         elif e["ready"]:
             n = e["nxt"]

@@ -24,6 +24,9 @@ Tests
 10. test_pc_past_imem        pc and IMEM_ADDR past IMEM_DEPTH: nops, wrap to 0, writes ignored.
 11. test_protocol_switches   what the host and firmware can read shows the features of each
                              protocol present or absent, as built (blocks.md Section 13).
+12. test_one_instruction_per_cycle  the pipelined fetch: one instruction a cycle in straight
+                             code, through a taken branch, call and ret, and a blocked wait
+                             retries every cycle (seen on the pins, cycle by cycle).
 """
 
 import sys
@@ -379,3 +382,72 @@ async def test_protocol_switches(dut):
     got = [await bus.read(R.RXF), await bus.read(R.RXF)]
     assert got == ([0xFF, 0xFF] if pe_build.has("usb") else [0, 0]), got
     await bus.write(R.RUN, 0)
+
+
+def edges(trace, lvl):
+    """Cycles where the trace goes to `lvl`."""
+    return [i + 1 for i, (x, y) in enumerate(zip(trace, trace[1:])) if x != y and y == lvl]
+
+
+@cocotb.test()
+async def test_one_instruction_per_cycle(dut):
+    async def run(a, cycles=120):
+        chip = Chip(dut)
+        await chip.reset()
+        await chip.bus.load_program(a.words())
+        await chip.bus.start()
+        await ClockCycles(dut.clk, cycles)
+        await chip.bus.write(R.RUN, 0)
+        return chip
+
+    def spacing(chip, n, period, what):
+        falls = edges(chip.trace(0), 0)
+        assert len(falls) == n, f"{what}: {len(falls)} falling edges, expected {n}"
+        gaps = {y - x for x, y in zip(falls, falls[1:])}
+        assert gaps == {period}, f"{what}: falling edges {gaps} cycles apart, expected {period}"
+
+    # 1. Straight code: set 0, set 1, ... toggles the pin every cycle.
+    a = Asm().set(0, I.SRC_1).setoe(0, 1)
+    for _ in range(20):
+        a.set(0, I.SRC_0).set(0, I.SRC_1)
+    idle(a)
+    spacing(await run(a), 20, 2, "straight code")
+
+    # 2. A taken branch costs one cycle, like any instruction: set, set, djnz = 3 cycles a turn.
+    a = Asm().set(0, I.SRC_1).setoe(0, 1).mov(1, 10)
+    a.L("l").set(0, I.SRC_0).set(0, I.SRC_1).djnz(1, "l")
+    idle(a)
+    spacing(await run(a), 10, 3, "djnz loop")
+
+    # 3. call and ret: set 0, call | set 1, ret | djnz = 5 cycles a turn, low for 2 of them.
+    a = Asm().set(0, I.SRC_1).setoe(0, 1).mov(1, 10)
+    a.L("l").set(0, I.SRC_0).call("f").djnz(1, "l")
+    idle(a)
+    a.L("f").set(0, I.SRC_1).ret()
+    chip = await run(a)
+    spacing(chip, 10, 5, "call / ret loop")
+    rises = edges(chip.trace(0), 1)
+    falls = edges(chip.trace(0), 0)
+    lows = [min(r for r in rises if r > f) - f for f in falls]
+    assert lows == [2] * 10, f"set 0 and call: low for {lows} cycles, expected 2"
+
+    # 4. A blocked instruction retries every cycle: the time from an input edge to the answer is
+    # the same on whichever cycle the edge comes (with an issue every 2 cycles it would alternate).
+    lat = set()
+    for k in range(4):
+        chip = Chip(dut)
+        await chip.reset()
+        chip.drive[1] = 0
+        a = Asm().set(0, I.SRC_0).setoe(0, 1).wait(1, 1).set(0, I.SRC_1)
+        idle(a)
+        await chip.bus.load_program(a.words())
+        await chip.bus.start()
+        await ClockCycles(dut.clk, 30 + k)
+        t0 = len(chip.samples)
+        chip.drive[1] = 1
+        await ClockCycles(dut.clk, 20)
+        rise = edges(chip.trace(0), 1)
+        assert rise, f"edge {k}: the wait never ended"
+        lat.add(rise[-1] - t0)
+        await chip.bus.write(R.RUN, 0)
+    assert len(lat) == 1, f"wait answers after {sorted(lat)} cycles: not one try a cycle"

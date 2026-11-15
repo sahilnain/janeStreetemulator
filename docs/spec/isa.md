@@ -37,7 +37,7 @@ Shared resources: TX FIFO, RX FIFO (8-bit entries), data memory (256 × 8), pin 
 
 The host starts and stops the controller with the RUN register, as in v1. The controller has no halt instruction: idle firmware loops, typically blocked in `wait`, `uwait`, `evt wait` or `fget`.
 
-**Timing.** The front end is unchanged from v1 (registered IMEM read, 2 slots). Each instruction takes **2 cycles**. A delay of d extra cycles is rounded up to whole slots: cost = 2·ceil((d+1)/2). Blocking instructions retry every 2 cycles until their condition is met: `wait`, `fget`/`fput` on an empty or full FIFO, `ustart TX` on an empty TX FIFO, `uwait`, and `evt wait`.
+**Timing.** Each instruction takes **1 cycle**: the IMEM read is registered, and the fetch is pipelined (the next pc is fetched while an instruction executes). A delay of d extra cycles costs exactly d + 1. Blocking instructions retry every cycle until their condition is met: `wait`, `fget`/`fput` on an empty or full FIFO, `ustart TX` on an empty TX FIFO, `uwait`, and `evt wait`.
 
 ## 2. Instruction word (32 bits)
 

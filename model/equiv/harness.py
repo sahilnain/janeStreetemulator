@@ -374,7 +374,7 @@ def ctrl(op, IMEM_DEPTH=160, NUM_PINS=8, STACK_DEPTH=4):
     def build(ob):
         g = lambda n: S(r.now(n))  # noqa: E731
         m = Ctrl(cfg)
-        m.slot, m.pc, m.z, m.c, m.to, m.db = g("slot"), g("pc"), g("z"), g("c"), g("to"), g("db")
+        m.run_q, m.pc, m.z, m.c, m.to, m.db = g("run_q"), g("pc"), g("z"), g("c"), g("to"), g("db")
         m.sp, m.stall, m.blocked = g("sp"), g("stall"), g("blocked")
         m.r = SymList([r.now(f"r[{i}]") for i in range(8)])
         m.stack = SymList([r.now(f"stack[{i}]") for i in range(STACK_DEPTH)])
@@ -395,7 +395,7 @@ def ctrl(op, IMEM_DEPTH=160, NUM_PINS=8, STACK_DEPTH=4):
             read_args.append(("dm_addr", addr))
             return g("dm_rdata")
 
-        out = dict(im_raddr=m.pc, pc=m.pc, z_o=m.z, c_o=m.c, to_o=m.to, db_o=m.db, blocked=m.blocked)
+        out = dict(pc=m.pc, z_o=m.z, c_o=m.c, to_o=m.to, db_o=m.db, blocked=m.blocked)
         e = m.comb(g("run"), g("im_rdata"), s, rd, dm)
         for k in ("txf_rd", "rxf_rd", "txf_wr", "rxf_wr", "dm_we", "cfg_we", "rd_strobe", "start_mask",
                   "stop_mask", "det_clr", "det_arm", "det_disarm", "host_irq"):
@@ -415,8 +415,9 @@ def ctrl(op, IMEM_DEPTH=160, NUM_PINS=8, STACK_DEPTH=4):
                  ("out po_val", V(e["ov"]) & V(e["om"]) != r.now("po_val") & r.now("po_mask"))]
         # what the model read from data memory or a unit: the same address as the RTL drives
         extra += [(f"read {k}", V(v) != r.now(k)) for k, v in read_args]
-        m.clock(g("rst"), g("restart"), g("start_pc"), g("db_set"), e)
-        nxt = dict(slot=m.slot, pc=m.pc, z=m.z, c=m.c, to=m.to, db=m.db, sp=m.sp, stall=m.stall, blocked=m.blocked)
+        out["im_raddr"] = m.fetch_addr(g("restart"), g("start_pc"), e)
+        m.clock(g("rst"), g("run"), g("restart"), g("start_pc"), g("db_set"), e)
+        nxt = dict(run_q=m.run_q, pc=m.pc, z=m.z, c=m.c, to=m.to, db=m.db, sp=m.sp, stall=m.stall, blocked=m.blocked)
         nxt.update({f"r[{i}]": m.r[i] for i in range(8)})
         nxt.update({f"stack[{i}]": m.stack[i] for i in range(STACK_DEPTH)})
         extra.append(ob.inv("sp <= depth", z3.And(V(m.sp) >= 0, V(m.sp) <= STACK_DEPTH)))

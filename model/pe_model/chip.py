@@ -141,7 +141,8 @@ class Chip:
 
         # ---- clock edge
         self.host.clock(rst, din, op, stb, r_rdata)
-        self.imem.clock(rc["im_we"], rc["im_waddr"], rc["im_wdata"], self.ctrl.pc)
+        self.imem.clock(rc["im_we"], rc["im_waddr"], rc["im_wdata"],
+                        self.ctrl.fetch_addr(restart, self.regs.start_pc, e))
         if rc["dm_acc"]:
             self.dmem.clock(rc["dm_we"], rc["dm_addr"], rc["dm_wdata"])
         else:
@@ -169,7 +170,7 @@ class Chip:
                          a_e["po_mask"], a_e["po_val"]),
                         (r["wm"], r["wv"], 0, 0), tx_busy, rx_busy, self.regs.owner, rc["owner_clr"], uio_in,
                         self.regs.filt)
-        self.ctrl.clock(rst, restart, self.regs.start_pc, rc["db_set"], e)
+        self.ctrl.clock(rst, self.regs.run, restart, self.regs.start_pc, rc["db_set"], e)
         self.regs.clock(rst, h, rc, e["ill"], e["stk"], underrun, e["host_irq"])
         self.rst_q = [1 - (rst_n & 1), self.rst_q[0]]
         self.cycle += 1
