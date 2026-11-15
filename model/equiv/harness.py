@@ -179,7 +179,7 @@ def fifo(W=8, DEPTH=8):
 
 
 # ------------------------------------------------------------------ pe_imem
-def imem(IW=32, DEPTH=160):
+def imem(IW=29, DEPTH=162):
     r = Rtl("pe_imem", dict(IW=IW, DEPTH=DEPTH, IMPL=0))
 
     def build(ob):
@@ -312,7 +312,7 @@ def host_if():
 
 
 # ------------------------------------------------------------------ pe_regs
-def regs(IMEM_DEPTH=160, NUM_PINS=8, protos=None):
+def regs(IMEM_DEPTH=162, NUM_PINS=8, protos=None):
     params, flags, tag = build(protos, ("i2c",))
     r = Rtl("pe_regs", dict(IMEM_DEPTH=IMEM_DEPTH, NUM_PINS=NUM_PINS, FIFO_CW=4, **params))
     cfg = Config(imem_depth=IMEM_DEPTH, num_pins=NUM_PINS, **flags)
@@ -354,7 +354,7 @@ def decode_ob():
 
     def build(ob):
         d = decode(S(r.now("ir")))
-        return dict(opcode=d["op"], dly=d["dly"], fa=d["a"], fi=d["i"], fb=d["b"], imm=d["imm"]), {}, []
+        return dict(opcode=d["op"], fa=d["a"], fi=d["i"], fb=d["b"], imm=d["imm"]), {}, []
 
     return Ob("pe_decode", r, build)
 
@@ -363,11 +363,11 @@ def decode_ob():
 CTRL_OPS = list(range(5)) + list(range(6, 35))  # every legal opcode; None = the illegal ones
 
 
-def ctrl(op, IMEM_DEPTH=160, NUM_PINS=8, STACK_DEPTH=4):
+def ctrl(op, IMEM_DEPTH=162, NUM_PINS=8, STACK_DEPTH=4):
     """One obligation per opcode. op=None covers the illegal opcodes (5 and above 34)."""
     r = Rtl("pe_ctrl", dict(IMEM_DEPTH=IMEM_DEPTH, NUM_PINS=NUM_PINS, STACK_DEPTH=STACK_DEPTH))
     cfg = Config(imem_depth=IMEM_DEPTH, num_pins=NUM_PINS, stack_depth=STACK_DEPTH)
-    code = r.now("im_rdata", 26, 6)
+    code = r.now("im_rdata", 23, 6)
     sp = r.now("sp")
     asm = [code == op if op is not None else z3.Or(code == 5, z3.UGT(code, 34)), z3.ULE(sp, STACK_DEPTH)]
 

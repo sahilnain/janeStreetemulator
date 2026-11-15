@@ -162,7 +162,7 @@ async def test_uart_8bit_compat(dut):
         words = a.words()
         # patch the two FRAME writes to the new length
         for i, w in enumerate(words):
-            if w >> 26 == I.OP["ucfg"] and (w >> 16) & 7 == 2:
+            if w >> 23 == I.OP["ucfg"] and (w >> 16) & 7 == 2:
                 hold = w & 2
                 words[i] = (w & ~0xFFFF) | hold | (bits << 4)
         chip = Chip(dut)
@@ -253,7 +253,7 @@ async def test_tx_inv_spi(dut):
     a = pe_fw.spi_master(B=4, sdly=2)
     words = a.words()
     for i, w in enumerate(words):
-        if w >> 26 == I.OP["ucfg"] and (w >> 20) & 7 == I.TX and (w >> 16) & 7 == I.TX_FRAME:
+        if w >> 23 == I.OP["ucfg"] and (w >> 20) & 7 == I.TX and (w >> 16) & 7 == I.TX_FRAME:
             words[i] = w | 4
     await chip.bus.load_program(words)
     await chip.bus.owners(R.owner_map(p2=R.OWN_TX, p3=R.OWN_TX))

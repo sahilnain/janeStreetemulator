@@ -40,7 +40,7 @@ def clog2(x):
 
 @dataclass
 class Config:
-    imem_depth: int = 160
+    imem_depth: int = 162
     dmem_depth: int = 256
     fifo_depth: int = 8
     stack_depth: int = 4

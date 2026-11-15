@@ -20,8 +20,8 @@
  * effect at all and is retried at E+1 (wait, fget/fput, ld/st, ustart,
  * uwait, evt wait). A blocked `wait` with a timeout still counts rd down.
  *
- * Stall: `dly` d (plus op2 for `delay`) loads the stall counter, which
- * counts down every cycle; the next issue is at E + 1 + d.
+ * Stall: `delay` n loads the stall counter with n, which counts down every
+ * cycle; the next issue is at E + 1 + n.
  *
  * restart (host RESTART): pc <- start_pc, registers/flags/stack cleared.
  * IMEM is addressed with start_pc in the same cycle, so the first word is
@@ -52,7 +52,7 @@ module pe_ctrl #(
 
     // instruction memory
     output wire [AW-1:0] im_raddr,
-    input  wire [  31:0] im_rdata,
+    input  wire [  28:0] im_rdata,
 
     // pins: CTRL write port of pe_pins, synchronised inputs
     output reg  [NUM_PINS-1:0] pw_mask,
@@ -125,7 +125,7 @@ module pe_ctrl #(
     output reg           blocked
 );
 
-  localparam STALL_W = 17;
+  localparam STALL_W = 16;
   localparam SP_W = $clog2(STACK_DEPTH + 1);
   localparam SI_W = (STACK_DEPTH > 1) ? $clog2(STACK_DEPTH) : 1;
   localparam integer STACK_DEPTH_I = STACK_DEPTH;
@@ -154,7 +154,7 @@ module pe_ctrl #(
 
   // --------------------------------------------------------------- decode
   wire [5:0] opcode;
-  wire [2:0] dly, fa, fb, rs_i;
+  wire [2:0] fa, fb, rs_i;
   wire       fi, lvl, illegal;
   wire [15:0] imm;
   wire [4:0] cond;
@@ -166,7 +166,6 @@ module pe_ctrl #(
   ) u_decode (
       .ir     (im_rdata),
       .opcode (opcode),
-      .dly    (dly),
       .fa     (fa),
       .fi     (fi),
       .fb     (fb),
@@ -481,8 +480,7 @@ module pe_ctrl #(
     end
 
     if (done)
-      stall_n = {{(STALL_W - 3) {1'b0}}, dly} +
-                ((opcode == OP_DELAY) ? {{(STALL_W - 16) {1'b0}}, op2} : {STALL_W{1'b0}});
+      stall_n = (opcode == OP_DELAY) ? op2 : {STALL_W{1'b0}};
     else stall_n = {STALL_W{1'b0}};
 
     // Gate every effect with the issue condition.

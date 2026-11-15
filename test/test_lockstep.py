@@ -94,7 +94,6 @@ def rand_program(rng, safe):
     words = 0
     tgt = lambda: rng.randrange(DEPTH)                                             # noqa: E731
     pin = lambda: rng.randrange(8) if rng.random() < 0.95 else rng.randrange(16)   # noqa: E731
-    dly = lambda: rng.randrange(8) if rng.random() < 0.25 else 0                   # noqa: E731
     reg = lambda: rng.randrange(8)                                                 # noqa: E731
     op2 = lambda: I.R(reg()) if rng.random() < 0.4 else rng.getrandbits(16)        # noqa: E731
     small = lambda: I.R(reg()) if False else rng.randrange(64)                     # noqa: E731
@@ -109,65 +108,65 @@ def rand_program(rng, safe):
             idx = rng.randrange(n_idx)
             if safe:
                 a.ustop(I.M_BOTH)
-            a.ucfg(u, idx, rand_cfg_value(rng, u, idx), dly=dly())
+            a.ucfg(u, idx, rand_cfg_value(rng, u, idx))
         elif k == "ustart":
-            a.ustart(rng.randrange(4), None if rng.random() < 0.4 else rng.getrandbits(16), dly=dly())
+            a.ustart(rng.randrange(4), None if rng.random() < 0.4 else rng.getrandbits(16))
         elif k == "uwait":
-            a.uwait(rng.randrange(4), dly=dly())
+            a.uwait(rng.randrange(4))
         elif k == "ustop":
-            a.ustop(rng.randrange(4), dly=dly())
+            a.ustop(rng.randrange(4))
         elif k == "urd":
-            a.urd(reg(), rng.randrange(6), rng.randrange(3), dly=dly())
+            a.urd(reg(), rng.randrange(6), rng.randrange(3))
         elif k == "evt":
-            a.evt(rng.getrandbits(1), rng.randrange(5), dly=dly())
+            a.evt(rng.getrandbits(1), rng.randrange(5))
         elif k == "set":
-            a.set(pin(), rng.randrange(4), dly=dly())
+            a.set(pin(), rng.randrange(4))
         elif k == "setoe":
-            a.setoe(pin(), rng.getrandbits(1), dly=dly())
+            a.setoe(pin(), rng.getrandbits(1))
         elif k == "wait":
             if rng.random() < 0.8:
                 a.mov(1, rng.randrange(40))
-                a.wait(pin(), rng.getrandbits(1), rd=1, dly=dly())
+                a.wait(pin(), rng.getrandbits(1), rd=1)
             else:
-                a.wait(pin(), rng.getrandbits(1), dly=dly())
+                a.wait(pin(), rng.getrandbits(1))
         elif k == "jpin":
-            a.jpin(pin(), rng.getrandbits(1), tgt(), dly=dly())
+            a.jpin(pin(), rng.getrandbits(1), tgt())
         elif k == "jmp":
-            a.jmp(tgt(), rng.randrange(32), dly=dly())
+            a.jmp(tgt(), rng.randrange(32))
         elif k == "djnz":
-            a.djnz(reg(), tgt(), dly=dly())
+            a.djnz(reg(), tgt())
         elif k == "call":
-            a.call(tgt(), dly=dly())
+            a.call(tgt())
         elif k == "ret":
-            a.ret(dly=dly())
+            a.ret()
         elif k == "delay":
-            a.delay(small(), dly=dly())
+            a.delay(small())
         elif k == "alu":
-            a.alu(rng.choice(("mov", "add", "sub", "and_", "or_", "xor", "cmp")), reg(), op2(), dly=dly())
+            a.alu(rng.choice(("mov", "add", "sub", "and_", "or_", "xor", "cmp")), reg(), op2())
         elif k == "shift":
-            (a.shl if rng.getrandbits(1) else a.shr)(reg(), rng.randrange(16), dly=dly())
+            (a.shl if rng.getrandbits(1) else a.shr)(reg(), rng.randrange(16))
         elif k == "par":
-            a.par(reg(), dly=dly())
+            a.par(reg())
         elif k == "rdpins":
-            a.rdpins(reg(), dly=dly())
+            a.rdpins(reg())
         elif k == "bitin":
-            a.bitin(reg(), pin(), rng.getrandbits(1), dly=dly())
+            a.bitin(reg(), pin(), rng.getrandbits(1))
         elif k == "bitout":
-            a.bitout(pin(), reg(), rng.getrandbits(1), dly=dly())
+            a.bitout(pin(), reg(), rng.getrandbits(1))
         elif k == "fget":
-            a.fget(reg(), rng.getrandbits(1), rng.getrandbits(1), dly=dly())
+            a.fget(reg(), rng.getrandbits(1), rng.getrandbits(1))
         elif k == "fput":
-            a.fput(reg(), rng.getrandbits(1), rng.getrandbits(1), dly=dly())
+            a.fput(reg(), rng.getrandbits(1), rng.getrandbits(1))
         elif k == "ld":
-            a.ld(reg(), reg(), rng.getrandbits(1), dly=dly())
+            a.ld(reg(), reg(), rng.getrandbits(1))
         elif k == "st":
-            a.st(reg(), reg(), rng.getrandbits(1), dly=dly())
+            a.st(reg(), reg(), rng.getrandbits(1))
         elif k == "host":
-            a.host_irq(dly=dly()) if rng.getrandbits(1) else a.dbclr(dly=dly())
+            a.host_irq() if rng.getrandbits(1) else a.dbclr()
         elif k == "nop":
-            a.nop(dly=dly())
+            a.nop()
         else:
-            a.raw((rng.choice(I.RESERVED_OPS) << 26) | rng.getrandbits(26))
+            a.raw((rng.choice(I.RESERVED_OPS) << 23) | rng.getrandbits(23))
         words = len(a.words())
         assert words > n0
     w = a.words()[:DEPTH - 1]

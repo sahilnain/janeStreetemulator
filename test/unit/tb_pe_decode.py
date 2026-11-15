@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-tb_pe_decode: unit test for src/core/pe_decode.v (32-bit word).
+tb_pe_decode: unit test for src/core/pe_decode.v (29-bit word).
 
 What is checked
 ---------------
@@ -21,10 +21,10 @@ AW = param("AW", 6)
 
 
 def ref(w):
-    return dict(opcode=w >> 26, dly=(w >> 23) & 7, fa=(w >> 20) & 7, fi=(w >> 19) & 1,
+    return dict(opcode=w >> 23, fa=(w >> 20) & 7, fi=(w >> 19) & 1,
                 fb=(w >> 16) & 7, imm=w & 0xFFFF, cond=(w >> 11) & 0x1F,
                 target=w & ((1 << AW) - 1), pin=(w >> 12) & 0xF, lvl=(w >> 11) & 1, rs=w & 7,
-                illegal=int((w >> 26) in I.RESERVED_OPS))
+                illegal=int((w >> 23) in I.RESERVED_OPS))
 
 
 async def check(dut, w):
@@ -38,16 +38,16 @@ async def check(dut, w):
 async def all_opcodes(dut):
     for op in range(64):
         for _ in range(8):
-            await check(dut, (op << 26) | random.getrandbits(26))
+            await check(dut, (op << 23) | random.getrandbits(23))
 
 
 @cocotb.test()
 async def random_words(dut):
     for _ in range(5000):
-        await check(dut, random.getrandbits(32))
+        await check(dut, random.getrandbits(29))
 
 
 @cocotb.test()
 async def field_extremes(dut):
-    for w in [0, 0xFFFFFFFF] + [1 << i for i in range(32)] + [~(1 << i) & 0xFFFFFFFF for i in range(32)]:
+    for w in [0, 0x1FFFFFFF] + [1 << i for i in range(29)] + [~(1 << i) & 0x1FFFFFFF for i in range(29)]:
         await check(dut, w)

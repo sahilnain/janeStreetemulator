@@ -1,5 +1,5 @@
 # pe_decode (combinational): every field is the documented slice, and exactly
-# the reserved opcodes are illegal. Exhaustive over all 32-bit words.
+# the reserved opcodes are illegal. Exhaustive over all 29-bit words.
 [tasks]
 aw6
 aw10

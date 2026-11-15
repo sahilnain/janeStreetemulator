@@ -31,7 +31,7 @@ Controller state:
 | `ETX`, `ERX` | 1 + 1 | sticky event flags of the TX and RX event detectors |
 | `DB` | 1 | host doorbell (set by a host register write) |
 | return stack | STACK_DEPTH × AW (default 4) | for `call` / `ret` |
-| stall counter | 17 bits | loaded by the delay field and `delay`: up to 7 + 65535 cycles |
+| stall counter | 16 bits | loaded by `delay`: up to 65535 extra cycles |
 
 Shared resources: TX FIFO, RX FIFO (8-bit entries), data memory (256 × 8), pin fabric.
 
@@ -39,20 +39,21 @@ The host starts and stops the controller with the RUN register, as in v1. The co
 
 **Timing.** Each instruction takes **1 cycle**: the IMEM read is registered, and the fetch is pipelined (the next pc is fetched while an instruction executes). A delay of d extra cycles costs exactly d + 1. Blocking instructions retry every cycle until their condition is met: `wait`, `fget`/`fput` on an empty or full FIFO, `ustart TX` on an empty TX FIFO, `uwait`, and `evt wait`.
 
-## 2. Instruction word (32 bits)
+## 2. Instruction word (29 bits)
 
 ```
- 31      26 25  23 22  20 19 18  16 15                              0
-┌──────────┬──────┬──────┬──┬──────┬─────────────────────────────────┐
-│  opcode  │ dly  │  A   │I │  B   │              imm16              │
-└──────────┴──────┴──────┴──┴──────┴─────────────────────────────────┘
-     6        3      3    1    3                  16
+ 28      23 22  20 19 18  16 15                              0
+┌──────────┬──────┬──┬──────┬─────────────────────────────────┐
+│  opcode  │  A   │I │  B   │              imm16              │
+└──────────┴──────┴──┴──────┴─────────────────────────────────┘
+     6        3    1    3                  16
 ```
+
+The host loads a word as 4 bytes (`IMEM_DATA` 0x10-0x13, low byte first); bits 31:29 of the last byte are not stored. There is no delay field: a pause after an instruction is a separate `delay`.
 
 | Field | Use |
 |---|---|
 | `opcode` | 64 opcodes: 34 used, 30 reserved |
-| `dly` | 0–7 extra stall cycles after the instruction (as in v1) |
 | `A` | destination/source register `rd`/`rs`, or unit id / unit mask |
 | `I` | 1: the operand is `imm16`. 0: the operand is register `rs = imm16[2:0]` |
 | `B` | sub-field: sub-op, second register `ra`, or config register index |
@@ -66,7 +67,7 @@ The host starts and stops the controller with the RUN register, as in v1. The co
 
 | Op | Mnemonic | Fields | Operation |
 |---|---|---|---|
-| 0 | `nop` | — | nothing (plus `dly`) |
+| 0 | `nop` | — | nothing |
 | 1 | `jmp [cond,] target` | cond = imm[15:11], target = imm[9:0] | if cond: pc ← target |
 | 2 | `djnz rd, target` | A = rd | rd ← rd − 1; if rd ≠ 0: pc ← target |
 | 3 | `call target` | target = imm[9:0] | push pc + 1; pc ← target |
@@ -261,17 +262,20 @@ There is a gap of a few instructions between bytes (SCK pauses); SPI allows this
 
 **I2C master, write one byte, read ACK, STOP.**
 ```asm
-        set   SDA, 0      dly 7        ; START: SDA falls while SCL is high
+        set   SDA, 0
+        delay 7                        ; START: SDA falls while SCL is high
         set   SCL, 0                   ; (both units idle, so the controller may drive)
         ustart TX|RX                   ; TX: 8 SCL clocks; RX: 8 bits out on SDA (from TX FIFO)
         uwait TX|RX
         setoe SDA, 0                   ; release SDA for the ACK
-        set   SCL, 1      dly 7        ; 9th clock high
+        set   SCL, 1
+        delay 7                        ; 9th clock high
         jpin  SDA, 1, nack             ; read ACK
         set   SCL, 0
         ...                            ; next byte, or:
 stop:   set   SDA, 0
-        set   SCL, 1      dly 7
+        set   SCL, 1
+        delay 7
         set   SDA, 1                   ; STOP: SDA rises while SCL is high
 ```
 
@@ -294,7 +298,7 @@ Ethernet remains open: Manchester (10BASE-T) at 20 Mbaud half-bits is 2.5 cycles
 
 | v1 | v2 |
 |---|---|
-| 24-bit word, 5-bit opcode | 32-bit word, 6-bit opcode |
+| 24-bit word, 5-bit opcode | 29-bit word, 6-bit opcode, no delay field |
 | 2 time-sliced contexts | 1 controller |
 | ctr0/ctr1, OSR/ISR per context | r0–r7, return stack, TX/RX units |
 | `out`/`in`/`vote` bit loops | one packet per `ustart` (bit loops still possible with `bitin`/`bitout`) |

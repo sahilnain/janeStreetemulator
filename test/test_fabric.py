@@ -136,7 +136,7 @@ async def test_every_pin_controller(dut):
         mask = 1 << p
         chip = Chip(dut)
         await chip.reset()
-        a = Asm().setoe(p, 1, dly=7).L("l").set(p, I.SRC_0, dly=7).set(p, I.SRC_1, dly=7).jmp("l")
+        a = Asm().setoe(p, 1).delay(6).L("l").set(p, I.SRC_0).delay(6).set(p, I.SRC_1).delay(6).jmp("l")
         await chip.bus.load_program(a.words())
         await chip.bus.start()
         seen = set()
@@ -327,7 +327,7 @@ async def test_erx_arm_pending(dut):
     rx_cfg(a, 1)
     a.ustart(I.M_RX).evt(I.DET_RX, I.EV_ARM)        # RX is busy: the arm waits
     a.urd(0, I.ERX_U, 0).fput(0, I.FIFO_RX)
-    a.uwait(I.M_RX).nop(dly=3)
+    a.uwait(I.M_RX).delay(3)
     a.urd(0, I.ERX_U, 0).fput(0, I.FIFO_RX)         # RX is idle: armed
     idle(a)
     await chip.bus.load_program(a.words())

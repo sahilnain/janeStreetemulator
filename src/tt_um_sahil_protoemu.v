@@ -43,7 +43,8 @@ module tt_um_sahil_protoemu (
 );
 
   // ------------------------------------------------- configuration
-  localparam IMEM_DEPTH = 160;  // USB device firmware is about 150 words; revisit in the area pass
+  localparam IMEM_DEPTH = 162;  // the USB device firmware is 162 words at full speed
+  localparam IW = 29;  // instruction word: [28:23] op [22:20] A [19] I [18:16] B [15:0] imm
   localparam IMEM_IMPL = 0;  // 0 = flops, 1 = latches
   localparam DMEM_DEPTH = 256;
   localparam FIFO_DEPTH = 8;
@@ -102,7 +103,8 @@ module tt_um_sahil_protoemu (
   // ------------------------------------------------------- signals
   wire im_we;
   wire [AW-1:0] im_waddr, im_raddr;
-  wire [31:0] im_wdata, im_rdata;
+  wire [31:0] im_wdata;  // the host stages 4 bytes; IMEM keeps the low IW bits
+  wire [IW-1:0] im_rdata;
 
   wire h_txf_wr, h_rxf_rd, txf_full, txf_empty, txf_overrun, txf_clr;
   wire rxf_full, rxf_empty, rxf_overrun, rxf_clr;
@@ -288,14 +290,14 @@ module tt_um_sahil_protoemu (
 
   // ------------------------------------------------- memories
   pe_imem #(
-      .IW   (32),
+      .IW   (IW),
       .DEPTH(IMEM_DEPTH),
       .IMPL (IMEM_IMPL)
   ) u_imem (
       .clk  (clk),
       .we   (im_we),
       .waddr(im_waddr),
-      .wdata(im_wdata),
+      .wdata(im_wdata[IW-1:0]),
       .raddr(im_raddr),
       .rdata(im_rdata)
   );
@@ -624,7 +626,7 @@ module tt_um_sahil_protoemu (
   );
 
   wire _unused = &{ena, ui_in[7], 1'b0, etx_pend, etx_end, etx_ferr, erx_wm, erx_wv, erx_om, erx_ov,
-                   rx_wv & ~rx_wm};
+                   rx_wv & ~rx_wm, im_wdata[31:IW]};
 
 `ifdef FORMAL
   // ------------------------------------------------------------ formal

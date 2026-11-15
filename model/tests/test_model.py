@@ -7,7 +7,7 @@ What is checked
 These tests check that the model behaves as docs/spec/ says, so that agreement with the
 RTL in test/test_lockstep.py means something.
 1. test_registers_reset    ID, VERSION, RUN and the pin reset state over the host bus.
-2. test_instruction_timing 1 cycle per instruction; dly d and `delay` d cost d + 1.
+2. test_instruction_timing 1 cycle per instruction; `delay` d costs d + 1.
 3. test_tx_times           TX bit i is on the pad during S+1+iB ... S+(i+1)B.
 4. test_tx_nbits_msb       word length and bit order on the pad.
 5. test_rx_vote_majority   the vote takes the majority of the samples between K and N-K.
@@ -67,14 +67,20 @@ def test_registers_reset():
 
 
 def test_instruction_timing():
-    for d, cost in ((0, 1), (1, 2), (2, 3), (3, 4), (7, 8)):
-        a = Asm().setoe(0, 1).L("l").set(0, I.SRC_0, dly=d).set(0, I.SRC_1, dly=d).jmp("l", dly=0)
+    # set 0, set 1, jmp: low 1 cycle, high 2. With delay(d) after each set: low d + 2, high d + 3.
+    for d in (None, 0, 1, 2, 7):
+        a = Asm().setoe(0, 1).L("l").set(0, I.SRC_0)
+        if d is not None:
+            a.delay(d)
+        a.set(0, I.SRC_1)
+        if d is not None:
+            a.delay(d)
+        a.jmp("l")
         _, tr = run(a.words(), cycles=120)
-        low = pin(tr, 0)
-        e = edges(low)[2:6]
-        assert e[1] - e[0] in (cost, cost + 1) and e[3] - e[2] in (cost, cost + 1), (d, e)
-        first = sorted({y - x for x, y in zip(e, e[1:])})
-        assert first[0] == cost, (d, first)
+        e = edges(pin(tr, 0))[2:7]
+        k = 0 if d is None else d + 1
+        runs = [y - x for x, y in zip(e, e[1:])]
+        assert sorted(set(runs)) == [k + 1, k + 2], (d, e)
     a = Asm().setoe(0, 1).set(0, I.SRC_0).delay(100).set(0, I.SRC_1).L("e").jmp("e")
     _, tr = run(a.words(), cycles=200)
     e = edges(pin(tr, 0))

@@ -25,7 +25,7 @@ class ModelError(Exception):
 
 
 def decode(w):
-    return dict(op=w >> 26, dly=(w >> 23) & 7, a=(w >> 20) & 7, i=(w >> 19) & 1, b=(w >> 16) & 7, imm=w & 0xFFFF)
+    return dict(op=(w >> 23) & 0x3F, a=(w >> 20) & 7, i=(w >> 19) & 1, b=(w >> 16) & 7, imm=w & 0xFFFF)
 
 
 class Ctrl:
@@ -232,7 +232,7 @@ class Ctrl:
 
         if done:
             e["wm"], e["wv"], e["om"], e["ov"] = wm, wv, om, ov
-            stall = d["dly"] + (op2 if op == OP_DELAY else 0)
+            stall = op2 if op == OP_DELAY else 0
             if pop:
                 pc = self.stack[self.sp - 1]
             elif jump:

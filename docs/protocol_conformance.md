@@ -152,7 +152,7 @@ Measured response times, in bit times. Each is the range over clock phase and ra
 
 Device NAK and IN data at full speed reach the limit exactly, with no margin.
 
-The firmware still fits IMEM, out of 160 words: device 160 (FS) and 159 (LS), host 158 and 155. **The full-speed device has no spare word left.**
+The firmware still fits IMEM, out of 162 words: device 162 (FS) and 159 (LS), host 159 and 155. **The full-speed device has no spare word left.**
 
 ## 6. Bugs and solutions
 
@@ -252,5 +252,5 @@ Known limits of what is implemented:
 
 - **SCL stuck low is not cleared.** The standard offers only a hardware reset or a power cycle for that case (3.1.16), and the master waits.
 - **Bus clear in the multi-master build** waits about 8 ms before acting. Another controller that pauses for longer than that with SDA low and SCL high could be clocked over.
-- **I2C multi-master with 10-bit addressing does not fit**: 166 words against 160. The other builds fit: single 126, 10-bit 138, multi-master 154, Hs 132, Hs with 10-bit 144.
+- **I2C multi-master with 10-bit addressing does not fit**: 167 words against 162. The other builds fit: single 126, 10-bit 138, multi-master 155, Hs 132, Hs with 10-bit 144.
 - **Bug U13 depended on timing that random tests hit only sometimes.** The phase sweeps now cover it, but other timing races could remain outside what was swept.

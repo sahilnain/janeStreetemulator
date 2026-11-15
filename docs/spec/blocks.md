@@ -20,7 +20,7 @@ Status: implemented, tested and formally proved (see Section 10). Instruction se
 | `pe_regs` | host register map | rewritten (Section 9) |
 | `pe_imem` | instruction memory | unchanged, IW = 32 |
 | `pe_ctrl` | controller: fetch, issue, state, execute | new, built from `pe_core` + `pe_ctx` + `pe_exec` |
-| `pe_decode` | 32-bit instruction decode | rewritten |
+| `pe_decode` | 29-bit instruction decode | rewritten |
 | `pe_txu` | TX unit | new |
 | `pe_rxu` | RX unit (contains `pe_vote`) | new; `pe_vote` unchanged |
 | `pe_det` | event detector, two instances: ETX and ERX | new |
@@ -34,7 +34,7 @@ Top-level parameters (defaults):
 
 | Parameter | Default | Notes |
 |---|---|---|
-| `IMEM_DEPTH` | 160 | ≤ 1024; 160 × 32 = 5120 bits. `pc` and IMEM_ADDR have AW = 8 bits: an address past the end reads as 0 (`nop`) and a write there does nothing, so a runaway `pc` runs to 255 and wraps to 0. Raised from 64 for the I2C master (about 105 words) and from 128 on 2026-11-04 for the USB device firmware (148 words); area to be revisited |
+| `IMEM_DEPTH` | 162 | ≤ 1024; 162 × 29 = 4698 bits (`IW` = 29). `pc` and IMEM_ADDR have AW = 8 bits: an address past the end reads as 0 (`nop`) and a write there does nothing, so a runaway `pc` runs to 255 and wraps to 0. Raised from 64 for the I2C master (about 105 words) and from 128 on 2026-11-04 for the USB device firmware (148 words); area to be revisited |
 | `DMEM_DEPTH` | 256 | ≤ 256; may be reduced if area is short |
 | `FIFO_DEPTH` | 8 | ≤ 15 (FIFO_CNT is 4 bits per FIFO) |
 | `STACK_DEPTH` | 4 | return stack |
@@ -51,12 +51,12 @@ Top-level parameters (defaults):
 ## 2. Controller (`pe_ctrl`, `pe_decode`)
 
 ### 2.1 State
-`pc` (AW bits), `r0`–`r7` (16 bits), flags `Z C TO DB`, return stack (STACK_DEPTH × AW, plus a depth counter), stall counter (17 bits: `dly` plus a 16-bit `delay` operand). The flags `ETX`, `ERX` live in the detectors, and `RXRDY` and `FERR` in the RX unit and ERX. The controller reads them as inputs.
+`pc` (AW bits), `r0`–`r7` (16 bits), flags `Z C TO DB`, return stack (STACK_DEPTH × AW, plus a depth counter), stall counter (16 bits, the `delay` operand). The flags `ETX`, `ERX` live in the detectors, and `RXRDY` and `FERR` in the RX unit and ERX. The controller reads them as inputs.
 
 ### 2.2 Issue timing
 - One stream, pipelined fetch. The cycle in which an instruction executes is called **E**; all its effects are written in E. In E, IMEM is addressed with the next pc (`im_raddr = pc_n`: pc + 1, the jump target, the return address, or pc again when blocked), so the next word arrives in E+1 (registered IMEM read) on every path. The controller **issues up to one instruction per cycle**. Invariant: `pc` equals the previous cycle's `im_raddr`, so `im_rdata` is always IMEM[pc].
 - Start: an instruction issues only if RUN was also 1 in the cycle before (`run_q`), so the first word after RUN rises is fetched once IMEM can no longer be written. RESTART addresses IMEM with START_PC in the same cycle.
-- `dly` d (or `delay`): the next issue is at E + 1 + d.
+- `delay` n: the next issue is at E + 1 + n.
 - **Blocking.** A blocked instruction has no effect, and is retried at E+1, E+2, … until its condition holds. Blocking instructions: `wait`, `fget`/`fput` (empty/full, or lost arbitration), `ld`/`st` (lost arbitration to the host), `ustart` (unit busy, or TX FIFO empty when a byte is needed), `uwait`, `evt wait/waitc`.
 - RUN = 0: no issue. A blocked instruction is abandoned and re-executed when RUN returns to 1. RESTART (host): `pc ← START_PC`; r0–r7, flags, stack and stall counter are cleared; both units are aborted (as `ustop`); both detectors are disarmed and their flags, FERR and RXRDY cleared.
 

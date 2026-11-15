@@ -2,10 +2,10 @@
  * Copyright (c) 2026 Sahil
  * SPDX-License-Identifier: Apache-2.0
  *
- * pe_decode: 32-bit instruction word -> opcode + fields (combinational).
+ * pe_decode: 29-bit instruction word -> opcode + fields (combinational).
  *
  * Word layout (docs/spec/isa.md Section 2):
- *   [31:26] opcode  [25:23] dly  [22:20] A  [19] I  [18:16] B  [15:0] imm16
+ *   [28:23] opcode  [22:20] A  [19] I  [18:16] B  [15:0] imm16
  *
  * Derived fields:
  *   cond   = imm[15:11]   jump condition
@@ -23,9 +23,8 @@
 module pe_decode #(
     parameter AW = 6
 ) (
-    input  wire [  31:0] ir,
+    input  wire [  28:0] ir,
     output wire [   5:0] opcode,
-    output wire [   2:0] dly,
     output wire [   2:0] fa,
     output wire          fi,
     output wire [   2:0] fb,
@@ -38,8 +37,7 @@ module pe_decode #(
     output wire          illegal
 );
 
-  assign opcode = ir[31:26];
-  assign dly    = ir[25:23];
+  assign opcode = ir[28:23];
   assign fa     = ir[22:20];
   assign fi     = ir[19];
   assign fb     = ir[18:16];
@@ -62,7 +60,7 @@ module pe_decode #(
   // Pure wiring: every field is the documented slice of ir, and exactly the
   // reserved opcodes are illegal.
   always @(*) begin
-    assert ({opcode, dly, fa, fi, fb, imm} == ir);
+    assert ({opcode, fa, fi, fb, imm} == ir);
     assert (cond == imm[15:11] && pin == imm[15:12] && lvl == imm[11] && rs == imm[2:0]);
     assert (target == ir[AW-1:0]);
     assert (illegal == !(opcode <= 6'd4 || (opcode >= 6'd6 && opcode <= 6'd34)));

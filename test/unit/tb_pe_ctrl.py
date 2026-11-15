@@ -16,7 +16,7 @@ not gated, so the register file is checked continuously as well.
    so that every opcode (and reserved ones) occurs; the environment (FIFO
    flags and data, grants, unit busy/need, flags, pins, DMEM data, urd data,
    run, restart, doorbell) is random every cycle.
-2. timing: issue spacing is 1 cycle; dly d costs d+1; delay rX loads the
+2. timing: issue spacing is 1 cycle; delay d costs d+1; delay rX loads the
    stall from a register.
 3. restart_run: RESTART loads START_PC and clears state; the word at
    START_PC is fetched in the same cycle; RUN = 0 holds the controller, and
@@ -70,7 +70,7 @@ class Ctrl:
 
     def comb(self, w, e):
         """Outputs and the next-state effects of this cycle."""
-        op, dly, a, fi, b, imm = w >> 26, (w >> 23) & 7, (w >> 20) & 7, (w >> 19) & 1, (w >> 16) & 7, w & 0xFFFF
+        op, a, fi, b, imm = (w >> 23) & 0x3F, (w >> 20) & 7, (w >> 19) & 1, (w >> 16) & 7, w & 0xFFFF
         r = self.r
         op2 = imm if fi else r[imm & 7]
         pin = (imm >> 12) & 0xF
@@ -242,7 +242,7 @@ class Ctrl:
         if ready:
             o.update(fx)
             o["ill_err"], o["stk_err"] = x["ill"], x["stk"]
-        x.update(ready=ready, op=op, a=a, dly=dly, op2=op2, tgt=tgt)
+        x.update(ready=ready, op=op, a=a, op2=op2, tgt=tgt)
         o["im_raddr"] = e["start_pc"] if e["restart"] else (self.next_pc(x) if ready else self.pc)
         return o, x
 
@@ -277,7 +277,7 @@ class Ctrl:
             if x["pop"]:
                 self.stack.pop()
             self.z, self.c, self.to = x["z"], x["c"], x["to"]
-            self.stall = (x["dly"] + (x["op2"] if x["op"] == 6 else 0)) if done else 0
+            self.stall = (x["op2"] if x["op"] == 6 else 0) if done else 0
             self.blocked = int(not done)
             if x["wb"] is not None:
                 self.r[x["wb"][0]] = x["wb"][1]
@@ -302,7 +302,7 @@ def check(dut, o, t, w):
             g &= o["pw_mask"]
         if k == "po_val":
             g &= o["po_mask"]
-        assert g == e, f"t={t} word={w:08x} op={w >> 26}: {k} = {g:#x}, expected {e:#x}"
+        assert g == e, f"t={t} word={w:08x} op={w >> 23}: {k} = {g:#x}, expected {e:#x}"
 
 
 class Harness:
@@ -371,7 +371,6 @@ def rand_word():
         op = random.choice(I.RESERVED_OPS)
     else:
         op = random.choice(list(I.OP.values()))
-    dly = random.choice([0, 0, 0, 1, 2, 7])
     imm = random.getrandbits(16)
     if op == 6:
         imm &= 0x1F                      # keep delays short
@@ -379,7 +378,7 @@ def rand_word():
         imm = (imm & ~0x3FF) | random.randrange(DEPTH)
     if op == 13 or op == 14:
         imm = random.randrange(17) & 0xF
-    w = I.word(op, a=random.randrange(8), i=random.getrandbits(1), b=random.randrange(8), imm=imm, dly=dly)
+    w = I.word(op, a=random.randrange(8), i=random.getrandbits(1), b=random.randrange(8), imm=imm)
     if op == 6 and not (w >> 19) & 1:
         pass                             # delay rX: register values are random -> may be long
     return w
@@ -392,7 +391,7 @@ async def random_programs(dut):
     for _ in range(12):
         prog = [rand_word() for _ in range(DEPTH)]
         # avoid huge register delays: `delay rX` only with an immediate
-        prog = [w | (1 << 19) if (w >> 26) == 6 else w for w in prog]
+        prog = [w | (1 << 19) if (w >> 23) == 6 else w for w in prog]
         h = await Harness(dut, prog).reset()
         e = quiet_env(restart=1, start_pc=0)
         await h.cycle(e)
@@ -422,7 +421,7 @@ async def timing(dut):
     for d in range(8):
         a = I.Asm()
         for _ in range(4):
-            a.nop(dly=d)
+            a.delay(d)
         a.L("e").jmp("e")
         times, _ = await issue_times(dut, a.words(), 80)
         gaps = [y - x for x, y in zip(times, times[1:4])]
@@ -431,10 +430,10 @@ async def timing(dut):
     a = I.Asm().mov(3, 9).delay(I.R(3)).nop().L("e").jmp("e")
     times, _ = await issue_times(dut, a.words(), 60)
     assert times[2] - times[1] == 9 + 1, times
-    # the longest stall: delay 0xFFFF with dly 7 (17-bit stall counter)
-    a = I.Asm().delay(0xFFFF, dly=7).nop().L("e").jmp("e")
-    times, _ = await issue_times(dut, a.words(), 0xFFFF + 7 + 20)
-    assert times[1] - times[0] == 0xFFFF + 7 + 1, times
+    # the longest stall: delay 0xFFFF (16-bit stall counter)
+    a = I.Asm().delay(0xFFFF).nop().L("e").jmp("e")
+    times, _ = await issue_times(dut, a.words(), 0xFFFF + 20)
+    assert times[1] - times[0] == 0xFFFF + 1, times
 
 
 @cocotb.test()

@@ -99,7 +99,7 @@ async def test_open_drain(dut):
     chip = Chip(dut)
     await chip.reset()
     bus = chip.bus
-    a = Asm().L("l").set(2, I.SRC_0, dly=7).set(2, I.SRC_1, dly=7).jmp("l")
+    a = Asm().L("l").set(2, I.SRC_0).delay(6).set(2, I.SRC_1).delay(6).jmp("l")
     await bus.load_program(a.words())
     await bus.write(R.PIN_OD, 0x04)
     await bus.start()

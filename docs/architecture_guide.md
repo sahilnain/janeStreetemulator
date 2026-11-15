@@ -72,7 +72,7 @@ So UART, SPI, I2C and USB are all just different programs. No block in the hardw
 
 | Name | Size | Holds |
 |---|---|---|
-| IMEM | 160 × 32 bits | the firmware |
+| IMEM | 162 × 29 bits | the firmware |
 | DMEM | 256 × 8 bits | requests and results between the host and the firmware |
 | TX FIFO, RX FIFO | 8 × 8 bits each | bytes going to and coming from the units |
 
@@ -82,31 +82,30 @@ So UART, SPI, I2C and USB are all just different programs. No block in the hardw
 
 | Item | Size | Notes |
 |---|---|---|
-| `pc` | 8 bits | 160 words need 8 bits. A pc past the end reads as `nop` |
+| `pc` | 8 bits | 162 words need 8 bits. A pc past the end reads as `nop` |
 | `r0`–`r7` | 16 bits each | general registers, all equal |
 | `Z`, `C` | 1 bit each | zero and carry, set by the ALU |
 | `TO` | 1 bit | a `wait` timed out |
 | `DB` | 1 bit | doorbell from the host |
 | return stack | 4 levels | for `call` and `ret` |
-| stall counter | 17 bits | counts down the delay after an instruction |
+| stall counter | 16 bits | counts down a `delay` |
 
 It also reads flags that live elsewhere: `ETX`, `ERX`, `FERR`, `RXRDY`, and the state of the units and FIFOs.
 
 ### 3.2 The instruction word
 
-Every instruction is 32 bits:
+Every instruction is 29 bits:
 
 ```
- 31      26 25  23 22  20 19 18  16 15                 0
-┌──────────┬──────┬──────┬──┬──────┬────────────────────┐
-│  opcode  │ dly  │  A   │I │  B   │       imm16        │
-└──────────┴──────┴──────┴──┴──────┴────────────────────┘
+ 28      23 22  20 19 18  16 15                 0
+┌──────────┬──────┬──┬──────┬────────────────────┐
+│  opcode  │  A   │I │  B   │       imm16        │
+└──────────┴──────┴──┴──────┴────────────────────┘
 ```
 
 | Field | Meaning |
 |---|---|
 | `opcode` | which instruction. 34 of 64 are used; a reserved one acts as `nop` and sets `ill_err` |
-| `dly` | 0–7 extra cycles after this instruction |
 | `A` | usually the destination register, or a unit number |
 | `I` | 1: the operand is `imm16`. 0: the operand is the register `imm16[2:0]` |
 | `B` | a sub-operation, second register or config register number |
@@ -226,11 +225,11 @@ The address does not increment, so reading a FIFO repeatedly only needs the data
 
 The host's register map (Section 5.3). It holds RUN, the pin configuration and the error flags, and turns accesses into actions: push to a FIFO, write IMEM, ring the doorbell.
 
-**Loading firmware.** A word is 32 bits but the bus carries bytes, so 3 bytes wait in a staging register, and writing the fourth (0x13) stores the whole word and advances the address. A store while RUN = 1 is dropped and sets `imem_err`, so firmware cannot change while it runs.
+**Loading firmware.** A word is 29 bits (sent as 4 bytes; the top 3 bits are dropped) but the bus carries bytes, so 3 bytes wait in a staging register, and writing the fourth (0x13) stores the whole word and advances the address. A store while RUN = 1 is dropped and sets `imem_err`, so firmware cannot change while it runs.
 
 ### 4.3 `pe_imem` (5,152): the program
 
-160 words of 32 bits, one write port for the host and one read port for the controller. The read is registered: the word arrives one cycle after the address, so the controller sends the address of the *next* instruction (section 4.4). The 32 extra flip-flops are that output register. It is built from flip-flops; a latch version exists but is not verified (`docs/area.md`).
+162 words of 29 bits, one write port for the host and one read port for the controller. The read is registered: the word arrives one cycle after the address, so the controller sends the address of the *next* instruction (section 4.4). The 32 extra flip-flops are that output register. It is built from flip-flops; a latch version exists but is not verified (`docs/area.md`).
 
 ### 4.4 `pe_ctrl` (194) and `pe_decode` (0): the processor
 
@@ -240,7 +239,7 @@ The host's register map (Section 5.3). It holds RUN, the pin configuration and t
 - **Issue:** when RUN is 1 (and was 1 the cycle before) and the stall counter is 0.
 - **Execute:** all effects happen in one cycle, called E: registers, pins, FIFOs and unit commands.
 - **Block:** if an instruction cannot finish, it has no effect at all and is retried, so a blocked `fget` can never half-happen. A blocked `wait` with a timeout is the one exception: it counts its register down.
-- **Stall:** `dly` or `delay` loads the stall counter.
+- **Stall:** `delay` loads the stall counter.
 - **Restart:** the host's RESTART loads `pc` from START_PC and clears the registers, flags and stack. It aborts the units and disarms the detectors. Config registers survive.
 
 ### 4.5 `pe_txu` (106): the TX unit

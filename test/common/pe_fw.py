@@ -20,7 +20,7 @@ clock cycle (21 ns at 48 MHz), too slow to time the bits of a fast protocol, so 
 
 Conventions
 -----------
-* Timing: an instruction takes 1 cycle. delay(n), or any instruction with dly=n, takes n + 1 in total.
+* Timing: an instruction takes 1 cycle, and delay(n) takes n + 1.
 * The host talks to a DMEM-driven program through DMEM: it writes a request, writes DOORBELL, and
   gets the IRQ when the result is there. Each program's docstring gives its DMEM map.
 * Carry as a result: several subroutines return C = 1 for "something else happened". cmp(x, 0)
@@ -233,7 +233,7 @@ SPI_PINS = dict(sck=2, mosi=3, miso=4, cs=5)
 
 def _cs_time(a, B):
     """CS lead and lag: at least half an SCK period, after CS falls and before it rises.
-    The lead: set(cs, dly=1) takes 2 cycles, and delay(n) n + 1."""
+    The lead: set(cs) and delay(0) take 2 cycles, and delay(n) n + 1."""
     n = (B + 1) // 2 - 3
     if n >= 0:
         a.delay(n)
@@ -261,7 +261,7 @@ def spi_master_words(B=2, cpol=0, cpha=0, msb=1, sdly=3, bits=16, sck=2, mosi=3,
     a.dbclr()
     # Request: r2 = n from dmem[0], r1 now points at dmem[1]. Then select the device.
     a.mov(1, 0).ld(2, 1, inc=1).mov(3, 0x80)
-    a.set(cs, I.SRC_0, dly=1)
+    a.set(cs, I.SRC_0).delay(0)
     _cs_time(a, B)
     a.L("word")
     # One word: two bytes from DMEM, low first, out and in together. A word over 8 bits comes from a
@@ -305,7 +305,7 @@ def spi_master(B=2, cpol=0, cpha=0, msb=1, sdly=3, sck=2, mosi=3, miso=4, cs=5):
     a.dbclr()
     a.mov(1, 0).ld(2, 1, inc=1)                                 # r2 = n, r1 -> data
     a.mov(3, 0x80)
-    a.set(cs, I.SRC_0, dly=1)
+    a.set(cs, I.SRC_0).delay(0)
     _cs_time(a, B)
     # Each byte: both units start in the same cycle, and the byte received goes to DMEM.
     # SCK pauses for a few instructions between bytes, which SPI allows.
@@ -390,7 +390,7 @@ def spi_master_stream(B=4, cpol=0, cpha=0, msb=1, sdly=3, sck=2, mosi=3, miso=4,
     a.mov(1, 0).ld(2, 1, inc=1).mov(5, I.R(2)).mov(3, 0x80).mov(6, 0)    # r2 tx left, r5 rx left
     a.L("pre").ld(0, 1, inc=1).fput(0, I.FIFO_TX).sub(2, 1).jmp("go", I.Z)
     a.jmp("go", I.TXF_FULL).jmp("pre")
-    a.L("go").set(cs, I.SRC_0, dly=1)
+    a.L("go").set(cs, I.SRC_0).delay(0)
     _cs_time(a, B).ustart(I.M_BOTH)
     a.cmp(2, 0).jmp("drain", I.Z)
     # While bytes are left to send, the last reply cannot have come: no test of r5 or r2 here
@@ -441,7 +441,7 @@ def spi_master_3wire(B=8, cpol=0, cpha=0, msb=1, sdly=3, sck=2, dio=3, cs=5):
     a.mov(1, 0).ld(2, 1, inc=1).ld(5, 1, inc=1).mov(3, 0x80)
     a.ucfg(I.TX, I.TX_PINS, I.tx_pins(dio, 1, sck, 1))
     a.setoe(dio, 1)
-    a.set(cs, I.SRC_0, dly=1)
+    a.set(cs, I.SRC_0).delay(0)
     _cs_time(a, B)
     a.cmp(2, 0).jmp("rd", I.Z)
     # Write phase: the TX unit drives DIO.
@@ -671,7 +671,7 @@ def i2c_master(B=126, scl=6, sda=7, odly=None, sdly=2, addr10=False, arb=False, 
     if arb:
         # SDA low with a request waiting. It is stuck only if nothing moves for this long.
         a.L("low").mov(5, stuck)
-        a.L("ll").jpin(sda, 1, "idle").jpin(scl, 0, "idle").djnz(5, "ll", dly=3)
+        a.L("ll").jpin(sda, 1, "idle").jpin(scl, 0, "idle").delay(2).djnz(5, "ll")
     # Bus clear (3.1.16). The STOP resets a device that was in the middle of a byte.
     a.L("clr").mov(5, 9)
     a.L("cl").set(scl, I.SRC_0).delay(H).set(scl, I.SRC_1).wait(scl, 1).delay(H)
@@ -917,11 +917,10 @@ def _rx_go(a, jp):
 
 
 def _tx_on(a, jp, kp, turn=0):
-    # Drive the bus and send the sync. CHAIN then takes the next bytes from TXF.
-    # `turn` extra cycles first: a small one rides in the dly field and costs no IMEM word.
-    if turn > 6:
+    # Drive the bus and send the sync, `turn` + 1 cycles later if turn > 0. CHAIN then takes the next bytes from TXF.
+    if turn:
         a.delay(turn)
-    a.setoe(jp, 1).setoe(kp, 1, dly=turn + 1 if 0 < turn <= 6 else 0).ustart(I.M_TX, USB_SYNC)
+    a.setoe(jp, 1).setoe(kp, 1).ustart(I.M_TX, USB_SYNC)
 
 
 def _next_crc(r, poly, bit=1):

@@ -26,7 +26,7 @@ class Chip:
         self.rst_q = [1, 1]
         self.host = HostIf()
         self.regs = Regs(cfg)
-        self.imem = Imem(cfg.imem_depth, 32)
+        self.imem = Imem(cfg.imem_depth, 29)
         self.dmem = Dmem(cfg.dmem_depth)
         self.txf = Fifo(cfg.fifo_depth, 8)
         self.rxf = Fifo(cfg.fifo_depth, 8)
