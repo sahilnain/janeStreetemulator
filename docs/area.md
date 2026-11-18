@@ -27,6 +27,8 @@ The core is 902,417 µm². Fill cells cover the rest after routing; they are not
 | Disconnected pins | 0 critical |
 | Magic DRC | 139,714, all inside the SRAM macro; 0 in our logic (Magic's rules do not fit a foundry SRAM layout; the reference SRAM project turns these off too) |
 | Max capacitance / max slew | 1 / 30, at the slow corner |
+| Tiny Tapeout precheck (tt-support-tools `01d5d28`) | all checks pass except KLayout SG13G2 DRC: 1,768 violations (`Sdiod.d`, `Sdiod.e`, `Cnt.c.digibnd`), every one inside the SRAM macro's own cells (`RM_IHPSG13_1P_*`, `RSC_IHPSG13_*`), none in our cells or routing. This is [tt-support-tools issue #190](https://github.com/TinyTapeout/tt-support-tools/issues/190), still open. The Verilog syntax check could not run locally (no `yowasp-yosys`) |
+| IHP KLayout DRC deck with `precheck_drc=true` | **0 violations** on the whole GDS |
 
 | Corner | Setup slack | Hold slack |
 |---|---:|---:|
