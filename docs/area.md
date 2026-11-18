@@ -36,7 +36,7 @@ The core is 902,417 µm². Fill cells cover the rest after routing; they are not
 | Fast, 1.32 V −40 °C | +10.21 ns | +0.10 ns |
 | Slow, 1.08 V 125 °C | **−1.15 ns**, 18 paths | +0.59 ns |
 
-The slow-corner paths all start at the controller's 16-bit `stall` counter and end at ERX config registers: stall == 0 decides whether an instruction issues, which drives the `ucfg` write enable. At the slow corner the chip would run at about 46 MHz. A registered "stall is zero" flag would remove most of that path; it is a controller change, so it waits for the verification work. The SRAM macro has a typical-corner timing library only, which the flow uses at every corner, so its paths at the slow corner are optimistic.
+All 18 slow-corner paths are the one-cycle fetch: they start at `pin_filt[4]` and end at `im_rdata`. The pin input (filtered or not) decides whether a `jpin`, `wait` or conditional jump is taken, that picks the next pc, and the next pc selects one of 162 IMEM words through the 29-bit read multiplexer, all in one cycle; about half the delay is the decision, half the IMEM read. At the slow corner the chip would run at about 46 MHz. The fixes all change the fetch pipeline (`docs/problem_log.md`, Section 7), so this is accepted for now. The SRAM macro has a typical-corner timing library only, which the flow uses at every corner, so its paths at the slow corner are optimistic.
 
 **Flow settings** added in v3 (`src/config.json`):
 - `MACROS`, `PDN_MACRO_CONNECTIONS`, `PDN_CFG` (`src/pdn_cfg.tcl`), the Magic settings: the SRAM macro, as in Tiny Tapeout's SRAM test project.
