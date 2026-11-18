@@ -54,7 +54,12 @@
   "//": "Clock nets without the 2x-spacing rule: with it, global routing never converged (docs/area.md)",
   "CTS_APPLY_NDR": "none",
 
-  "PL_TARGET_DENSITY_PCT": 60,
+  "//": "55, not 60: at 60 OpenROAD CTS (LibreLane 3.0.5) left the clock input of two IMEM clock gates unconnected; the flow's disconnected-pin check catches it if it recurs",
+  "PL_TARGET_DENSITY_PCT": 55,
+
+  "//": "Repair slew and timing again after global routing, with the real wire lengths: without it the slow corner (1.08 V, 125 C) missed setup by 4.2 ns through one long, weakly driven wire",
+  "RUN_POST_GRT_DESIGN_REPAIR": true,
+  "RUN_POST_GRT_RESIZER_TIMING": true,
 
   "//": "CLOCK_PERIOD - Increase this in case you are getting setup time violations.",
   "//": "The value is in nanoseconds, so 20.833ns == 48MHz (exact USB bit times).",

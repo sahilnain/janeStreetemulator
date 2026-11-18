@@ -1,8 +1,50 @@
 # Area
 
-Cell area of the RTL in the process Tiny Tapeout will use, after synthesis and after placement with the clock tree. Routing, hold repair and fill have not been run, so the final number is still to come (see "Does it fit?"). The Python model is not synthesizable, so the RTL stands in for it; the z3 proof and lockstep tests tie the two together.
+Cell area of the RTL in the process Tiny Tapeout will use. The Python model is not synthesizable, so the RTL stands in for it; the z3 proof and lockstep tests tie the two together.
 
-> **v3 (2026-11-17):** DMEM moved from flip-flops to the IHP SRAM macro (`docs/v3_design.md`), and a mailbox and two data movers were added. The numbers below are for the v2 design with memory clock gating, which placed but did not route. The v3 synthesis and place-and-route results will be added here.
+## v3: the full flow to GDS (2026-11-18)
+
+v3 (`docs/v3_design.md`) moved DMEM into the IHP SRAM macro and added the mailbox and the two data movers. It is the first version to go through the whole flow: synthesis, placement, clock tree, routing, fill, sign-off timing, GDS, DRC and LVS. Same flow and config as below (LibreLane 3.0.5, `tt_tool.py --create-user-config --ihp`), with the changes in "Flow settings" further down.
+
+| Stage | v2 (flip-flop DMEM, gated) | v3 (SRAM DMEM) |
+|---|---:|---:|
+| Cell area after synthesis | 580,697 µm² | **476,210 µm²**: 454,257 standard cells, 4,406 for the 162 clock gates, 17,547 the SRAM |
+| Flip-flops | 7,915 | 6,053 |
+| After detailed placement | 604,810 µm², 67.0% of the core | 495,968 µm², 55.0% |
+| After the clock tree | 690,597 µm², 76.5% | 549,146 µm², 60.9% |
+| After routing (with timing repair) | did not route (about 6,000 violations left) | **577,217 µm², 64.0%** |
+
+The core is 902,417 µm². Fill cells cover the rest after routing; they are not counted. Designs route reliably up to about 70–75%, so the practical room left is about 60,000–100,000 µm².
+
+**Sign-off** (final run, `runs/v3e`):
+
+| Check | Result |
+|---|---|
+| Routing DRC | 0 |
+| LVS | clean: 0 errors, 0 device or net differences |
+| Antenna | 0 violations (125 diodes) |
+| Power grid | 0 violations |
+| Disconnected pins | 0 critical |
+| Magic DRC | 139,714, all inside the SRAM macro; 0 in our logic (Magic's rules do not fit a foundry SRAM layout; the reference SRAM project turns these off too) |
+| Max capacitance / max slew | 1 / 30, at the slow corner |
+
+| Corner | Setup slack | Hold slack |
+|---|---:|---:|
+| Typical, 1.2 V 25 °C (the sign-off corner of the Tiny Tapeout flow) | **+6.73 ns** | +0.28 ns |
+| Fast, 1.32 V −40 °C | +10.21 ns | +0.10 ns |
+| Slow, 1.08 V 125 °C | **−1.15 ns**, 18 paths | +0.59 ns |
+
+The slow-corner paths all start at the controller's 16-bit `stall` counter and end at ERX config registers: stall == 0 decides whether an instruction issues, which drives the `ucfg` write enable. At the slow corner the chip would run at about 46 MHz. A registered "stall is zero" flag would remove most of that path; it is a controller change, so it waits for the verification work. The SRAM macro has a typical-corner timing library only, which the flow uses at every corner, so its paths at the slow corner are optimistic.
+
+**Flow settings** added in v3 (`src/config.json`):
+- `MACROS`, `PDN_MACRO_CONNECTIONS`, `PDN_CFG` (`src/pdn_cfg.tcl`), the Magic settings: the SRAM macro, as in Tiny Tapeout's SRAM test project.
+- `CTS_APPLY_NDR` none: with the clock nets' double-spacing rule, global routing never converged.
+- `PL_TARGET_DENSITY_PCT` 55, not 60: at 60, OpenROAD's clock-tree step left the clock input of two IMEM clock gates (rows 89 and 157) unconnected. The same two were lost whatever the clock-tree options; a different placement avoids it. The flow's disconnected-pin check stops the flow if it happens again.
+- `RUN_POST_GRT_DESIGN_REPAIR`, `RUN_POST_GRT_RESIZER_TIMING`: repair slew and timing after global routing, with the real wire lengths. Without them the slow corner missed setup by 4.24 ns, mostly through one long wire driven by a small gate (a 2.7 ns edge). With them: −1.15 ns, and typical went from +5.23 to +6.73 ns.
+
+## v2 numbers
+
+The rest of this file is the v2 design with memory clock gating (DMEM in flip-flops), measured after synthesis and after placement with the clock tree. It placed but did not route.
 
 The target is **6x4 tiles**: a die of 1289.28 × 710.64 µm = 916,220 µm², of which about **902,400 µm² is core** for cells.
 
