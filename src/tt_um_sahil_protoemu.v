@@ -74,6 +74,13 @@ module tt_um_sahil_protoemu (
 `endif
   localparam MEM_CLOCK_GATE = `MEM_CLOCK_GATE;
 
+  // Data memory (docs/spec/blocks.md Section 8): 1 = the IHP SRAM macro (256 x 8), 0 = flip-flops.
+  // Both have a registered read and behave the same. To roll back: -DDMEM_IMPL=0.
+`ifndef DMEM_IMPL
+`define DMEM_IMPL 1
+`endif
+  localparam DMEM_IMPL = `DMEM_IMPL;
+
   localparam AW = (IMEM_DEPTH > 1) ? $clog2(IMEM_DEPTH) : 1;
   localparam FIFO_CW = $clog2(FIFO_DEPTH + 1);
 
@@ -87,7 +94,7 @@ module tt_um_sahil_protoemu (
 
   // --------------------------------------------------- host interface
   wire [7:0] r_addr, r_wdata, r_rdata;
-  wire r_we, r_re, irq;
+  wire r_we, r_re, r_late, irq;
 
   pe_host_if u_host_if (
       .clk    (clk),
@@ -103,6 +110,7 @@ module tt_um_sahil_protoemu (
       .r_we   (r_we),
       .r_re   (r_re),
       .r_rdata(r_rdata),
+      .r_late (r_late),
       .irq    (irq)
   );
 
@@ -131,12 +139,22 @@ module tt_um_sahil_protoemu (
   wire h_dm_acc, h_dm_we;
   wire [7:0] h_dm_addr, h_dm_wdata, dm_rdata;
 
+  // DMEM port and data movers (pe_dmov)
+  wire m_re, m_we, m_txf_wr, m_rxf_rd, txm_busy, rxm_busy;
+  wire [7:0] m_addr, m_wdata, m_txf_wdata;
+  wire [15:0] mv_rd;
+
+  // mailbox
+  wire [2:0] mb_idx;
+  wire [15:0] mb_rdata, mb_wdata;
+  wire mb_we, mb_gnt;
+
   // controller <-> blocks
   wire [NUM_PINS-1:0] c_wm, c_wv, c_om, c_ov;
   wire c_txf_rd, c_rxf_rd, c_txf_wr, c_rxf_wr;
   wire [7:0] c_fdata;
   wire [7:0] c_dm_addr, c_dm_wdata;
-  wire c_dm_we, c_dm_gnt;
+  wire c_dm_we, c_dm_re, c_dm_gnt;
   wire cfg_we;
   wire [2:0] cfg_unit, cfg_idx, rd_unit, rd_idx;
   wire [15:0] cfg_data;
@@ -185,8 +203,9 @@ module tt_um_sahil_protoemu (
   wire [15:0] u_data = use_imm ? c_start_data : txf_empty ? 16'd0 : {8'd0, txf_rdata};
 
   // CHAIN: the next TX word is a FIFO byte, or else the CRC.
-  wire tx_next_crc = txf_empty & crc_app_ok;
-  wire tx_next_ok = ~txf_empty | crc_app_ok;
+  // The CRC comes only after the TX mover has pushed its last byte.
+  wire tx_next_crc = txf_empty & crc_app_ok & ~txm_busy;
+  wire tx_next_ok = ~txf_empty | (crc_app_ok & ~txm_busy);
   wire [15:0] tx_next_data = txf_empty ? crc_val : {8'd0, txf_rdata};
   wire chain_pop_raw = tx_chain & ~tx_next_crc;
   wire chain_pop = chain_pop_raw & ~stop_mask[0] & ~etx_stop & ~restart;
@@ -195,12 +214,14 @@ module tt_um_sahil_protoemu (
   wire det_pop = (((etx_raw & tx_den) | (erx_raw & rx_need)) & ~txf_empty) | chain_pop_raw;
 
   // ---------------------------------------------------------- FIFOs
-  wire txf_wr = h_txf_wr | c_txf_wr;
-  wire [7:0] txf_wdata = h_txf_wr ? h_txf_wdata : c_fdata;
+  // write side of TXF: host, then the TX mover, then the controller; read side of RXF: host,
+  // then the RX mover, then the controller
+  wire txf_wr = h_txf_wr | m_txf_wr | c_txf_wr;
+  wire [7:0] txf_wdata = h_txf_wr ? h_txf_wdata : m_txf_wr ? m_txf_wdata : c_fdata;
   wire txf_rd = u_pop | chain_pop | c_txf_rd;
   wire rxf_wr = rx_push | c_rxf_wr;
   wire [7:0] rxf_wdata = rx_push ? rx_push_data : c_fdata;
-  wire rxf_rd = h_rxf_rd | c_rxf_rd;
+  wire rxf_rd = h_rxf_rd | m_rxf_rd | c_rxf_rd;
 
   pe_fifo #(
       .W    (8),
@@ -293,7 +314,13 @@ module tt_um_sahil_protoemu (
       .dm_we          (h_dm_we),
       .dm_addr        (h_dm_addr),
       .dm_wdata       (h_dm_wdata),
-      .dm_rdata       (dm_rdata)
+      .dm_rdata       (dm_rdata),
+      .r_late         (r_late),
+      .mb_idx         (mb_idx),
+      .mb_rdata       (mb_rdata),
+      .mb_we          (mb_we),
+      .mb_wdata       (mb_wdata),
+      .mb_gnt         (mb_gnt)
   );
 
   // ------------------------------------------------- memories
@@ -311,20 +338,54 @@ module tt_um_sahil_protoemu (
       .rdata(im_rdata)
   );
 
+  pe_dmov u_dmov (
+      .clk        (clk),
+      .rst        (rst),
+      .restart    (restart),
+      .h_acc      (h_dm_acc),
+      .h_we       (h_dm_we),
+      .h_addr     (h_dm_addr),
+      .h_wdata    (h_dm_wdata),
+      .c_re       (c_dm_re),
+      .c_we       (c_dm_we),
+      .c_addr     (c_dm_addr),
+      .c_wdata    (c_dm_wdata),
+      .c_gnt      (c_dm_gnt),
+      .cfg_we     (cfg_we),
+      .cfg_unit   (cfg_unit),
+      .cfg_idx    (cfg_idx),
+      .cfg_data   (cfg_data),
+      .rd_unit    (rd_unit),
+      .rd_idx     (rd_idx),
+      .rd_data    (mv_rd),
+      .h_txf_wr   (h_txf_wr),
+      .txf_full   (txf_full),
+      .m_txf_wr   (m_txf_wr),
+      .m_txf_wdata(m_txf_wdata),
+      .h_rxf_rd   (h_rxf_rd),
+      .rxf_empty  (rxf_empty),
+      .rxf_rdata  (rxf_rdata),
+      .m_rxf_rd   (m_rxf_rd),
+      .txm_busy   (txm_busy),
+      .rxm_busy   (rxm_busy),
+      .m_re       (m_re),
+      .m_we       (m_we),
+      .m_addr     (m_addr),
+      .m_wdata    (m_wdata),
+      .m_rdata    (dm_rdata)
+  );
+
   pe_dmem #(
       .DEPTH(DMEM_DEPTH),
-      .CG   (MEM_CLOCK_GATE)
+      .CG   (MEM_CLOCK_GATE),
+      .IMPL (DMEM_IMPL)
   ) u_dmem (
-      .clk    (clk),
-      .h_acc  (h_dm_acc),
-      .h_we   (h_dm_we),
-      .h_addr (h_dm_addr),
-      .h_wdata(h_dm_wdata),
-      .c_we   (c_dm_we),
-      .c_addr (c_dm_addr),
-      .c_wdata(c_dm_wdata),
-      .c_gnt  (c_dm_gnt),
-      .rdata  (dm_rdata)
+      .clk  (clk),
+      .re   (m_re),
+      .we   (m_we),
+      .addr (m_addr),
+      .wdata(m_wdata),
+      .rdata(dm_rdata)
   );
 
   // ---------------------------------------------------- controller
@@ -356,8 +417,8 @@ module tt_um_sahil_protoemu (
       .rxf_full  (rxf_full),
       .rxf_rdata (rxf_rdata),
       .txf_rd_gnt(~det_pop),
-      .txf_wr_gnt(~h_txf_wr),
-      .rxf_rd_gnt(~h_rxf_rd),
+      .txf_wr_gnt(~h_txf_wr & ~m_txf_wr),
+      .rxf_rd_gnt(~h_rxf_rd & ~m_rxf_rd),
       .rxf_wr_gnt(~rx_push),
       .txf_rd    (c_txf_rd),
       .rxf_rd    (c_rxf_rd),
@@ -367,8 +428,16 @@ module tt_um_sahil_protoemu (
       .dm_addr   (c_dm_addr),
       .dm_rdata  (dm_rdata),
       .dm_we     (c_dm_we),
+      .dm_re     (c_dm_re),
       .dm_wdata  (c_dm_wdata),
       .dm_gnt    (c_dm_gnt),
+      .mb_idx    (mb_idx),
+      .mb_rdata  (mb_rdata),
+      .mb_we     (mb_we),
+      .mb_wdata  (mb_wdata),
+      .mb_gnt    (mb_gnt),
+      .txm_busy  (txm_busy),
+      .rxm_busy  (rxm_busy),
       .cfg_we    (cfg_we),
       .cfg_unit  (cfg_unit),
       .cfg_idx   (cfg_idx),
@@ -411,6 +480,7 @@ module tt_um_sahil_protoemu (
       3'd2: rd_data = (rd_idx == 3'd0) ? etx_rd : 16'd0;
       3'd3: rd_data = (rd_idx == 3'd0) ? erx_rd : 16'd0;
       3'd4: rd_data = crc_rd;
+      3'd5, 3'd6: rd_data = mv_rd;
       default: rd_data = 16'd0;
     endcase
   end
@@ -679,9 +749,13 @@ module tt_um_sahil_protoemu (
       if (chain_pop) assert (!txf_empty && !c_txf_rd);
       if (tx_chain) assert (tx_busy);
       if (u_pop) assert (!c_txf_rd);
-      if (h_txf_wr) assert (!c_txf_wr);
+      if (h_txf_wr) assert (!c_txf_wr && !m_txf_wr);
+      if (m_txf_wr) assert (!c_txf_wr && !txf_full);
       if (rx_push) assert (!c_rxf_wr);
-      if (h_rxf_rd) assert (!c_rxf_rd);
+      if (h_rxf_rd) assert (!c_rxf_rd && !m_rxf_rd);
+      if (m_rxf_rd) assert (!c_rxf_rd && !rxf_empty);
+      assert (!(m_re && m_we));
+      if (h_dm_acc) assert (!c_dm_gnt);
       if (tx_go && restart) assert (1'b0);
       if (rx_go && restart) assert (1'b0);
       if (tx_go) assert (!tx_busy);

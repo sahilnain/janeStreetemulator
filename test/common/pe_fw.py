@@ -18,11 +18,45 @@ Every program has the same shape:
 The hardware does the bits and the firmware does the rules. The controller runs one instruction per
 clock cycle (21 ns at 48 MHz), too slow to time the bits of a fast protocol, so the units time them. The firmware decides what happens between packets: START, STOP, ACK, error checks.
 
+How the host and a program talk (v3)
+------------------------------------
+Two places, with different jobs:
+* The mailbox: eight 16-bit registers M0-M7 (host 0x30-0x3F, firmware mbr / mbw). They hold the
+  request (how many bytes, which address, which operation) and the result (status, length).
+  Names: M_OP, M_ADDR, M_NTX, M_NRX, M_PID, M_HS, M_STATUS, M_INFO (pe_isa.py).
+* DMEM (the SRAM, 256 bytes): payload only. By convention bytes to send start at dmem[0x00]
+  and received bytes at dmem[0x80].
+A request-driven program waits for DOORBELL, reads the mailbox, moves the payload, writes the
+result to the mailbox and raises the host IRQ. Each docstring lists the registers it uses.
+
+  Program              Request (mailbox)               Payload (DMEM)                Result (mailbox)
+  uart, spi_slave*     -                               - (FIFOs only)                -
+  uart_ex              M_NTX break length              - (FIFOs only)                M_STATUS breaks, M_INFO parity errors
+  spi_master(_stream)  M_NTX n                         0x00.. out, 0x80.. in         M_STATUS (stream only)
+  spi_master_3wire     M_NTX writes, M_NRX reads       0x00.. out, 0x80.. in         -
+  spi_master_words     M_NTX words                     0x00.. out, 0x80.. in (2 B)   -
+  i2c_master           M_ADDR, M_NTX, M_NRX            0x00.. out, 0x80.. in         M_STATUS
+  i2c_slave            -                               the whole DMEM is its registers
+  usb_device           UD_* names (see the USB section) 0x00.. IN data, 0x80.. OUT   UD_EVENT and others
+  usb_host             UH_* names (see the USB section) token 0x00, data 0x10, 0x80 in UH_STATUS, UH_RXLEN
+
+Moving payload: the data movers
+-------------------------------
+Two small hardware units copy payload between DMEM and the FIFOs on their own, so the program
+does not touch the bytes:
+* TXM (unit 5): ucfg(TXM, MV_PTR, p); ucfg(TXM, MV_GO, n) copies dmem[p..p+n-1] into TXF, as
+  fast as TXF has room (about 3 cycles a byte). The TX unit then takes them from TXF as usual.
+* RXM (unit 6): the same set-up copies the next n bytes that arrive in RXF to dmem[p..].
+  ucfg(RXM, MV_GO, 0) stops it; urd(r, RXM, MV_RD_CNT) gives how many it stored.
+* Done-tests: jump conditions TXM_BUSY / TXM_IDLE / RXM_BUSY / RXM_IDLE. A program that needs
+  the last received byte in DMEM waits for RXM_IDLE (or for RXF to be empty when RXM was given
+  a large count, as USB does, where the packet length is not known in advance).
+Programs that must look at every byte in a register (16-bit SPI words, I2C, the PID of a USB
+packet) use ld / st instead. ld takes 2 cycles (the SRAM has a registered read); st takes 1.
+
 Conventions
 -----------
-* Timing: an instruction takes 1 cycle, and delay(n) takes n + 1.
-* The host talks to a DMEM-driven program through DMEM: it writes a request, writes DOORBELL, and
-  gets the IRQ when the result is there. Each program's docstring gives its DMEM map.
+* Timing: an instruction takes 1 cycle, and delay(n) takes n + 1. ld takes 2.
 * Carry as a result: several subroutines return C = 1 for "something else happened". cmp(x, 0)
   gives C = 0 for any x, and with x = 0, cmp(x, 1) borrows, which gives C = 1.
 * fget(..., nb=1) does not block: C = 1 means the FIFO was empty, C = 0 means a byte was read.
@@ -136,13 +170,13 @@ def uart_ex(txd=0, rxd=1, B=112, N=9, K=1, S=12, bits=8, parity=PAR_NONE, stop_b
     line, either bit order.
     The host writes data to TXF and reads it from RXF; with bits > 8 a word is
     two FIFO bytes, low byte first. Frames with a bad stop bit or parity are
-    dropped; dmem[1] counts parity errors.
-    Break: a frame of all zeros with a bad stop bit counts in dmem[2] and raises the
-    controller IRQ. A doorbell sends a break of dmem[3] bit times (> 0), between frames.
+    dropped; mailbox M_INFO counts parity errors.
+    Break: a frame of all zeros with a bad stop bit counts in M_STATUS and raises the
+    controller IRQ. A doorbell sends a break of M_NTX bit times (> 0), between frames.
     The start bit is timed by the instruction stream, because a word with parity or 9
     bits comes from a register, not the FIFO."""
-    # Registers: r0 the word being sent or received. r1 scratch: second FIFO byte, DMEM pointer, break length.
-    # r2 parity test. r5 break count, kept in dmem[2]. r6 parity error count, kept in dmem[1].
+    # Registers: r0 the word being sent or received. r1 scratch: second FIFO byte, break length.
+    # r2 parity test. r5 break count, kept in M_STATUS. r6 parity error count, kept in M_INFO.
     # Unlike uart(), a word with parity or 9 bits comes from a register, so the start bit is timed by instructions.
     idle, active = (0, 1) if inv else (1, 0)
     c = uart_consts(B, N, K, S)
@@ -226,12 +260,12 @@ def uart_ex(txd=0, rxd=1, B=112, N=9, K=1, S=12, bits=8, parity=PAR_NONE, stop_b
         a.shr(1, 8).and_(1, (mask >> 8) & 0xFF).fput(1, I.FIFO_RX)   # the high data bits as a second byte
     a.jmp("loop")
     if parity != PAR_NONE:
-        a.L("p_bad").add(6, 1).mov(1, 1).st(6, 1).jmp("loop")   # count it in dmem[1], drop the word
+        a.L("p_bad").add(6, 1).mbw(6, I.M_INFO).jmp("loop")     # count it in M_INFO, drop the word
     # a bad stop bit with all data 0 is a break; ERX needs a new edge, so it counts once
     a.L("ferr").cmp(0, 0).jmp("loop", I.NZ)      # bad stop bit, data not 0: a framing error, dropped
-    a.add(5, 1).mov(1, 2).st(5, 1).host_irq().jmp("loop")   # a break: count it in dmem[2], tell the host
+    a.add(5, 1).mbw(5, I.M_STATUS).host_irq().jmp("loop")   # a break: count it in M_STATUS, tell the host
     # send a break, then the stop time (ETX re-arms on the idle level)
-    a.L("brk").dbclr().mov(1, 3).ld(1, 1).evt(I.DET_TX, I.EV_CLR)   # r1 = the length from dmem[3], in bit times
+    a.L("brk").dbclr().mbr(1, I.M_NTX).evt(I.DET_TX, I.EV_CLR)   # r1 = the length from M_NTX, in bit times
     a.set(txd, I.SRC_1 if inv else I.SRC_0)      # the line to the active level: the break
     # One bit time a pass: delay(B - 2) takes B - 1, and djnz takes 1.
     a.L("brl").delay(B - 2).djnz(1, "brl")
@@ -254,9 +288,10 @@ def _cs_time(a, B):
 
 
 def spi_master_words(B=2, cpol=0, cpha=0, msb=1, sdly=3, bits=16, sck=2, mosi=3, miso=4, cs=5):
-    """SPI master for words of 1-16 bits, DMEM-driven: dmem[0] = n words,
-    then two bytes per word (low first) from dmem[1]; n replies, two bytes
-    each, at dmem[0x80]. Owners: SCK, MOSI -> TX unit."""
+    """SPI master for words of 1-16 bits: M_NTX = n words, two bytes per word (low first)
+    from dmem[0]; n replies, two bytes each, at dmem[0x80]. A word over 8 bits does not fit
+    the byte FIFOs, so this program moves its words with ld / st, not the data movers.
+    Owners: SCK, MOSI -> TX unit."""
     # Registers: r0 word out. r1 pointer to the words. r2 words left. r3 pointer to the replies. r4 scratch.
     a = Asm()
     # The TX unit makes SCK and MOSI; the RX unit samples MISO on the TX unit's sample tick, SDLY cycles late.
@@ -273,8 +308,8 @@ def spi_master_words(B=2, cpol=0, cpha=0, msb=1, sdly=3, bits=16, sck=2, mosi=3,
     a.set(cs, I.SRC_1).setoe(cs, 1)
     a.L("idle").jmp("idle", I.NDB)                              # wait for the doorbell
     a.dbclr()
-    # Request: r2 = n from dmem[0], r1 now points at dmem[1]. Then select the device.
-    a.mov(1, 0).ld(2, 1, inc=1).mov(3, 0x80)                    # r3 -> the replies at 0x80
+    # Request: r2 = n from M_NTX, r1 -> the words at dmem[0]. Then select the device.
+    a.mbr(2, I.M_NTX).mov(1, 0).mov(3, 0x80)                    # r3 -> the replies at 0x80
     a.set(cs, I.SRC_0).delay(0)                                 # CS low, then the lead time
     _cs_time(a, B)
     a.L("word")
@@ -295,11 +330,11 @@ def spi_master_words(B=2, cpol=0, cpha=0, msb=1, sdly=3, bits=16, sck=2, mosi=3,
 
 
 def spi_master(B=2, cpol=0, cpha=0, msb=1, sdly=3, sck=2, mosi=3, miso=4, cs=5):
-    """SPI master, DMEM-driven (H1): the host writes dmem[0] = n, dmem[1..n] =
-    data and rings DOORBELL; the firmware clocks n bytes with CS low and
-    stores the received bytes in dmem[0x80..], then raises the host IRQ.
-    Owners: SCK, MOSI -> TX unit."""
-    # Registers: r0 byte out. r1 pointer to the data. r2 bytes left. r3 pointer to the replies. r4 byte in.
+    """SPI master: the host writes M_NTX = n and dmem[0..n-1] = data and rings DOORBELL;
+    the firmware clocks n bytes with CS low, the received bytes go to dmem[0x80..], then
+    it raises the host IRQ. The data movers carry the bytes: TXM from DMEM to the TX FIFO,
+    RXM from the RX FIFO to DMEM. Owners: SCK, MOSI -> TX unit."""
+    # Registers: r2 bytes left.
     a = Asm()
     # The TX unit makes SCK and MOSI. The RX unit samples MISO on the TX unit's sample tick, and SDLY covers
     # the trip through the synchroniser and the outside world.
@@ -317,19 +352,16 @@ def spi_master(B=2, cpol=0, cpha=0, msb=1, sdly=3, sck=2, mosi=3, miso=4, cs=5):
     # Wait for the host, then select the device.
     a.L("idle").jmp("idle", I.NDB)                              # wait for the doorbell
     a.dbclr()
-    a.mov(1, 0).ld(2, 1, inc=1)                                 # r2 = n, r1 -> data
-    a.mov(3, 0x80)                                              # r3 -> the replies at 0x80
+    a.mbr(2, I.M_NTX)                                           # r2 = n
+    a.ucfg(I.TXM, I.MV_PTR, 0).ucfg(I.TXM, I.MV_GO, I.R(2))     # TXM: dmem[0..n-1] -> TXF
+    a.ucfg(I.RXM, I.MV_PTR, 0x80).ucfg(I.RXM, I.MV_GO, I.R(2))  # RXM: RXF -> dmem[0x80..]
     a.set(cs, I.SRC_0).delay(0)                                 # CS low, then the lead time
     _cs_time(a, B)
-    # Each byte: both units start in the same cycle, and the byte received goes to DMEM.
+    # Each byte: both units start in the same cycle; TX takes its byte from TXF (ustart waits
+    # until TXM has put one there) and RX pushes the reply to RXF, where RXM takes it.
     # SCK pauses for a few instructions between bytes, which SPI allows.
-    a.L("byte")
-    a.ld(0, 1, inc=1)                                           # r0 = the next byte to send
-    a.ustart(I.M_BOTH, I.R(0))                                  # one byte out and in
-    a.uwait(I.M_BOTH)
-    a.fget(4, I.FIFO_RX)                                        # the byte received (RX pushed it to RXF)
-    a.st(4, 3, inc=1)
-    a.djnz(2, "byte")                                           # next byte, until n are done
+    a.L("byte").ustart(I.M_BOTH).uwait(I.M_BOTH).djnz(2, "byte")
+    a.L("rxw").jmp("rxw", I.RXM_BUSY)                           # the last reply is in DMEM
     # All sent: deselect, and tell the host.
     _cs_time(a, B)                                              # the lag time before CS rises
     a.set(cs, I.SRC_1)
@@ -377,16 +409,14 @@ def spi_slave(cpol=0, cpha=0, msb=1, bits=0, sck=2, mosi=3, miso=4, cs=5):
 
 
 def spi_master_stream(B=4, cpol=0, cpha=0, msb=1, sdly=3, sck=2, mosi=3, miso=4, cs=5):
-    """SPI master with no gap between bytes (TX and RX CHAIN), DMEM-driven: dmem[0] = n,
-    dmem[1..n] = data; the replies go to dmem[0x80..]. dmem[0x7F] = 0 ok, 1 the firmware fell
-    behind and SCK paused, 2 a reply was lost (RXF overran, or the host took a byte from it).
-    A pass that refills TXF and empties RXF takes 9 cycles, and a byte at B = 2 lasts 16, so any
-    length runs with no pause. Whatever happens, the firmware ends and raises the
-    IRQ: once TX is idle it does not wait for a reply that is not there.
-    Owners: SCK, MOSI -> TX unit."""
-    # Registers: r0 byte out. r1 pointer to the data. r2 bytes left to send. r3 pointer to the replies.
-    # r4 byte in. r5 replies left to take. r6 the status, stored in dmem[0x7F].
-    # CHAIN makes each unit go straight on to the next byte, so the only job left is to keep the FIFOs moving.
+    """SPI master with no gap between bytes (TX and RX CHAIN): M_NTX = n, dmem[0..n-1] = data;
+    the replies go to dmem[0x80..]. M_STATUS = 0 ok, 1 TX ran dry and SCK paused, 2 a reply was
+    lost (RXF overran, or the host took a byte from it). The data movers keep the FIFOs going:
+    TXM refills TXF in 3 cycles a byte, and a byte at B = 2 lasts 16, so any length runs with no
+    pause. Whatever happens, the firmware ends and raises the IRQ: once TX is idle it does not
+    wait for a reply that is not there. Owners: SCK, MOSI -> TX unit."""
+    # Registers: r2 = n. r6 the status, for M_STATUS.
+    # CHAIN makes each unit go straight on to the next byte; the movers keep the FIFOs moving.
     a = Asm()
     a.ucfg(I.TX, I.TX_PINS, I.tx_pins(mosi, 1, sck, 1))        # data on MOSI, clock on SCK
     a.ucfg(I.TX, I.TX_BIT, B)
@@ -401,46 +431,37 @@ def spi_master_stream(B=4, cpol=0, cpha=0, msb=1, sdly=3, sck=2, mosi=3, miso=4,
     a.set(cs, I.SRC_1).setoe(cs, 1)
     a.L("idle").jmp("idle", I.NDB)                              # wait for the doorbell
     a.dbclr()
-    # Request, then fill TXF as far as it goes before the first clock.
-    a.mov(1, 0).ld(2, 1, inc=1).mov(5, I.R(2)).mov(3, 0x80).mov(6, 0)    # r2 tx left, r5 rx left
-    a.L("pre").ld(0, 1, inc=1).fput(0, I.FIFO_TX).sub(2, 1).jmp("go", I.Z)   # all bytes in TXF already
-    a.jmp("go", I.TXF_FULL).jmp("pre")                          # or TXF is full
+    # Request: start both movers, and let TXF fill before the first clock.
+    a.mbr(2, I.M_NTX).mov(6, 0)                                 # r2 = n; status 0
+    a.ucfg(I.TXM, I.MV_PTR, 0).ucfg(I.TXM, I.MV_GO, I.R(2))     # TXM: dmem[0..n-1] -> TXF
+    a.ucfg(I.RXM, I.MV_PTR, 0x80).ucfg(I.RXM, I.MV_GO, I.R(2))  # RXM: RXF -> dmem[0x80..]
+    a.L("pre").jmp("go", I.TXF_FULL).jmp("pre", I.TXM_BUSY)     # TXF full, or every byte queued
     a.L("go").set(cs, I.SRC_0).delay(0)                         # select, the lead time,
     _cs_time(a, B).ustart(I.M_BOTH)                             # then both units: they take bytes from here on
-    a.cmp(2, 0).jmp("drain", I.Z)                               # nothing left to queue: only take replies
-    # While bytes are left to send, the last reply cannot have come: no test of r5 or r2 here
-    # Main loop: empty RXF, refill TXF. This pass is what limits the speed: 9 cycles for one of each.
-    a.L("run").fget(4, I.FIFO_RX, nb=1).jmp("no_rx", I.C)       # a reply waiting? (C = 1: RXF empty)
-    a.st(4, 3, inc=1).sub(5, 1)                                 # store it, one fewer to take
-    a.L("no_rx").jmp("late", I.TXU_IDLE).jmp("run", I.TXF_FULL)   # TX stopped: it ran dry. TXF full: loop
-    a.ld(0, 1, inc=1).fput(0, I.FIFO_TX).djnz(2, "run").jmp("drain")   # queue the next byte
-    # The FIFO ran dry, so the chain ended and SCK paused. Report it and start TX again.
-    a.L("late").mov(6, 1)                                       # TX ended early: start it again
-    a.ld(0, 1, inc=1).fput(0, I.FIFO_TX).ustart(I.M_TX).djnz(2, "run")
-    # All sent: take the replies that are left
-    a.L("drain").fget(4, I.FIFO_RX, nb=1).jmp("dry", I.C)
-    a.st(4, 3, inc=1).sub(5, 1).jmp("end", I.Z).jmp("drain")    # end once every reply is in
-    a.L("dry").jmp("drain", I.TXU_BUSY)                         # RXF empty but TX still sending: keep waiting
-    # TX is idle: a last reply is at most SDLY away, and after that none will come
-    a.delay(20).fget(4, I.FIFO_RX, nb=1).jmp("lost", I.C)
-    a.st(4, 3, inc=1).sub(5, 1).jmp("end", I.Z).jmp("dry")
-    a.L("lost").mov(6, 2)                                       # a reply never came: report it
-    # Done: let the last bits go, stop RX (a chained RX never ends by itself), deselect and report.
-    a.L("end").uwait(I.M_TX).ustop(I.M_RX)
+    # While TXM has bytes to give, TX must not stop. If it does (the chain ran dry), SCK paused:
+    # report it and start TX again (ustart waits for a byte).
+    a.L("run").jmp("tend", I.TXM_IDLE).jmp("run", I.TXU_BUSY)
+    a.L("late").mov(6, 1).ustart(I.M_TX).jmp("run")
+    # Every byte is in TXF or gone. When TX ends, TXF must be empty too.
+    a.L("tend").uwait(I.M_TX).jmp("late", I.TXF_NEMPTY)
+    # The last reply is at most SDLY away; RXM stores it at once.
+    a.jmp("end", I.RXM_IDLE).delay(20).jmp("end", I.RXM_IDLE)
+    a.mov(6, 2)                                                 # a reply never came: report it
+    # Done: stop RX (a chained RX never ends by itself) and RXM, deselect and report.
+    a.L("end").ustop(I.M_RX).ucfg(I.RXM, I.MV_GO, 0)
     _cs_time(a, B)
     a.set(cs, I.SRC_1)
-    a.mov(1, 0x7F).st(6, 1)                                     # the status to dmem[0x7F]
+    a.mbw(6, I.M_STATUS)                                        # the status for the host
     a.host_irq()
     a.jmp("idle")
     return a
 
 
 def spi_master_3wire(B=8, cpol=0, cpha=0, msb=1, sdly=3, sck=2, dio=3, cs=5):
-    """3-wire SPI master: one data pin, DMEM-driven: dmem[0] = n_write, dmem[1] = n_read,
-    dmem[2..] = write bytes; read bytes at dmem[0x80..]. All writes, then all reads, in one
-    CS frame; the pin is released in between. Owners: SCK, DIO -> TX unit."""
-    # Registers: r0 byte out. r1 pointer to the write data. r2 writes left. r3 pointer to the replies.
-    # r4 byte in. r5 reads left.
+    """3-wire SPI master: one data pin. M_NTX = n_write, M_NRX = n_read, dmem[0..] = write
+    bytes; read bytes go to dmem[0x80..]. All writes, then all reads, in one CS frame; the pin
+    is released in between. The data movers carry the bytes. Owners: SCK, DIO -> TX unit."""
+    # Registers: r2 writes left. r5 reads left.
     a = Asm()
     a.ucfg(I.TX, I.TX_BIT, B)                                   # TX_PINS is set per phase, below
     a.ucfg(I.TX, I.TX_FRAME, msb)
@@ -453,20 +474,22 @@ def spi_master_3wire(B=8, cpol=0, cpha=0, msb=1, sdly=3, sck=2, dio=3, cs=5):
     a.L("idle").jmp("idle", I.NDB)                              # wait for the doorbell
     a.dbclr()
     # Request. The TX unit gets the data pin only for the writes.
-    a.mov(1, 0).ld(2, 1, inc=1).ld(5, 1, inc=1).mov(3, 0x80)    # r2 = writes, r5 = reads, r3 -> replies
+    a.mbr(2, I.M_NTX).mbr(5, I.M_NRX)                          # r2 = writes, r5 = reads
+    a.ucfg(I.TXM, I.MV_PTR, 0).ucfg(I.TXM, I.MV_GO, I.R(2))     # TXM: the write bytes -> TXF
+    a.ucfg(I.RXM, I.MV_PTR, 0x80).ucfg(I.RXM, I.MV_GO, I.R(5))  # RXM: the read bytes -> dmem[0x80..]
     a.ucfg(I.TX, I.TX_PINS, I.tx_pins(dio, 1, sck, 1))          # write phase: TX drives DIO and SCK
     a.setoe(dio, 1)
     a.set(cs, I.SRC_0).delay(0)
     _cs_time(a, B)
     a.cmp(2, 0).jmp("rd", I.Z)                                  # no writes: straight to the reads
     # Write phase: the TX unit drives DIO.
-    a.L("wr").ld(0, 1, inc=1).ustart(I.M_TX, I.R(0)).uwait(I.M_TX).djnz(2, "wr")
+    a.L("wr").ustart(I.M_TX).uwait(I.M_TX).djnz(2, "wr")      # each byte from TXF
     a.L("rd").setoe(dio, 0)                                     # turnaround
     a.ucfg(I.TX, I.TX_PINS, I.tx_pins(0, 0, sck, 1))            # the clock only
     a.cmp(5, 0).jmp("fin", I.Z).delay(B)
     # Read phase: the TX unit only makes the clock. Its data goes nowhere, and the RX unit reads DIO.
-    a.L("rl").ustart(I.M_BOTH, 0).uwait(I.M_BOTH)               # 8 clocks; RX takes the byte
-    a.fget(4, I.FIFO_RX).st(4, 3, inc=1).djnz(5, "rl")          # store it, next read
+    a.L("rl").ustart(I.M_BOTH, 0).uwait(I.M_BOTH).djnz(5, "rl")   # 8 clocks; RX takes the byte, RXM stores it
+    a.L("rxw").jmp("rxw", I.RXM_BUSY)                           # the last one is in DMEM
     a.L("fin")
     _cs_time(a, B).set(cs, I.SRC_1)                             # lag time, deselect
     a.host_irq()
@@ -554,11 +577,13 @@ def spi_slave_words(bits=12, cpol=0, cpha=0, msb=1, sck=2, mosi=3, miso=4, cs=5)
 # ------------------------------------------------------------------ I2C
 def i2c_master(B=126, scl=6, sda=7, odly=None, sdly=2, addr10=False, arb=False, hs_B=None, master_code=0x08,
                stuck=0xFFFF):
-    """I2C master, DMEM-driven. Request: dmem[0] = 7-bit address, dmem[1] = n_write, dmem[2] =
-    n_read, dmem[3..] = write data. The firmware sends START, address+W and the write bytes (if
-    any), then, if n_read > 0, a repeated START, address+R and reads n_read bytes (ACK all but
-    the last, NACK the last), then STOP. Result: dmem[0x80..] = read bytes, dmem[0x7F] = 0 ok /
-    1 address NACK / 2 data NACK / 3 arbitration lost / 4 SDA stuck low; then host IRQ.
+    """I2C master. Request: M_ADDR = the address (7 bits, or 10 with addr10), M_NTX = n_write,
+    M_NRX = n_read, dmem[0..] = write data. The firmware sends START, address+W and the write
+    bytes (if any), then, if n_read > 0, a repeated START, address+R and reads n_read bytes
+    (ACK all but the last, NACK the last), then STOP. Result: dmem[0x80..] = read bytes,
+    M_STATUS = 0 ok / 1 address NACK / 2 data NACK / 3 arbitration lost / 4 SDA stuck low;
+    then host IRQ. Every byte passes through a register (the firmware clocks or checks it),
+    so this program moves its bytes with ld / st rather than the data movers.
     Bus clear (UM10204 3.1.16): if SDA is low when a request starts, the master sends up to nine
     clock pulses. When SDA is released it sends a STOP and goes on with the request. If SDA is
     still low after nine, it reports 4; the bus then needs a device reset or a power cycle.
@@ -571,7 +596,7 @@ def i2c_master(B=126, scl=6, sda=7, odly=None, sdly=2, addr10=False, arb=False, 
     START and STOP is too. Q = B/4 is only the short hold after SCL falls. The SCL period is B + 2.
     B for the I2C limits (i2c.check_timing): 478 = 100 kHz, 126 = 375 kHz, 48 = 960 kHz, hs_B 16 = 2.67 MHz.
     Options, chosen when the firmware is built:
-    addr10   dmem[0x7E] holds address bits 9:8, dmem[0] bits 7:0 (10-bit addressing).
+    addr10   M_ADDR holds a 10-bit address (10-bit addressing).
     arb      multi-master: waits for a free bus and checks every bit it sends. A master that
              reads 0 after sending 1 has lost: it releases both lines at once, sends no
              STOP and reports 3. Written bits are clocked by firmware, not by the units, because
@@ -585,7 +610,7 @@ def i2c_master(B=126, scl=6, sda=7, odly=None, sdly=2, addr10=False, arb=False, 
     #   r2 write bytes left                    r3 pointer to the read data
     #   r4 the address                         r7 read bytes left
     #   r5 result of wbyte: 0 ACK, 1 NACK, 2 lost. Input of rbyte: 0 ACK, 1 NACK. Also a loop counter
-    #   r6 the status for dmem[0x7F]. With arb, between requests: nonzero = bus busy; hi2 also uses it
+    #   r6 the status for M_STATUS. With arb, between requests: nonzero = bus busy; hi2 also uses it
     #
     # Two builds share this code. Without arb the units clock the bytes, which is fast and takes little code.
     # With arb, firmware clocks every bit, because it has to read SDA back after each one.
@@ -619,11 +644,9 @@ def i2c_master(B=126, scl=6, sda=7, odly=None, sdly=2, addr10=False, arb=False, 
         # Single master: nothing to do but wait for the host.
         a.L("idle").jmp("idle", I.NDB)
     a.dbclr()
-    # A request has come: read it from DMEM.
-    a.mov(1, 0).ld(4, 1, inc=1).ld(2, 1, inc=1).ld(7, 1, inc=1)    # addr, n_w, n_r
-    if addr10:
-        a.mov(0, 0x7E).ld(0, 0).shl(0, 8).or_(4, I.R(0))           # r4 = the 10-bit address
-    a.mov(3, 0x80)                                              # r3 -> the read data at 0x80
+    # A request has come: read it from the mailbox.
+    a.mbr(4, I.M_ADDR).mbr(2, I.M_NTX).mbr(7, I.M_NRX)          # addr, n_w, n_r
+    a.mov(1, 0).mov(3, 0x80)                                    # r1 -> the write data, r3 -> the read data
     if not arb:                                                 # with arb, r6 is 0 to get here
         # SDA low before we even started: a device is stuck in the middle of a byte.
         a.mov(6, 0).jpin(sda, 0, "clr").L("go")
@@ -674,7 +697,7 @@ def i2c_master(B=126, scl=6, sda=7, odly=None, sdly=2, addr10=False, arb=False, 
     a.L("rep")
     if hs_B:
         a.ucfg(I.TX, I.TX_BIT, B)                               # back to F/S speed for the next master code
-    a.mov(1, 0x7F).st(6, 1)                                     # the status to dmem[0x7F]
+    a.mbw(6, I.M_STATUS)                                        # the status for the host
     a.host_irq()
     if arb:
         # After a lost arbitration the bus stays busy. Otherwise our own STOP is behind us, or SDA
@@ -877,14 +900,35 @@ PID_DATA0, PID_DATA1 = 0xC3, 0x4B
 PID_ACK, PID_NAK, PID_STALL = 0xD2, 0x5A, 0x1E
 CRC5_POLY, CRC5_INIT, CRC5_RES = 0x2800, 0xF800, 0x6000
 CRC16_POLY, CRC16_INIT, CRC16_RES = 0x8005, 0xFFFF, 0x800D
-# usb_device DMEM map
-UD_ADDR, UD_TOKEN, UD_EP, UD_RXLEN, UD_INLEN, UD_INPID, UD_OUTHS, UD_INHS, UD_EVENT = range(9)
-UD_INDATA, UD_RXDATA = 0x10, 0x80
+# usb_device: the mailbox registers under their USB names.
+#   host -> firmware
+#     UD_ADDR   (M1) our device address, 7 bits; read again before every token
+#     UD_INLEN  (M2) the IN packet waiting: its length counting the PID (0 = none, answer with UD_HS[15:8]).
+#                    The firmware clears it when the host ACKs the packet.
+#     UD_INPID  (M4) the DATA0 / DATA1 PID of that IN packet
+#     UD_HS     (M5) the handshake PIDs to send: [7:0] for OUT data, [15:8] for an IN with no data (NAK / STALL)
+#   firmware -> host
+#     UD_TOKEN  (M0) the token PID of the last OUT / SETUP
+#     UD_EP     (M3) its endpoint
+#     UD_EVENT  (M6) what happened: EV_* below; written together with the controller IRQ
+#     UD_RXLEN  (M7) bytes received in the OUT / SETUP data packet, with its PID
+UD_ADDR, UD_INLEN, UD_INPID, UD_HS = I.M_ADDR, I.M_NTX, I.M_PID, I.M_HS
+UD_TOKEN, UD_EP, UD_EVENT, UD_RXLEN = I.M_OP, I.M_NRX, I.M_STATUS, I.M_INFO
+UD_INDATA, UD_RXDATA = 0x00, 0x80   # DMEM: the IN data (no PID), and the packet received (PID first)
 USB_IDLE = 65535        # usb_device: cycles of J that set ETX (1.37 ms at 48 MHz)
 EV_OUT, EV_IN_ACK, EV_RESET, EV_IN_NOACK = 1, 2, 3, 4
-# usb_host DMEM map
-UH_OP, UH_TOK0, UH_TOK1, UH_TOK2, UH_DPID, UH_N, UH_NH, UH_STATUS, UH_RXLEN = range(9)
-UH_RPID = 0x80          # the first byte received
+# usb_host: the mailbox registers under their USB names.
+#   host -> firmware
+#     UH_OP     (M0) 0 a transaction, 1 bus reset, 2 keep-alive EOP, 3 resume
+#     UH_DPID   (M4) the DATA PID for OUT / SETUP; 0 means an IN
+#     UH_N      (M2) OUT / SETUP data bytes; for a reset or resume, the length in 256-cycle turns
+#   firmware -> host
+#     UH_STATUS (M6) UH_OK / UH_TIMEOUT / UH_BADPKT
+#     UH_RXLEN  (M7) bytes received, with the PID
+UH_OP, UH_DPID, UH_N = I.M_OP, I.M_PID, I.M_NTX
+UH_STATUS, UH_RXLEN = I.M_STATUS, I.M_INFO
+UH_TOK, UH_DATA = 0x00, 0x10   # DMEM: the 3 token bytes (PID, address/endpoint, CRC5), and the OUT / SETUP data
+UH_RPID = 0x80          # DMEM: the first byte received, then the rest of the packet
 UH_OK, UH_TIMEOUT, UH_BADPKT = 0, 1, 2
 
 
@@ -956,9 +1000,10 @@ def _crc_good(a, res, drib, ok, bad):
 
 def usb_device(B=4, jp=0, kp=1, turn=None):
     """USB device at transaction level, low or full speed. The host side sets
-    the address and handshakes in DMEM and owns the higher layers (enumeration,
+    the address and handshakes in the mailbox and owns the higher layers (enumeration,
     data toggles, endpoints). See UD_* for the map; UD_EVENT says what happened,
-    with a controller IRQ. `turn`: extra cycles before answering (B = 32: the
+    with a controller IRQ. The IN data (dmem[UD_INDATA..]) goes out through TXM, and a
+    received packet goes to dmem[UD_RXDATA..] (its PID by the firmware, the rest by RXM). `turn`: extra cycles before answering (B = 32: the
     answer must not come before 2 bit times). A SETUP is always answered with ACK (8.5.3).
     Suspend: ETX times the idle bus. CSTAT.ETX set means J for at least USB_IDLE cycles
     (1.37 ms) since the last packet, and any packet clears it. Read it twice, 1.7 ms
@@ -967,7 +1012,7 @@ def usb_device(B=4, jp=0, kp=1, turn=None):
     not implemented: the device must not advertise it."""
     # Registers
     #   r0 byte, event code          r1 second token byte, then the handshake to send
-    #   r2 third token byte, then EP r3 DMEM pointer
+    #   r2 third token byte, then EP r3 DMEM pointer (the PID received)
     #   r4 CRC value, RX status      r5 UD_INLEN, then a time-out count
     #   r6 the PID, 0 if none came   r7 our address
     if turn is None:
@@ -982,12 +1027,13 @@ def usb_device(B=4, jp=0, kp=1, turn=None):
     # packet may start 2 bit times after the last one, and no bit reaches the FIFO or the CRC unit
     # until the hunt ends, so the rest has time.
     a.L("idle").ustop(I.M_RX).evt(I.DET_RX, I.EV_DISARM).evt(I.DET_RX, I.EV_CLR)   # stop RX, clear the EOP flag
+    a.ucfg(I.RXM, I.MV_GO, 0)                                    # and RXM, if a packet was dropped half way
     _rx_go(a, jp)
     a.L("dr").fget(0, I.FIFO_RX, nb=1).jmp("dr", I.NC)           # drain
     _crc_rx(a, CRC5_POLY, CRC5_INIT)                             # a token comes next: check its CRC5
     a.evt(I.DET_TX, I.EV_CLR).evt(I.DET_TX, I.EV_ARM)            # the idle timer starts again
-    a.mov(3, UD_ADDR).ld(7, 3)                                   # r7 = our address (the host side may change it)
-    a.mov(3, UD_INLEN).ld(5, 3)                                  # r5 = the IN packet waiting, if any
+    a.mbr(7, UD_ADDR)                                            # r7 = our address (the host side may change it)
+    a.mbr(5, UD_INLEN)                                           # r5 = the IN packet waiting, if any
     a.mov(6, 0)                                                  # r6 = 0: no PID yet
     # Receive a token, wait for its EOP, and check it: PID in r6, then the second byte, then CRC5.
     a.evt(I.DET_RX, I.EV_WAITC)                                  # SE0: RX is stopped
@@ -997,38 +1043,40 @@ def usb_device(B=4, jp=0, kp=1, turn=None):
     # Good token: address in the low 7 bits of the second byte. IN goes straight to the answer: it has the least time.
     a.L("t_ok").mov(4, I.R(1)).and_(4, 0x7F).cmp(4, I.R(7)).jmp("idle", I.NZ)
     a.cmp(6, PID_IN).jmp("in_tok", I.Z)                          # no time to spare here
-    # OUT / SETUP: the data packet follows soon. No bit reaches the CRC unit until the hunt ends.
-    # OUT or SETUP: start hunting at once for the data packet, then read the token's last byte.
+    # OUT / SETUP: the data packet follows soon, so start hunting for it at once, then read the token's
+    # last byte. No bit reaches the CRC unit until the hunt ends, so switching it to CRC16 here is safe.
     _rx_go(a, jp)
     a.ucfg(I.CRC, I.CRC_POLY, CRC16_POLY).ucfg(I.CRC, I.CRC_INIT, CRC16_INIT)   # the data packet has CRC16
     a.fget(2, I.FIFO_RX, nb=1)                                   # r2 = third token byte
     a.cmp(6, PID_OUT).jmp("o_ok", I.Z)
     a.cmp(6, PID_SETUP).jmp("idle", I.NZ)                        # any other token: ignore
     # Report PID and endpoint. EP = 3 bits of the third byte, then the top bit of the second.
-    a.L("o_ok").mov(3, UD_TOKEN).st(6, 3, inc=1)                 # UD_EP comes next
-    a.and_(2, 7).shl(2, 1).shr(1, 7).or_(2, I.R(1)).st(2, 3)     # EP = byte3[2:0] : byte2[7]
-    a.mov(3, UD_OUTHS).ld(1, 3)                                  # handshake ready in r1
+    a.L("o_ok").mbw(6, UD_TOKEN)
+    a.and_(2, 7).shl(2, 1).shr(1, 7).or_(2, I.R(1)).mbw(2, UD_EP)   # EP = byte3[2:0] : byte2[7]
+    a.mbr(1, UD_HS)                                              # OUT handshake in r1 (fput sends bits 7:0)
     a.cmp(6, PID_SETUP).jmp("o_hs", I.NZ).mov(1, PID_ACK)        # SETUP is always ACKed
     a.L("o_hs").mov(3, UD_RXDATA)                                # r3 -> where the data goes
     # The first byte must be a good DATA PID. The slow checks are done here, as bytes arrive:
     # after the EOP only the CRC and the stuff flag stand between us and the handshake.
     a.L("op").jmp("idle", I.ERX).fget(0, I.FIFO_RX, nb=1).jmp("op", I.C)   # an EOP before any byte: drop
-    a.st(0, 3, inc=1).cmp(0, PID_DATA0).jmp("rl", I.Z).cmp(0, PID_DATA1).jmp("idle", I.NZ).jmp("rl")   # DATA0/1 only
-    # The EOP is looked for every 2 instructions: the time from here to the handshake is the tightest
-    # in the firmware.
-    a.L("rl").jmp("rle0", I.ERX).jmp("rl", I.RXF_EMPTY).fget(0, I.FIFO_RX).st(0, 3, inc=1).jmp("rl")
+    a.st(0, 3).cmp(0, PID_DATA0).jmp("rl0", I.Z).cmp(0, PID_DATA1).jmp("idle", I.NZ)   # DATA0/1 only
+    # The rest of the packet goes to DMEM through RXM. The firmware only waits for the EOP:
+    # the time from here to the handshake is the tightest in the firmware.
+    # The length is not known in advance: RXM is given 255 (the most that fits after the PID) and is
+    # stopped once the packet is over.
+    a.L("rl0").ucfg(I.RXM, I.MV_PTR, UD_RXDATA + 1).ucfg(I.RXM, I.MV_GO, 255)
+    a.L("rl").jmp("rl", I.NERX)
     # EOP seen. Answer only if CRC16 and stuffing are good; otherwise stay silent, so the host retries.
     a.L("rle0").urd(4, I.CRC, I.CRC_VAL)                        # r4 = the CRC register
     _crc_good(a, CRC16_RES, CRC16_DRIB, "rc2", "idle")
     a.L("rc2").urd(4, I.RX, I.RX_STAT).and_(4, I.RX_ST_SERR).jmp("idle", I.NZ)   # a stuff error: silent
     _tx_on(a, jp, kp, turn)                                      # sync out, after the turnaround
-    a.call("hsend")                                              # the handshake from UD_OUTHS (ACK for SETUP)
-    # At full speed the last byte can reach the FIFO just before the EOP, and the loop above leaves
-    # as soon as it sees the EOP. The CRC unit has it already, so answer first and store it now.
-    # At low speed the EOP takes far longer to detect than the loop takes to go round.
-    if B <= 8:
-        a.fget(0, I.FIFO_RX, nb=1).jmp("rle", I.C).st(0, 3, inc=1).L("rle")
-    a.mov(0, I.R(3)).sub(0, UD_RXDATA).mov(3, UD_RXLEN).st(0, 3)   # length = how far r3 moved
+    a.call("hsend")                                              # the handshake in r1: UD_HS[7:0], or ACK for SETUP
+    # The last byte can reach the FIFO just before the EOP: RXM stores whatever is left, then stops.
+    # The handshake is out first, because it has a deadline; the length can wait.
+    a.L("rle").jmp("rle", I.RXF_NEMPTY)
+    a.urd(0, I.RXM, I.MV_RD_CNT).add(0, 1).mbw(0, UD_RXLEN)      # length: the PID and what RXM stored
+    a.ucfg(I.RXM, I.MV_GO, 0)
     a.mov(0, EV_OUT).jmp("ev")
     # Subroutine: send the handshake in r1. The CRC unit must not add anything to it.
     a.L("hsend").fput(1, I.FIFO_TX).ucfg(I.CRC, I.CRC_CTRL, 0).uwait(I.M_TX).ret()
@@ -1041,9 +1089,9 @@ def usb_device(B=4, jp=0, kp=1, turn=None):
     # INIT takes effect 5 cycles after the sync started (4-6 all work): the bits already gone do not count.
     _crc_tx(a, skip=16 - (5 // B + 1))
     # Data: PID, then the bytes. The chain must not run dry: the loop is far faster than the bytes go out.
-    a.mov(3, UD_INPID).ld(0, 3).fput(0, I.FIFO_TX)               # the DATA PID from the host side
-    a.mov(3, UD_INDATA).sub(5, 1).jmp("txe", I.Z)                # r5 = data bytes (UD_INLEN counts the PID)
-    a.L("txl").ld(0, 3, inc=1).fput(0, I.FIFO_TX).djnz(5, "txl")
+    a.mbr(0, UD_INPID).fput(0, I.FIFO_TX)                        # the DATA PID from the host side
+    a.sub(5, 1).jmp("txe", I.Z)                                  # r5 = data bytes (UD_INLEN counts the PID)
+    a.ucfg(I.TXM, I.MV_PTR, UD_INDATA).ucfg(I.TXM, I.MV_GO, I.R(5))   # TXM: the data -> TXF, well ahead of the line
     a.L("txe").uwait(I.M_TX)                                     # TXF empty: the CRC unit appends CRC16, EOP
     # the host's handshake: its packet must start before 18 bit times
     a.ucfg(I.CRC, I.CRC_CTRL, 0)                                 # CRC off: a handshake has none
@@ -1056,44 +1104,46 @@ def usb_device(B=4, jp=0, kp=1, turn=None):
     # A handshake came. ACK clears UD_INLEN, and the host side can fill the next packet.
     a.L("hb").evt(I.DET_RX, I.EV_WAITC).fget(1, I.FIFO_RX, nb=1)   # wait for its EOP; r1 = its PID
     a.cmp(1, PID_ACK).jmp("nk", I.NZ)                            # not an ACK: as if none came
-    a.mov(3, UD_INLEN).mov(0, 0).st(0, 3).mov(0, EV_IN_ACK).jmp("ev")
-    # NAK or STALL, as the host side chose in UD_INHS.
-    a.L("nak").mov(3, UD_INHS).ld(1, 3).call("hsend").jmp("idle")
+    a.mov(0, 0).mbw(0, UD_INLEN).mov(0, EV_IN_ACK).jmp("ev")
+    # NAK or STALL, as the host side chose in UD_HS bits 15:8.
+    a.L("nak").mbr(1, UD_HS).shr(1, 8).call("hsend").jmp("idle")
     # A packet shorter than a token, or a bus reset: SE0 still there after 2 us (the limit is 2.5).
     a.L("t_bad").cmp(6, 0).jmp("idle", I.NZ)                     # a PID came: just a bad token, ignore
     a.delay(81).jpin(jp, 1, "idle").mov(0, EV_RESET)             # 2 us after the SE0 began: still SE0 = reset
     # Every event ends here: tell the host what happened.
-    a.L("ev").mov(3, UD_EVENT).st(0, 3).host_irq().jmp("idle")
+    a.L("ev").mbw(0, UD_EVENT).host_irq().jmp("idle")
     return a
 
 
 def usb_host(B=4, jp=0, kp=1, gap=None, timeout=None):
-    """USB host at transaction level, low or full speed. dmem: UH_OP (0
-    transaction, 1 bus reset, 2 EOP = keep-alive, 3 resume; suspend = no transactions), UH_TOK0-2 = the
-    token with its CRC5, UH_DPID = data PID for OUT / SETUP (0 for IN), UH_N = data
-    bytes at 0x10. Reset and resume last n * 256 cycles, n = UH_N + 256 * dmem[UH_N + 1]: 1875 for the
-    10 ms of a reset, 3750 for the 20 ms of a resume.
-    Result: UH_RPID = handshake or data PID, UH_STATUS, UH_RXLEN = bytes
-    received with the PID, at 0x80; controller IRQ. An IN gets an ACK when its
+    """USB host at transaction level, low or full speed. Mailbox: UH_OP (0
+    transaction, 1 bus reset, 2 EOP = keep-alive, 3 resume; suspend = no transactions),
+    UH_DPID = data PID for OUT / SETUP (0 for IN), UH_N = data bytes at dmem[UH_DATA]. DMEM:
+    the token with its CRC5 at dmem[UH_TOK..UH_TOK+2]. Reset and resume last UH_N * 256 cycles:
+    1875 for the 10 ms of a reset, 3750 for the 20 ms of a resume.
+    Result: dmem[UH_RPID..] = the packet received (handshake or data PID first), UH_STATUS,
+    UH_RXLEN = bytes received with the PID; controller IRQ. TXM sends the token and the data,
+    RXM stores the packet after its PID. An IN gets an ACK when its
     PID, CRC and stuffing are good, within 7.5 bit times. Only a one-byte packet (a handshake) is
     reported with a PID that was not checked: the host software looks at UH_RPID."""
     # Registers
     #   r0 byte                       r1 the status for UH_STATUS
-    #   r3 DMEM pointer               r4 CRC value, RX status
+    #   r3 DMEM pointer (the PID)     r4 CRC value, RX status, RXM count
     #   r5 count, time-out            r6 UH_DPID (0 for an IN), also the high byte of a count
     if gap is None:
         gap = max(7, 4 * B - 15)        # >= 2 bit times after SE0 ends, measured from SE0
     if timeout is None:
-        timeout = max(1, (35 * B // 2 - 15 - B) // 2)    # the answer must start before 18 bit times
+        # the answer must start before 18 bit times. + 1: v3 reaches the loop 2 cycles sooner (mbr for mov + ld)
+        timeout = max(1, (35 * B // 2 - 15 - B) // 2 + 1)
     a = Asm()
     _usb_setup(a, B, jp, kp)
     # Wait for the doorbell, then branch on UH_OP. Each operation ends at fin0.
     a.L("idle").jmp("idle", I.NDB).dbclr()
-    a.mov(3, UH_OP).ld(0, 3).cmp(0, 0).jmp("tok", I.Z)           # 0: a transaction
+    a.mbr(0, UH_OP).cmp(0, 0).jmp("tok", I.Z)                    # 0: a transaction
     a.cmp(0, 3).jmp("resu", I.Z)                                 # 3: resume
     a.cmp(0, 1).jmp("keep", I.NZ)                                # 2: keep-alive; 1 falls through: reset
     # Bus reset: SE0 for n * 256 cycles, and then the end of an EOP.
-    a.call("gn")                                                 # r5 = the length, in 256-cycle turns
+    a.mbr(5, UH_N)                                               # r5 = the length, in 256-cycle turns
     a.set(jp, I.SRC_0).setoe(jp, 1).setoe(kp, 1)                 # drive both lines low: SE0
     a.L("rl").delay(254).djnz(5, "rl")                           # 256 cycles a turn
     a.jmp("rel")
@@ -1101,11 +1151,9 @@ def usb_host(B=4, jp=0, kp=1, gap=None, timeout=None):
     a.L("keep").set(jp, I.SRC_0).setoe(jp, 1).setoe(kp, 1)
     a.L("eop").delay(2 * B - 3)
     a.L("rel").set(jp, I.SRC_1).delay(max(0, B - 2)).setoe(jp, 0).setoe(kp, 0).jmp("fin0")
-    # Subroutine: the 16-bit count from UH_N and UH_N + 1, into r5.
-    a.L("gn").mov(3, UH_N).ld(5, 3, inc=1).ld(6, 3).shl(6, 8).or_(5, I.R(6)).ret()
     # resume: K, then the EOP that "keep" ends with. J to K changes two pins: only a TX unit
     # write with DIFF changes both in one edge, with no glitch of SE0 between them.
-    a.L("resu").call("gn")
+    a.L("resu").mbr(5, UH_N)
     a.ucfg(I.TX, I.TX_LINE, I.tx_line(diff=1, d2pin=kp))         # plain differential, no NRZI / EOP
     a.ucfg(I.TX, I.TX_FRAME, I.tx_frame(nbits=1))                # a single bit
     a.ucfg(I.ETX_U, I.D_AFTER, I.A_NONE)                         # and keep driving after it
@@ -1119,44 +1167,44 @@ def usb_host(B=4, jp=0, kp=1, gap=None, timeout=None):
     # token
     a.L("tok")                      # the CRC unit is off or on RX here: neither adds to a TX packet
     _tx_on(a, jp, kp)
-    # The 3 bytes of the token. The host side worked out its CRC5.
-    a.mov(3, UH_TOK0).ld(0, 3, inc=1).fput(0, I.FIFO_TX).ld(0, 3, inc=1).fput(0, I.FIFO_TX)
-    a.ld(0, 3).fput(0, I.FIFO_TX).uwait(I.M_TX)                  # CHAIN sends them; EOP when TXF runs out
+    # The 3 bytes of the token, from DMEM through TXM. The host side worked out its CRC5.
+    a.ucfg(I.TXM, I.MV_PTR, UH_TOK).ucfg(I.TXM, I.MV_GO, 3)
+    a.uwait(I.M_TX)                                              # CHAIN sends them; EOP when TXF runs out
     # No data PID means an IN, and the next thing is the device's answer.
-    a.mov(3, UH_DPID).ld(6, 3).cmp(6, 0).jmp("rxp", I.Z)
+    a.mbr(6, UH_DPID).cmp(6, 0).jmp("rxp", I.Z)
     # data stage (OUT / SETUP)
     _crc_tx(a)                                                   # the data packet gets CRC16, appended by hardware
     a.delay(2 * B)                                               # the gap between token and data
     _tx_on(a, jp, kp)
     a.fput(6, I.FIFO_TX)                                         # the DATA PID
-    a.mov(3, UH_N).ld(5, 3).mov(3, 0x10).cmp(5, 0).jmp("dte", I.Z)   # r5 = data bytes at 0x10; none: zero-length
-    a.L("dtl").ld(0, 3, inc=1).fput(0, I.FIFO_TX).djnz(5, "dtl")
+    a.mbr(5, UH_N).cmp(5, 0).jmp("dte", I.Z)                     # r5 = data bytes; none: zero-length
+    a.ucfg(I.TXM, I.MV_PTR, UH_DATA).ucfg(I.TXM, I.MV_GO, I.R(5))   # TXM: the data -> TXF
     a.L("dte").uwait(I.M_TX)                                     # data, CRC16 and EOP sent
     # receive a packet (handshake or data) into 0x80. Its start must come in time.
     a.L("rxp")
     _crc_rx(a, CRC16_POLY, CRC16_INIT)
     _rx_go(a, jp)
-    # r3 stores from 0x80. The status starts as OK.
-    a.mov(3, 0x80).mov(5, timeout).mov(1, UH_OK)
+    # The status starts as OK.
+    a.mov(5, timeout).mov(1, UH_OK)
     # K means a packet has started. Nothing in time means a time-out.
     a.L("rw").jpin(kp, 1, "sop").djnz(5, "rw")                   # 2 cycles a pass
     a.ustop(I.M_RX).evt(I.DET_RX, I.EV_DISARM).mov(1, UH_TIMEOUT).jmp("done")   # no answer: time-out
     # The first byte decides. Only a good DATA PID in answer to an IN goes on to the ACK path, where
     # time is short: the other checks are made here, as bytes arrive.
-    # A byte can reach the FIFO between finding it empty and seeing the EOP, so nothing is decided
-    # from the FIFO being empty. A one-byte packet is read once more before it is judged (sope). On
-    # the way to the ACK there is no time for that, but the CRC unit has seen the byte already: the
-    # end ("hs") stores what is left, or it would pass as the next packet's PID.
+    # The PID is stored by the firmware, the rest of the packet by RXM. A byte can reach the FIFO
+    # between finding it empty and seeing the EOP: a PID that came with the EOP is read once more
+    # (sope); bytes after the PID are RXM's, and the end ("hs") waits until it has stored them all.
     a.L("sop").fget(0, I.FIFO_RX, nb=1).jmp("s1", I.NC).jmp("sope", I.ERX).jmp("sop")   # wait for the first byte
-    a.L("s1").st(0, 3, inc=1).cmp(6, 0).jmp("rx", I.NZ)          # stored; after an OUT / SETUP, no ACK to give
+    a.L("s1").mov(3, UH_RPID).st(0, 3)                           # the PID
+    a.ucfg(I.RXM, I.MV_PTR, UH_RPID + 1).ucfg(I.RXM, I.MV_GO, 255)   # RXM: the rest of the packet
+    a.cmp(6, 0).jmp("rx", I.NZ)                                  # after an OUT / SETUP, no ACK to give
     a.cmp(0, PID_DATA0).jmp("rd", I.Z).cmp(0, PID_DATA1).jmp("rd", I.Z)   # an IN answered with data
     # anything else gets no ACK: with the CRC unit off the check below cannot pass, and that costs
     # the ACK no time. One byte is a handshake; more is a bad packet.
-    a.L("rx").ucfg(I.CRC, I.CRC_CTRL, 0).jmp("rd")
-    a.L("rs").st(0, 3, inc=1)
-    a.L("rd").fget(0, I.FIFO_RX, nb=1).jmp("rs", I.NC).jmp("rd", I.NERX)   # store bytes until the EOP
+    a.L("rx").ucfg(I.CRC, I.CRC_CTRL, 0)
+    a.L("rd").jmp("rd", I.NERX)                                  # RXM stores bytes until the EOP
     a.urd(4, I.CRC, I.CRC_VAL)                                   # r4 = the CRC register
-    _crc_good(a, CRC16_RES, CRC16_DRIB, "rc2", "sope")
+    _crc_good(a, CRC16_RES, CRC16_DRIB, "rc2", "rn")
     # PID and CRC good. ACK it if the stuffing is good too.
     a.L("rc2").urd(4, I.RX, I.RX_STAT).and_(4, I.RX_ST_SERR).jmp("bad", I.NZ)
     if gap:
@@ -1164,15 +1212,16 @@ def usb_host(B=4, jp=0, kp=1, gap=None, timeout=None):
     _tx_on(a, jp, kp)
     a.mov(0, PID_ACK).fput(0, I.FIFO_TX).uwait(I.M_TX)           # the ACK handshake
     a.jmp("hs")
-    a.L("sope").fget(0, I.FIFO_RX, nb=1).jmp("s1", I.NC)         # a byte that came with the EOP: judge it now
-    # A packet with no ACK: one byte is a handshake, reported as OK. Anything else is a bad packet.
-    a.L("rn").cmp(3, 0x81).jmp("hs", I.Z)
+    a.L("sope").fget(0, I.FIFO_RX, nb=1).jmp("s1", I.NC)         # a PID that came with the EOP: judge it now
+    a.mov(1, UH_BADPKT).mov(0, 0).mbw(0, UH_RXLEN).evt(I.DET_RX, I.EV_CLR).jmp("done")   # an EOP and no byte
+    # A packet with no ACK: one byte (only the PID: RXM stored nothing) is a handshake, reported
+    # as OK. Anything else is a bad packet.
+    a.L("rn").jmp("rn", I.RXF_NEMPTY).urd(4, I.RXM, I.MV_RD_CNT).cmp(4, 0).jmp("hs", I.Z)
     a.L("bad").mov(1, UH_BADPKT)
-    a.L("hs")
-    if B <= 8:                      # at low speed the EOP takes far longer than a turn of the loop
-        a.fget(0, I.FIFO_RX, nb=1).jmp("hse", I.C).st(0, 3, inc=1).jmp("hs").L("hse")
-    # The length is how far r3 moved from 0x80.
-    a.evt(I.DET_RX, I.EV_CLR).sub(3, 0x80).mov(0, I.R(3)).mov(3, UH_RXLEN).st(0, 3)
-    a.L("done").mov(3, UH_STATUS).st(1, 3)                       # the status for the host
+    # RXM stores what is left; the length is the PID and what RXM stored.
+    a.L("hs").jmp("hs", I.RXF_NEMPTY)
+    a.urd(0, I.RXM, I.MV_RD_CNT).add(0, 1).mbw(0, UH_RXLEN).ucfg(I.RXM, I.MV_GO, 0)
+    a.evt(I.DET_RX, I.EV_CLR)
+    a.L("done").mbw(1, UH_STATUS)                                # the status for the host
     a.L("fin0").host_irq().jmp("idle")
     return a

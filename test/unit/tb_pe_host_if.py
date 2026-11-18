@@ -16,6 +16,12 @@ logs every r_we and r_re pulse.
 3. sync_recovers_phase: after a stray single write nibble, OP_SYNC resets
    the nibble phase, so the next full byte write is correct.
 4. irq_passthrough: h_irq follows irq.
+5. late_reads: (v3) addresses with r_late = 1 (DMEM_DATA in the chip) are
+   answered one cycle later: the fake register file shows garbage on
+   r_rdata in the r_re cycle and the value only in the next one, as DMEM's
+   registered read does. Reads of late and normal registers, mixed with
+   writes, still return the right bytes with one r_re each, and h_ack still
+   toggles once per strobe.
 """
 
 import random
@@ -34,6 +40,8 @@ class Env:
         self.writes, self.reads = [], []
         self.stb = 0
         self.max_gap = 0
+        self.late = set()          # addresses answered a cycle late (r_late)
+        self.pending = None
 
     async def monitor(self):
         d = self.dut
@@ -42,9 +50,19 @@ class Env:
             if v(d.r_we):
                 self.regs[v(d.r_addr)] = v(d.r_wdata)
                 self.writes.append((v(d.r_addr), v(d.r_wdata)))
+            a = v(d.r_addr)
+            d.r_late.value = int(a in self.late)
+            if a in self.late:
+                # registered read: the byte appears only in the cycle after r_re
+                d.r_rdata.value = self.pending if self.pending is not None else random.getrandbits(8)
+                self.pending = None
+                if v(d.r_re):
+                    self.pending = self.regs[a]
+                    d.r_rdata.value = self.regs[a] ^ 0xFF          # garbage in the r_re cycle
+            else:
+                d.r_rdata.value = self.regs[a]
             if v(d.r_re):
-                self.reads.append(v(d.r_addr))
-            d.r_rdata.value = self.regs[v(d.r_addr)]
+                self.reads.append(a)
 
     async def op(self, op, nib=0):
         d = self.dut
@@ -76,7 +94,7 @@ class Env:
 
 
 async def setup(dut):
-    for s in ("h_din", "h_op", "h_stb", "r_rdata", "irq"):
+    for s in ("h_din", "h_op", "h_stb", "r_rdata", "r_late", "irq"):
         getattr(dut, s).value = 0
     await start(dut)
     e = Env(dut)
@@ -130,3 +148,20 @@ async def irq_passthrough(dut):
         dut.irq.value = x
         await settle()
         assert v(dut.h_irq) == x
+
+
+@cocotb.test(timeout_time=10, timeout_unit="ms")
+async def late_reads(dut):
+    e = await setup(dut)
+    e.late = {0x29, 0x80, 0xFF}
+    e.max_gap = 3
+    for _ in range(150):
+        a = random.choice([0x29, 0x80, 0xFF, random.getrandbits(8)])
+        if random.random() < 0.3:
+            x = random.getrandbits(8)
+            n = len(e.writes)
+            await e.write(a, x)
+            assert e.writes[n:] == [(a, x)]
+        n = len(e.reads)
+        assert await e.read(a) == e.regs[a], f"addr {a:#x}"
+        assert e.reads[n:] == [a], e.reads[n:]

@@ -58,6 +58,7 @@ import uart  # noqa: E402
 import usb  # noqa: E402
 from chip import Chip  # noqa: E402
 from cocotb.triggers import ClockCycles, FallingEdge  # noqa: E402
+from cocotb.handle import Force, Release  # noqa: E402
 from test_usb import device as usb_device_chip, host as usb_host_chip, send_token_data, tok  # noqa: E402
 
 SCK, MOSI, MISO, CS = 2, 3, 4, 5
@@ -113,7 +114,7 @@ async def test_uart_break_rx(dut):
     B = 64
     chip = await fresh(dut, pe_fw.uart_ex(B=B, N=5, K=1, S=8).words(), R.owner_map(p0=R.OWN_TX))
     chip.drive[1] = 1
-    await chip.bus.dmem_write(2, [0])
+    await chip.bus.mb_write(R.M_STATUS, 0)
     await chip.bus.start()
     await ClockCycles(dut.clk, 3 * B)
     await send_frame(chip, 0x00, B)                    # a real zero byte
@@ -126,7 +127,7 @@ async def test_uart_break_rx(dut):
     await ClockCycles(dut.clk, 3 * B)
     await wait_irq(chip, "break")
     await chip.bus.write(R.RUN, 0)
-    assert await chip.bus.dmem_read(2, 1) == [1], "one break"
+    assert await chip.bus.mb_read(R.M_STATUS) == 1, "one break"
     await chip.bus.write(R.RUN, 1)
     await send_frame(chip, 0xC3, B)
     assert await chip.read_rx(1) == [0xC3], "frames work after a break"
@@ -139,7 +140,8 @@ async def test_uart_break_tx(dut):
     n = 15
     chip = await fresh(dut, pe_fw.uart_ex(B=B, N=5, K=1, S=8).words(), R.owner_map(p0=R.OWN_TX))
     chip.loop.append((0, 1))
-    await chip.bus.dmem_write(2, [0, n])
+    await chip.bus.mb_write(R.M_STATUS, 0)
+    await chip.bus.mb_write(R.M_NTX, n)
     await chip.bus.start()
     await ClockCycles(dut.clk, 3 * B)
     t0 = len(chip.samples)
@@ -150,7 +152,7 @@ async def test_uart_break_tx(dut):
     assert n * B <= low <= n * B + 8, f"break of {low} cycles"
     assert await chip.transfer([0x3C], n_rx=1, limit=20000) == [0x3C]
     await chip.bus.write(R.RUN, 0)
-    assert await chip.bus.dmem_read(2, 1) == [1], "its own break is received"
+    assert await chip.bus.mb_read(R.M_STATUS) == 1, "its own break is received"
 
 
 # -------------------------------------------------------------------- SPI
@@ -175,11 +177,12 @@ async def stream(dut, B, n, mode, msb=1):
     await chip.bus.start()
     await ClockCycles(dut.clk, 40)
     down = [random.getrandbits(8) for _ in range(n)]
-    await chip.bus.dmem_write(0, [n] + down)
+    await chip.bus.mb_write(R.M_NTX, n)
+    await chip.bus.dmem_write(0, down)
     t0 = len(chip.samples)
     await chip.bus.write(R.DOORBELL, 0)
     await wait_irq(chip, f"stream B={B} mode {mode}")
-    assert await chip.bus.dmem_read(0x7F, 1) == [0], f"B={B}: firmware fell behind"
+    assert await chip.bus.mb_read(R.M_STATUS) == 0, f"B={B}: firmware fell behind"
     assert dev.rx == down, f"B={B} mode {mode}: device got {dev.rx}"
     assert await chip.bus.dmem_read(0x80, n) == up, f"B={B} mode {mode}: chip read"
     p = sck_periods(chip, t0)
@@ -208,10 +211,11 @@ async def test_spi_stream_fast(dut):
     await chip.bus.start()
     await ClockCycles(dut.clk, 40)
     down = [random.getrandbits(8) for _ in range(126)]
-    await chip.bus.dmem_write(0, [126] + down)
+    await chip.bus.mb_write(R.M_NTX, 126)
+    await chip.bus.dmem_write(0, down)
     await chip.bus.write(R.DOORBELL, 0)
     await wait_irq(chip, "stream B=2")
-    st = (await chip.bus.dmem_read(0x7F, 1))[0]
+    st = await chip.bus.mb_read(R.M_STATUS)
     assert st == 0, f"status {st}: SCK paused"
     dut._log.info(f"stream B=2, 126 bytes: status {st}")
     assert dev.rx == down and await chip.bus.dmem_read(0x80, 126) == up
@@ -224,15 +228,26 @@ async def test_spi_stream_lost(dut):
     chip.devices.append(spi.SpiSlave(SCK, MOSI, MISO, CS, tx=[0x5A] * 30))
     await chip.bus.start()
     await ClockCycles(dut.clk, 40)
-    await chip.bus.dmem_write(0, [30] + [0xA5] * 30)
+    await chip.bus.mb_write(R.M_NTX, 30)
+    await chip.bus.dmem_write(0, [0xA5] * 30)
     await chip.bus.write(R.DOORBELL, 0)
-    await ClockCycles(dut.clk, 200)
-    await chip.bus.write(R.RUN, 0)                     # TX and RX run on: RXF takes 8, the next is dropped
-    await ClockCycles(dut.clk, 12 * 8 * 4)
-    assert await chip.bus.read(R.STATUS) & 0x20, "RXF overran"
-    await chip.bus.write(R.RUN, 1)
+    # A reply is lost: RXM takes each byte from RXF in the cycle it arrives, so a real host read over the
+    # slow host bus almost never wins. Force one host pop (it has priority over RXM) in a cycle with a byte
+    # in RXF: RXM then stores 29 of 30. The model cannot see a forced signal, so lockstep stops here.
+    if chip.ls is not None:
+        chip.ls.stop()
+    up = dut.user_project
+    for _ in range(5000):
+        await FallingEdge(dut.clk)
+        if not int(up.rxf_empty.value):
+            up.h_rxf_rd.value = Force(1)
+            await FallingEdge(dut.clk)
+            up.h_rxf_rd.value = Release()
+            break
+    else:
+        raise AssertionError("no reply ever reached RXF")
     await wait_irq(chip, "a lost reply must not hang the firmware")
-    assert await chip.bus.dmem_read(0x7F, 1) == [2], "status: reply lost"
+    assert await chip.bus.mb_read(R.M_STATUS) == 2, "status: reply lost"
     await chip.bus.write(R.RUN, 0)
 
 
@@ -254,12 +269,16 @@ async def test_spi_3wire_master(dut):
         t = cocotb.start_soon(no_contention(dut, dev, MOSI))
         await chip.bus.start()
         await ClockCycles(dut.clk, 40)
-        await chip.bus.dmem_write(0, [3, 0, 0x11, 0x22, 0x33])
+        await chip.bus.mb_write(R.M_NTX, 3)
+        await chip.bus.mb_write(R.M_NRX, 0)
+        await chip.bus.dmem_write(0, [0x11, 0x22, 0x33])
         await chip.bus.write(R.DOORBELL, 0)
         await wait_irq(chip, "3-wire write")
         assert dev.rx == [0x11, 0x22, 0x33], f"mode {mode}: {dev.rx}"
         dev.rx.clear()
-        await chip.bus.dmem_write(0, [1, 3, 0x81])
+        await chip.bus.mb_write(R.M_NTX, 1)
+        await chip.bus.mb_write(R.M_NRX, 3)
+        await chip.bus.dmem_write(0, [0x81])
         await chip.bus.write(R.DOORBELL, 0)
         await wait_irq(chip, "3-wire read")
         assert dev.rx == [0x81], f"mode {mode}: {dev.rx}"
@@ -331,12 +350,19 @@ async def i2c_master_chip(dut, peer=None, **kw):
 
 
 async def i2c_req(chip, addr, wdata=(), nread=0, hi=None):
-    if hi is not None:
-        await chip.bus.dmem_write(0x7E, [hi])
-    await chip.bus.dmem_write(0, [addr, len(wdata), nread] + list(wdata))
-    await chip.bus.write(R.DOORBELL, 0)
+    await i2c_post(chip, addr | ((hi or 0) << 8), wdata, nread)
     await wait_irq(chip, "I2C master", limit=30000)
-    return (await chip.bus.dmem_read(0x7F, 1))[0], (await chip.bus.dmem_read(0x80, nread) if nread else [])
+    return await chip.bus.mb_read(R.M_STATUS), (await chip.bus.dmem_read(0x80, nread) if nread else [])
+
+
+async def i2c_post(chip, addr, wdata=(), nread=0):
+    """An I2C master request (pe_fw.i2c_master): the mailbox, the write data, the doorbell."""
+    await chip.bus.mb_write(R.M_ADDR, addr)
+    await chip.bus.mb_write(R.M_NTX, len(wdata))
+    await chip.bus.mb_write(R.M_NRX, nread)
+    if wdata:
+        await chip.bus.dmem_write(0, list(wdata))
+    await chip.bus.write(R.DOORBELL, 0)
 
 
 @pe_build.test("i2c")
@@ -411,8 +437,7 @@ async def test_i2c_arbitration(dut):
     # The chip sends 1011000 W, the rival 1010000 W: the chip reads 0 after sending 1 at bit 4
     rival = Rival(0xA0)
     chip = await i2c_master_chip(dut, rival, B=64, arb=True)
-    await chip.bus.dmem_write(0, [0x58, 1, 0, 0x55])
-    await chip.bus.write(R.DOORBELL, 0)
+    await i2c_post(chip, 0x58, [0x55])
     t0 = len(chip.samples)
     lost_at = None
     for _ in range(4000):
@@ -424,7 +449,7 @@ async def test_i2c_arbitration(dut):
         if not rival.active and lost_at is not None:
             break
     await wait_irq(chip, "arbitration")
-    assert await chip.bus.dmem_read(0x7F, 1) == [3], "the chip lost"
+    assert await chip.bus.mb_read(R.M_STATUS) == 3, "the chip lost"
     assert not int(dut.uio_oe.value) & 0xC0, "both lines released"
     tr_scl, tr_sda = chip.trace(SCL, t0), chip.trace(SDA, t0)
     stops = sum(1 for k in range(1, len(tr_sda)) if tr_scl[k] and tr_scl[k - 1] and tr_sda[k] and not tr_sda[k - 1])
@@ -443,13 +468,12 @@ async def test_i2c_arbitration(dut):
     # The bus is busy when the request comes: the chip waits for it to be free
     chip = await i2c_master_chip(dut, i2c.I2cSlave(SCL, SDA, 0x28), B=64, arb=True)
     chip.drive[SDA] = 0
-    await chip.bus.dmem_write(0, [0x28, 1, 0, 0x01])
-    await chip.bus.write(R.DOORBELL, 0)
+    await i2c_post(chip, 0x28, [0x01])
     await ClockCycles(dut.clk, 300)
     assert not int(dut.uio_oe.value) & 0xC0, "no START on a busy bus"
     del chip.drive[SDA]
     await wait_irq(chip, "free bus")
-    assert await chip.bus.dmem_read(0x7F, 1) == [0]
+    assert await chip.bus.mb_read(R.M_STATUS) == 0
     await chip.bus.write(R.RUN, 0)
 
 
@@ -586,8 +610,8 @@ async def test_usb_host_resume(dut):
     for speed in ("FS", "LS"):
         chip, peer, B, jp, kp = await usb_host_chip(dut, speed)
         n = 2
-        await chip.bus.dmem_write(F.UH_OP, [3])
-        await chip.bus.dmem_write(F.UH_N, [n, 0])
+        await chip.bus.mb_write(F.UH_OP, 3)
+        await chip.bus.mb_write(F.UH_N, n)
         t0 = len(chip.samples)
         await chip.bus.write(R.DOORBELL, 0)
         await wait_irq(chip, f"{speed}: resume")

@@ -1,5 +1,5 @@
-# pe_dmem: host priority, controller write dropped in a host cycle, data integrity
-# at a solver-chosen address (unbounded).
+# pe_dmem (v3, one port, registered read): data integrity at a solver-chosen address,
+# and a read returns that byte from the next cycle until the next read (unbounded).
 [tasks]
 d256
 d64

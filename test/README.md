@@ -1,47 +1,49 @@
-# Sample testbench for a Tiny Tapeout project
+# Tests
 
-This is a sample testbench for a Tiny Tapeout project. It uses [cocotb](https://docs.cocotb.org/en/stable/) to drive the DUT and check the outputs.
-See below to get started or for more information, check the [website](https://tinytapeout.com/hdl/testing/).
+The chip tests drive `tt_um_sahil_protoemu` through its host bus with [cocotb](https://docs.cocotb.org/en/stable/), load firmware from `common/pe_fw.py`, and check the protocol pins against peers written in Python (UART, SPI, I2C and USB devices and hosts).
 
-## Setting up
+## Layout
 
-1. Edit [Makefile](Makefile) and modify `PROJECT_SOURCES` to point to your Verilog files.
-2. Edit [tb.v](tb.v) and replace `tt_um_example` with your module name.
+| Path | Contents |
+|---|---|
+| `tb.v`, `tb_dual.v` | the test benches: one chip, or two chips wired together |
+| `test.py` | registers, firmware loading, errors and IRQ |
+| `test_uart.py`, `test_spi.py`, `test_i2c.py`, `test_usb.py`, `test_modes.py` | each protocol and its options |
+| `test_fabric.py`, `test_gaps.py` | pin fabric, protocol switches, corner cases |
+| `test_lockstep.py`, `test_cross.py` | the RTL against the Python model (`../model`) |
+| `test_dual.py` | two emulators talking to each other (run with `TB=tb_dual`) |
+| `common/pe_isa.py` | the assembler: instruction encodings, condition and unit numbers, config field helpers |
+| `common/pe_fw.py` | all firmware, with the mailbox and DMEM conventions in its header |
+| `common/pe_host.py` | the host-bus driver and request helpers (mailbox, DMEM, doorbell) |
+| `common/lockstep.py` | runs the model next to the RTL and compares every register each cycle |
+| `models/` | the PDK's behavioural model of the SRAM macro, for simulation |
+| `unit/` | a bench for each module (`pytest` in that folder) |
 
-## How to run
-
-To run the RTL simulation:
+## Running
 
 ```sh
-make -B
+make                          # every chip test, RTL simulation (Icarus)
+make LOCKSTEP=1               # the same, comparing the RTL with the model on every cycle
+make COCOTB_TEST_MODULES=test_spi        # one test file
+make PROTOCOLS=uart,i2c       # a build with only some protocols; tests for the others are skipped
+make DMEM_IMPL=0              # flip-flop data memory instead of the SRAM macro
+make MEM_CG=0                 # memories without clock gating
+make TB=tb_dual COCOTB_TEST_MODULES=test_dual MODULE=test_dual   # two chips
+cd unit && pytest             # unit benches
 ```
 
-To run gatelevel simulation, first harden your project and copy `../runs/wokwi/results/final/verilog/gl/{your_module_name}.v` to `gate_level_netlist.v`.
+Each combination of `PROTOCOLS`, `MEM_CG` and `DMEM_IMPL` builds in its own `sim_build/` folder.
 
-Then run:
+## Gate-level simulation
+
+After the GDS flow, copy the gate-level netlist to `gate_level_netlist.v` and run:
 
 ```sh
 make -B GATES=yes
 ```
 
-If you wish to save the waveform in VCD format instead of FST format, edit tb.v to use `$dumpfile("tb.vcd");` and then run:
+The SRAM macro's behavioural model is included in this build as well.
 
-```sh
-make -B FST=
-```
+## Waveforms
 
-This will generate `tb.vcd` instead of `tb.fst`.
-
-## How to view the waveform file
-
-Using GTKWave
-
-```sh
-gtkwave tb.fst tb.gtkw
-```
-
-Using Surfer
-
-```sh
-surfer tb.fst
-```
+The benches write `tb.fst` (or `tb_dual.fst`). View with `gtkwave tb.fst tb.gtkw` or `surfer tb.fst`. To write VCD instead, edit `tb.v` to use `$dumpfile("tb.vcd");` and run `make -B FST=`.

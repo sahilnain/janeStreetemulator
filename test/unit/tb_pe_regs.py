@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-tb_pe_regs: unit test for src/host/pe_regs.v (v2 register map).
+tb_pe_regs: unit test for src/host/pe_regs.v (v3 register map).
 
 What is checked
 ---------------
@@ -16,6 +16,10 @@ DMEM strobes, RUN/RESTART/START_PC/DOORBELL, pin config, error clears).
    bits written; a new pulse in the same cycle wins.
 4. irq_sources: each IRQ_EN bit with its source.
 5. dmem_auto_inc: DMEM_DATA reads and writes increment DMEM_ADDR (wrap).
+6. mailbox: (v3) M0-M7 at 0x30-0x3F, host byte writes and reads, the
+   controller's mbw (mb_we) and its grant: blocked only by a host write to a
+   byte of the same register in that cycle; r_late only for DMEM_DATA. Also
+   part of random_access, with random controller writes.
 """
 
 import random
@@ -30,12 +34,13 @@ AW = max(1, (DEPTH - 1).bit_length())
 INS = ("r_addr", "r_wdata", "r_we", "r_re", "txf_full", "txf_empty", "txf_count", "txf_overrun",
        "rxf_rdata", "rxf_full", "rxf_empty", "rxf_count", "rxf_overrun", "pc", "cstat_in",
        "ill_err", "stk_err", "tx_underrun", "ctrl_irq", "rx_overrun", "pin_in", "owner_err",
-       "dm_rdata")
+       "dm_rdata", "mb_idx", "mb_we", "mb_wdata")
 OUTS = ("r_rdata", "irq", "im_we", "im_waddr", "im_wdata", "txf_wr", "txf_wdata",
         "txf_clr_overrun", "rxf_rd", "rxf_clr_overrun", "run", "restart", "start_pc", "db_set",
         "rx_ovr_clr", "pin_owner", "pin_od", "pin_filt", "owner_clr_err", "dm_acc", "dm_we", "dm_addr",
-        "dm_wdata")
-MAPPED = list(range(0x00, 0x16)) + [0x18, 0x19, 0x1A, 0x1B, 0x20, 0x21, 0x22, 0x23, 0x24, 0x28, 0x29]
+        "dm_wdata", "r_late", "mb_rdata", "mb_gnt")
+MAPPED = list(range(0x00, 0x16)) + [0x18, 0x19, 0x1A, 0x1B, 0x20, 0x21, 0x22, 0x23, 0x24, 0x28, 0x29] + \
+    list(range(0x30, 0x40))
 
 
 class Regs:
@@ -43,6 +48,7 @@ class Regs:
         self.run = self.start_pc = self.owner = self.od = self.filt = self.imaddr = self.stage = 0
         self.irq_en = self.imem_err = self.dm_addr = 0
         self.st2 = 0  # bits 0,1,3,4
+        self.mbox = [0] * 8
 
     def comb(self, i):
         a, d, we, re = i["r_addr"], i["r_wdata"], i["r_we"], i["r_re"]
@@ -55,7 +61,7 @@ class Regs:
                  (i["txf_full"] << 1) | i["txf_empty"]
         c4 = min(CW, 4)
         cm = (1 << c4) - 1
-        rd = {0x00: 0x50, 0x01: 0x02, 0x02: self.run, 0x04: status, 0x06: self.irq_en,
+        rd = {0x00: 0x50, 0x01: 0x03, 0x02: self.run, 0x04: status, 0x06: self.irq_en,
               0x07: (i["txf_count"] & cm) | ((i["rxf_count"] & cm) << 4), 0x09: i["rxf_rdata"],
               0x0A: self.imaddr & 0xFF, 0x0D: self.imaddr >> 8, 0x0B: i["pin_in"] & 0xFF,
               0x0C: (i["pin_in"] >> 8) & 0xFF, 0x0E: s2, 0x14: self.od & 0xFF, 0x15: self.od >> 8,
@@ -64,6 +70,10 @@ class Regs:
               0x1B: (self.owner >> 24) & 0xFF, 0x20: self.start_pc & 0xFF, 0x21: self.start_pc >> 8,
               0x22: i["pc"] & 0xFF, 0x23: i["pc"] >> 8, 0x24: (i["cstat_in"] & 0xFE) | self.run,
               0x28: self.dm_addr, 0x29: i["dm_rdata"]}.get(a, 0)
+        if 0x30 <= a <= 0x3F:
+            rd = (self.mbox[(a >> 1) & 7] >> (8 * (a & 1))) & 0xFF
+        mb_host = we and 0x30 <= a <= 0x3F
+        gnt = int(not (mb_host and ((a >> 1) & 7) == i["mb_idx"]))
         commit = we and a == 0x13
         o = dict(r_rdata=rd, irq=irq, im_we=int(commit and not self.run), im_waddr=self.imaddr,
                  im_wdata=(d << 24) | self.stage, txf_wr=int(we and a == 0x08), txf_wdata=d,
@@ -73,7 +83,7 @@ class Regs:
                  db_set=int(we and a == 0x0F), rx_ovr_clr=int(we and a == 0x0E and d >> 2 & 1),
                  pin_owner=self.owner, pin_od=self.od, pin_filt=self.filt, owner_clr_err=int(we and a == 0x05 and d >> 6 & 1),
                  dm_acc=int((we or re) and a == 0x29), dm_we=int(we and a == 0x29), dm_addr=self.dm_addr,
-                 dm_wdata=d)
+                 dm_wdata=d, r_late=int(a == 0x29), mb_rdata=self.mbox[i["mb_idx"]], mb_gnt=gnt)
         return o
 
     def step(self, i, o):
@@ -117,6 +127,11 @@ class Regs:
             nb = i[src] | (old & ~((w1c >> bit) & 1) & 1)
             new |= nb << bit
         self.st2 = new
+        if i["mb_we"] and o["mb_gnt"]:
+            self.mbox[i["mb_idx"]] = i["mb_wdata"]
+        if we and 0x30 <= a <= 0x3F:
+            k = (a >> 1) & 7
+            self.mbox[k] = (self.mbox[k] & 0xFF) | (d << 8) if a & 1 else (self.mbox[k] & 0xFF00) | d
         if we and a == 0x28:
             self.dm_addr = d
         elif o["dm_acc"]:
@@ -163,7 +178,8 @@ def rand_in():
         i[k] = int(random.random() < 0.03)
     i.update(txf_count=random.getrandbits(CW), rxf_count=random.getrandbits(CW),
              rxf_rdata=random.getrandbits(8), pc=random.getrandbits(AW), cstat_in=random.getrandbits(8),
-             pin_in=random.getrandbits(NP), dm_rdata=random.getrandbits(8))
+             pin_in=random.getrandbits(NP), dm_rdata=random.getrandbits(8), mb_idx=random.getrandbits(3),
+             mb_we=int(random.random() < 0.2), mb_wdata=random.getrandbits(16))
     return i
 
 
@@ -234,3 +250,29 @@ async def dmem_auto_inc(dut):
         await cycle(dut, m, base(r_we=k & 1, r_re=1 - (k & 1), r_addr=0x29, r_wdata=k))
     assert m.dm_addr == 0x02
     await cycle(dut, m, base(r_re=1, r_addr=0x28))
+
+
+@cocotb.test()
+async def mailbox(dut):
+    m = await init(dut)
+    # host writes every byte, reads it back
+    for k in range(8):
+        await cycle(dut, m, base(r_addr=0x30 + 2 * k, r_we=1, r_wdata=0x10 + k))
+        await cycle(dut, m, base(r_addr=0x31 + 2 * k, r_we=1, r_wdata=0xA0 + k))
+    for a in range(0x30, 0x40):
+        await cycle(dut, m, base(r_addr=a, r_re=1))
+    # the controller reads every register (mb_rdata) and writes it
+    for k in range(8):
+        await cycle(dut, m, base(mb_idx=k))
+        await cycle(dut, m, base(mb_idx=k, mb_we=1, mb_wdata=0x1234 * (k + 1) & 0xFFFF))
+        await cycle(dut, m, base(r_addr=0x30 + 2 * k, r_re=1, mb_idx=k))
+    # a host write to the same register blocks mbw (mb_gnt = 0, the host byte lands, the mbw is not done)
+    for hb in (0, 1):
+        await cycle(dut, m, base(r_addr=0x34 + hb, r_we=1, r_wdata=0x5A, mb_idx=2, mb_we=1, mb_wdata=0xBEEF))
+        assert m.mbox[2] & (0xFF << (8 * hb)) == 0x5A << (8 * hb)
+    # ... and to another register does not
+    await cycle(dut, m, base(r_addr=0x36, r_we=1, r_wdata=0x77, mb_idx=2, mb_we=1, mb_wdata=0xBEEF))
+    assert m.mbox[2] == 0xBEEF and m.mbox[3] & 0xFF == 0x77
+    # r_late only for DMEM_DATA
+    for a in MAPPED:
+        await cycle(dut, m, base(r_addr=a))

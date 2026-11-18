@@ -11,13 +11,18 @@ the word for pc is always ready. comb() computes everything the instruction does
 this cycle from the current state and inputs; clock() applies it. A blocked
 instruction has no effect (only a timed `wait` counts rd down) and retries in the
 next cycle.
+
+v3: `ld` takes 2 cycles, because DMEM has a registered read: the first sends the read
+(dm_re, when the port is granted) and sets ld_ph; the second writes the byte, which
+is then on dm_rdata. `mbr` / `mbw` read and write the mailbox (pe_regs); `mbw` blocks
+when the host writes the same mailbox register in that cycle.
 """
 
 OP_NOP, OP_JMP, OP_DJNZ, OP_CALL, OP_RET = 0, 1, 2, 3, 4
 OP_DELAY, OP_MOV, OP_ADD, OP_SUB, OP_AND, OP_OR, OP_XOR, OP_SHL, OP_SHR, OP_CMP = range(6, 16)
 OP_SET, OP_SETOE, OP_WAIT, OP_JPIN, OP_RDPINS, OP_BITIN, OP_BITOUT = range(16, 23)
 OP_FGET, OP_FPUT, OP_LD, OP_ST, OP_UCFG, OP_URD, OP_USTART, OP_USTOP = range(23, 31)
-OP_UWAIT, OP_EVT, OP_HOST, OP_PAR = range(31, 35)
+OP_UWAIT, OP_EVT, OP_HOST, OP_PAR, OP_MBR, OP_MBW = range(31, 37)
 
 
 class ModelError(Exception):
@@ -37,6 +42,7 @@ class Ctrl:
 
     def reset(self):
         self.run_q = self.pc = self.z = self.c = self.to = self.db = self.sp = self.stall = self.blocked = 0
+        self.ld_ph = 0
         self.r = [0] * 8
 
     def ready(self, run):
@@ -46,12 +52,15 @@ class Ctrl:
         table = (1, self.z, self.z ^ 1, self.c, self.c ^ 1, self.to, self.to ^ 1, s["erx"], s["erx"] ^ 1,
                  s["tx_busy"], s["tx_busy"] ^ 1, s["rx_busy"], s["rx_busy"] ^ 1, s["etx"], s["etx"] ^ 1,
                  s["ferr"], s["ferr"] ^ 1, s["txf_empty"], s["txf_empty"] ^ 1, s["txf_full"], s["rxf_empty"],
-                 s["rxf_empty"] ^ 1, s["rxf_full"], self.db, self.db ^ 1, s["rxrdy"], s["rxrdy"] ^ 1)
+                 s["rxf_empty"] ^ 1, s["rxf_full"], self.db, self.db ^ 1, s["rxrdy"], s["rxrdy"] ^ 1,
+                 s["txm_busy"], s["txm_busy"] ^ 1, s["rxm_busy"], s["rxm_busy"] ^ 1)
         return bool(table[code]) if code < len(table) else False
 
-    def comb(self, run, word, s, rd_data, dm_rdata):
-        """s: status inputs. rd_data(unit, idx), dm_rdata(addr). Returns the cycle's effects."""
-        e = dict(wm=0, wv=0, om=0, ov=0, txf_rd=0, rxf_rd=0, txf_wr=0, rxf_wr=0, fdata=0, dm_we=0, dm_addr=0,
+    def comb(self, run, word, s, rd_data, dm_rdata, mb_rdata):
+        """s: status inputs. rd_data(unit, idx), dm_rdata: DMEM's registered output, mb_rdata(idx).
+        Returns the cycle's effects."""
+        e = dict(wm=0, wv=0, om=0, ov=0, txf_rd=0, rxf_rd=0, txf_wr=0, rxf_wr=0, fdata=0, dm_we=0, dm_re=0,
+                 dm_addr=0, mb_we=0, mb_idx=0, mb_wdata=0,
                  dm_wdata=0, cfg_we=0, cfg_unit=0, cfg_idx=0, cfg_data=0, rd_unit=0, rd_idx=0, rd_strobe=0,
                  start_mask=0, start_imm=0, start_data=0, stop_mask=0, det_sel=0, det_clr=0, det_arm=0,
                  det_disarm=0, host_irq=0, ill=0, stk=0, ready=0, db_clr=0, done=1, nxt=None)
@@ -83,6 +92,7 @@ class Ctrl:
         e["det_sel"] = fa & 1
         e["fdata"] = ra & 0xFF
         e["dm_addr"], e["dm_wdata"] = rb & 0xFF, ra & 0xFF
+        e["mb_idx"], e["mb_wdata"] = imm & 7, ra
 
         if op in (OP_NOP, OP_DELAY):
             pass
@@ -178,16 +188,28 @@ class Ctrl:
                 e["rxf_wr" if f_rx else "txf_wr"] = 1
                 if imm & 1:
                     c = 0
-        elif op in (OP_LD, OP_ST):
+        elif op == OP_LD:
+            if not self.ld_ph:
+                done = 0                       # the read goes out now; the byte is written next cycle
+                e["dm_re"] = int(bool(s["dm_gnt"]))
+            else:
+                wa = dm_rdata
+                if imm & 1:
+                    wb = (rb + 1) & 0xFFFF
+        elif op == OP_ST:
             if not s["dm_gnt"]:
                 done = 0
             else:
-                if op == OP_ST:
-                    e["dm_we"] = 1
-                else:
-                    wa = dm_rdata(rb & 0xFF)
+                e["dm_we"] = 1
                 if imm & 1:
                     wb = (rb + 1) & 0xFFFF
+        elif op == OP_MBR:
+            wa = mb_rdata(imm & 7)
+        elif op == OP_MBW:
+            if not s["mb_gnt"]:
+                done = 0
+            else:
+                e["mb_we"] = 1
         elif op == OP_UCFG:
             e["cfg_we"] = 1
         elif op == OP_URD:
@@ -244,9 +266,9 @@ class Ctrl:
                             push=ret if push else None, pop=pop)
         else:
             e["cfg_we"] = e["cfg_we"]
-            e["nxt"] = dict(pc=self.pc, z=self.z, c=self.c, to=self.to, stall=0, blocked=1,
+            e["nxt"] = dict(pc=self.pc, z=self.z, c=self.c, to=self.to, stall=0, blocked=int(not e["dm_re"]),
                             wa=wa if op == OP_WAIT else None, wb=None, a=fa, b=fb, push=None, pop=0)
-            for k in ("txf_rd", "rxf_rd", "txf_wr", "rxf_wr", "dm_we", "start_mask", "det_clr"):
+            for k in ("txf_rd", "rxf_rd", "txf_wr", "rxf_wr", "dm_we", "mb_we", "start_mask", "det_clr"):
                 e[k] = 0
         e["done"] = done
         return e
@@ -262,6 +284,7 @@ class Ctrl:
             self.reset()
             return
         self.run_q = int(bool(run))
+        self.ld_ph = int(bool(e["dm_re"]) and not restart)
         if db_set:
             self.db = 1
         elif e["db_clr"] and e["ready"]:

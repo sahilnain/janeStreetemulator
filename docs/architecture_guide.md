@@ -25,19 +25,24 @@ So UART, SPI, I2C and USB are all just different programs. No block in the hardw
            │ pe_host_if  │  nibbles → one register access
            └──────┬──────┘
            ┌──────▼──────┐
-           │   pe_regs   │  the host's register map
+           │   pe_regs   │  the host's register map, mailbox M0–M7
            └┬───┬───┬───┬┘
-   program  │   │   │   │  mailbox
-       ┌────▼─┐ │   │ ┌─▼──────┐
-       │ IMEM │ │   │ │  DMEM  │
-       └────┬─┘ │   │ └─▲──────┘
-            │   │   │   │ ld / st
+   program  │   │   │   │ DMEM_ADDR / DMEM_DATA
+       ┌────▼─┐ │   │ ┌─▼──────────────────┐
+       │ IMEM │ │   │ │      pe_dmov       │  DMEM port arbiter and
+       └────┬─┘ │   │ │  TXM: DMEM → TXF   │  the two data movers
+            │   │   │ │  RXM: RXF → DMEM   │
+            │   │   │ └─▲─────────────┬────┘
+            │   │   │   │ ld / st     │ one port
+            │   │   │   │       ┌─────▼──────┐
+            │   │   │   │       │DMEM (SRAM) │  256 × 8, payload only
+            │   │   │   │       └────────────┘
        ┌────▼───┼───┼───┴───┐
        │    pe_ctrl         │  the processor: runs the firmware
-       │    (pe_decode)     │
+       │    (pe_decode)     │  (mbr / mbw reach the mailbox)
        └─┬───┬──┼───┼───┬───┘
   commands│   │ ┌▼───▼┐  │ commands
-          │   │ │FIFOs│  │  TX FIFO, RX FIFO (byte queues)
+          │   │ │FIFOs│  │  TX FIFO, RX FIFO (byte queues; the movers use them too)
           │   │ └┬───┬┘  │
      ┌────▼┐  │  │   │  ┌▼────┐     ┌───────┐
      │ ETX ├──┼─►│   │◄─┤ ERX │     │pe_crc │ checks bits as they pass
@@ -73,7 +78,9 @@ So UART, SPI, I2C and USB are all just different programs. No block in the hardw
 | Name | Size | Holds |
 |---|---|---|
 | IMEM | 162 × 29 bits | the firmware |
-| DMEM | 256 × 8 bits | requests and results between the host and the firmware |
+| DMEM | 256 × 8 bits, the IHP SRAM macro | payload bytes: data to send and data received (v3) |
+| Mailbox | 8 × 16 bits | control values between the host and the firmware: the request and the result (v3) |
+| TX / RX data movers | units 5 and 6 | copy payload between DMEM and the FIFOs without the controller (v3) |
 | TX FIFO, RX FIFO | 8 × 8 bits each | bytes going to and coming from the units |
 
 ## 3. The instruction set
@@ -105,7 +112,7 @@ Every instruction is 29 bits:
 
 | Field | Meaning |
 |---|---|
-| `opcode` | which instruction. 34 of 64 are used; a reserved one acts as `nop` and sets `ill_err` |
+| `opcode` | which instruction. 36 of 64 are used (0–36 except 5); a reserved one acts as `nop` and sets `ill_err` |
 | `A` | usually the destination register, or a unit number |
 | `I` | 1: the operand is `imm16`. 0: the operand is the register `imm16[2:0]` |
 | `B` | a sub-operation, second register or config register number |
@@ -123,7 +130,7 @@ This is what the assembler in `test/common/pe_isa.py` does. In firmware it is wr
 
 ### 3.3 Timing
 
-- **Every instruction takes 1 cycle.** The memory read takes a cycle, but it overlaps with execution: while one instruction executes, the next one is fetched (section 4.4).
+- **Every instruction takes 1 cycle, except `ld`, which takes 2** (the SRAM's read is registered: the byte arrives the cycle after the address). The memory read takes a cycle, but it overlaps with execution: while one instruction executes, the next one is fetched (section 4.4).
 - **A delay** of `n` extra cycles takes `n + 1` in total.
 - **A blocked instruction** has no effect and is tried again every cycle. `wait`, `uwait`, `evt wait`, and `fget` or `fput` when the FIFO is empty or full all block. This is how firmware idles: there is no halt instruction.
 
@@ -154,8 +161,10 @@ This is what the assembler in `test/common/pe_isa.py` does. In firmware it is wr
 | `TXF_EMPTY`, `TXF_FULL`, `RXF_EMPTY`, `RXF_FULL` | FIFO state |
 | `DB` | the host rang the doorbell |
 | `RXRDY` | the RX unit holds a finished word |
+| `TXM_BUSY`, `TXM_IDLE` | the TX mover still has bytes to read or push (v3) |
+| `RXM_BUSY`, `RXM_IDLE` | the RX mover still has bytes to store (v3) |
 
-Most have an opposite too (`NZ`, `NC`, `NERX`, `TXU_IDLE`, and so on), except the two "full" conditions.
+Most have an opposite too (`NZ`, `NC`, `NERX`, `TXU_IDLE`, and so on), except the two "full" conditions. The mover conditions come as explicit pairs.
 
 **Registers and ALU** (16 bits)
 
@@ -187,14 +196,16 @@ None of the current firmware uses `rdpins`, `bitin`, `bitout` or `xor`.
 |---|---|---|
 | 23 | `fget rd, fifo [,nb]` | take a byte. Blocks if empty; with `nb`, sets C instead |
 | 24 | `fput rs, fifo [,nb]` | add a byte. Blocks if full; with `nb`, drops it and sets C |
-| 25 | `ld rd, [ra] [,+]` | read DMEM, optionally `ra + 1` |
+| 25 | `ld rd, [ra] [,+]` | read DMEM, optionally `ra + 1`. 2 cycles: DMEM has a registered read |
 | 26 | `st rs, [ra] [,+]` | write DMEM, optionally `ra + 1` |
+| 35 | `mbr rd, i` | read mailbox register M[i] |
+| 36 | `mbw rs, i` | write mailbox register M[i] |
 
 **Units and events**
 
 | Op | Instruction | What it does |
 |---|---|---|
-| 27 | `ucfg u, reg, op2` | write a unit's config register |
+| 27 | `ucfg u, reg, op2` | write a unit's config register (units 0–6, including the movers) |
 | 28 | `urd rd, u, reg` | read a unit's status or data |
 | 29 | `ustart mask [, op2]` | start one packet on TX, RX or both, in the same cycle |
 | 30 | `ustop mask` | abort at once |
@@ -208,7 +219,7 @@ None of the current firmware uses `rdpins`, `bitin`, `bitout` or `xor`.
 
 The order follows an instruction from the host to the wires. The numbers in brackets are flip-flops, from `docs/area.md`.
 
-### 4.1 `pe_host_if` (24, plus 2 in its synchroniser): the host bus
+### 4.1 `pe_host_if` (25, plus 2 in its synchroniser): the host bus
 
 It turns a slow 4-bit bus into one-cycle register accesses. The host can be much slower than the chip and on a different clock, because of the handshake: the host sets the operation and data, then toggles the strobe. The chip synchronises the strobe, performs the operation and toggles ack.
 
@@ -221,9 +232,13 @@ It turns a slow 4-bit bus into one-cycle register accesses. The host can be much
 
 The address does not increment, so reading a FIFO repeatedly only needs the data operations.
 
-### 4.2 `pe_regs` (90): the host's view
+A read of DMEM_DATA is answered one cycle later than other reads, since the SRAM's read is registered (`rpend`). The host waits for the ack toggle anyway, so host software sees no difference.
+
+### 4.2 `pe_regs` (90, plus 128 for the mailbox): the host's view
 
 The host's register map (Section 5.3). It holds RUN, the pin configuration and the error flags, and turns accesses into actions: push to a FIFO, write IMEM, ring the doorbell.
+
+**Mailbox (v3).** Eight 16-bit registers, M0–M7, that both sides can read and write: the host at 0x30–0x3F (a byte at a time) and the firmware with `mbr` / `mbw` (16 bits at a time). The host has priority: an `mbw` to the register the host is writing in that same cycle blocks for one cycle and then completes. The mailbox carries control values (counts, addresses, status); payload goes through DMEM.
 
 **Loading firmware.** A word is 29 bits (sent as 4 bytes; the top 3 bits are dropped) but the bus carries bytes, so 3 bytes wait in a staging register, and writing the fourth (0x13) stores the whole word and advances the address. A store while RUN = 1 is dropped and sets `imem_err`, so firmware cannot change while it runs.
 
@@ -231,7 +246,7 @@ The host's register map (Section 5.3). It holds RUN, the pin configuration and t
 
 162 words of 29 bits, one write port for the host and one read port for the controller. The read is registered: the word arrives one cycle after the address, so the controller sends the address of the *next* instruction (section 4.4). The extra flip-flops are that output register. It is built from flip-flops. With `MEM_CLOCK_GATE` = 1 (the default) each word's flip-flops are clocked through their own clock gate (`pe_icg`), which only lets a clock edge through when that word is written. A plain flip-flop takes its D input on every edge, so without the gate each bit would need a 2:1 multiplexer to feed its own value back; the IHP library has no flip-flop with an enable. A latch version also exists but is not verified (`docs/area.md`).
 
-### 4.4 `pe_ctrl` (194) and `pe_decode` (0): the processor
+### 4.4 `pe_ctrl` (195) and `pe_decode` (0): the processor
 
 `pe_decode` is pure logic that splits a word into its fields. `pe_ctrl` does everything else:
 
@@ -240,6 +255,7 @@ The host's register map (Section 5.3). It holds RUN, the pin configuration and t
 - **Execute:** all effects happen in one cycle, called E: registers, pins, FIFOs and unit commands.
 - **Block:** if an instruction cannot finish, it has no effect at all and is retried, so a blocked `fget` can never half-happen. A blocked `wait` with a timeout is the one exception: it counts its register down.
 - **Stall:** `delay` loads the stall counter.
+- **`ld` (v3):** the first cycle asks DMEM for the byte (it blocks while the port is taken by the host or a mover); the second cycle (`ld_ph`) writes it to the register.
 - **Restart:** the host's RESTART loads `pc` from START_PC and clears the registers, flags and stack. It aborts the units and disarms the detectors. Config registers survive.
 
 ### 4.5 `pe_txu` (106): the TX unit
@@ -316,18 +332,34 @@ Everything that touches a wire goes through here.
 - **Inputs:** `pe_sync` passes each input through 2 flip-flops, since the outside world is not on this clock. Every block reads this same `pin_in`.
 - **Filter:** with `PIN_FILT` set, a new level must be seen on 4 samples in a row. That rejects I2C's 50 ns spikes and adds 4 cycles of delay.
 
-### 4.10 `pe_fifo` (78 each) and `pe_dmem` (2,048): queues and memory
+### 4.10 `pe_fifo` (78 each), `pe_dmem` (SRAM macro) and `pe_dmov` (53): queues, memory and movers
 
 **FIFOs** have fixed priority, so the units and the host never wait; the controller blocks and retries instead:
 
 | FIFO | Writers, highest first | Readers, highest first |
 |---|---|---|
-| TX | host, controller | units, controller |
-| RX | RX unit, controller | host, controller |
+| TX | host, TX mover, controller | units, controller |
+| RX | RX unit, controller | host, RX mover, controller |
 
 A host write to a full TX FIFO or a unit push to a full RX FIFO is dropped and flagged.
 
-**DMEM** is the mailbox. The host has priority, and a controller `ld` or `st` in the same cycle retries. Like IMEM, each byte has its own clock gate when `MEM_CLOCK_GATE` = 1.
+**DMEM** (v3) holds payload bytes only, in the IHP SRAM macro `RM_IHPSG13_1P_256x8_c3_bm_bist` (`DMEM_IMPL` = 1; 0 gives flip-flops with the same behaviour, as a fall-back). It has one port with a registered read: a byte comes out the cycle after it is asked for, and stays until the next read. Control values go through the **mailbox** in `pe_regs` instead (Section 5.4).
+
+**`pe_dmov`** owns the DMEM port and shares it, one user a cycle, in this order:
+
+| Priority | User | Why this order |
+|---|---|---|
+| 1 | host (DMEM_DATA) | the host must never wait |
+| 2 | RX mover | the RX FIFO fills from the line and must not overflow |
+| 3 | TX mover | the TX FIFO only needs to stay ahead of the line |
+| 4 | controller `ld` / `st` | it blocks and retries, like any controller access |
+
+The two movers are small state machines that move payload with no firmware involved:
+
+- **TX mover (TXM, unit 5).** The firmware writes a start address (`MV_PTR`) and a count (`MV_GO`). TXM then reads one byte, holds it in a one-byte buffer for the SRAM latency, and pushes it into the TX FIFO when the FIFO has room and the host is not writing it. About 3 cycles a byte; the fastest line (SPI at 24 MHz) needs one every 16.
+- **RX mover (RXM, unit 6).** With the same set-up, it pops each byte from the RX FIFO as soon as one is there and writes it to DMEM, up to the count. `MV_GO` = 0 stops it. It counts the bytes it stored (`urd RXM, MV_RD_CNT`), which is how USB learns a packet's length.
+
+The firmware only starts them and later checks the `TXM_*` / `RXM_*` jump conditions. For USB the CRC append waits until TXM is idle, so the CRC cannot be sent while data bytes are still on their way to the FIFO.
 
 ### 4.11 The top level
 
@@ -335,7 +367,8 @@ A host write to a full TX FIFO or a unit push to a full RX FIFO is dropped and f
 - One TX FIFO pop serves every unit starting in a cycle, so TX and RX in one `ustart` get the same byte.
 - A detector start with no byte available is dropped and sets `tx_underrun`.
 - RX counts as busy through the ERX stop-bit check.
-- In CHAIN, the next TX word comes from the FIFO, or the CRC if that is empty and APPEND is set.
+- In CHAIN, the next TX word comes from the FIFO, or the CRC if that is empty, APPEND is set and the TX mover is idle.
+- The TX FIFO's write port is shared host > TX mover > controller, and the RX FIFO's read port host > RX mover > controller.
 
 ### 4.12 Protocol switches
 
@@ -352,21 +385,22 @@ There are five groups, depending on who can see them.
 | Program | r0 | r1 | r2 | r3 | r4 | r5 | r6 | r7 |
 |---|---|---|---|---|---|---|---|---|
 | `uart` | byte in | | | | | | | TX state |
-| `uart_ex` | word | scratch | parity test | | | break count | parity errors | |
-| `spi_master` | byte out | data pointer | bytes left | reply pointer | byte in | | | |
-| `spi_master_stream` | byte out | data pointer | bytes to send | reply pointer | byte in | replies left | status | |
-| `spi_master_3wire` | byte out | data pointer | writes left | reply pointer | byte in | reads left | | |
+| `uart_ex` | word | scratch, break length | parity test | | | break count | parity errors | |
+| `spi_master` | | | bytes left | | | | | |
+| `spi_master_words` | word out | word pointer | words left | reply pointer | scratch, word in | | | |
+| `spi_master_stream` | | | n | | | | status | |
+| `spi_master_3wire` | | | writes left | | | reads left | | |
 | `spi_slave_words` | next word | scratch | scratch | | word in | | | |
 | `i2c_master` | byte | write pointer | writes left | read pointer | address | result, counter | status, busy flag | reads left |
 | `i2c_slave` | byte | scratch | pointer-next flag | register pointer | | | 10-bit match | |
 | `usb_device` | byte, event | token byte, handshake | token byte, EP | pointer | CRC, status | IN length, timeout | PID | our address |
-| `usb_host` | byte | status | | pointer | CRC, status | count, timeout | data PID | |
+| `usb_host` | byte | status | | pointer | CRC, status, RXM count | count, timeout | data PID | |
 
-`spi_slave` uses no registers, `spi_master_words` uses the same ones as `spi_master`, and `spi_slave_3wire` only uses `r0`. The comments in `test/common/pe_fw.py` give these for each program.
+`spi_slave` uses no registers and `spi_slave_3wire` only uses `r0`. With the movers (v3) the byte-streaming SPI masters need only a count: they never hold a payload byte. The comments in `test/common/pe_fw.py` give these for each program.
 
 ### 5.2 Unit config registers
 
-Firmware writes these with `ucfg` and reads status with `urd`. They are 16 bits and keep their values through RESTART. The unit numbers are TX 0, RX 1, ETX 2, ERX 3, CRC 4.
+Firmware writes these with `ucfg` and reads status with `urd`. They are 16 bits and keep their values through RESTART (the movers are the exception: RESTART stops them). The unit numbers are TX 0, RX 1, ETX 2, ERX 3, CRC 4, TXM 5, RXM 6.
 
 **TX unit (0)**
 
@@ -415,6 +449,15 @@ Firmware writes these with `ucfg` and reads status with `urd`. They are 16 bits 
 | read 0 | value | the CRC register |
 | read 1 | STAT | `[0]` the CRC has been sent |
 
+**Data movers: TXM (5) and RXM (6)** (v3)
+
+| # | Name | Bits |
+|---|---|---|
+| 0 | PTR | `[7:0]` the DMEM address of the first byte |
+| 1 | GO | `[8:0]` the byte count, 0–256; writing it starts the mover. 0 stops it |
+| TXM read 0 / 1 | PTR / LEFT | the next address / bytes still to read |
+| RXM read 0 / 1 / 2 | PTR / CNT / LEFT | the next address / bytes stored since GO / bytes still to store |
+
 ### 5.3 The host's register map
 
 The external host reaches these over the 4-bit bus. Addresses that are not mapped read 0.
@@ -422,7 +465,7 @@ The external host reaches these over the 4-bit bus. Addresses that are not mappe
 | Addr | Name | Access | Meaning |
 |---|---|---|---|
 | 0x00 | ID | R | 0x50 |
-| 0x01 | VERSION | R | 0x02 |
+| 0x01 | VERSION | R | 0x03 |
 | 0x02 | RUN | RW | `[0]` the controller runs |
 | 0x03 | RESTART | W | `[0]` = 1: restart the controller, units and detectors |
 | 0x04 | STATUS | R | `[0]` txf_empty, `[1]` txf_full, `[2]` rxf_empty, `[3]` rxf_full, `[4]` txf_overrun, `[5]` rxf_overrun, `[6]` owner_err, `[7]` imem_err |
@@ -445,7 +488,8 @@ The external host reaches these over the 4-bit bus. Addresses that are not mappe
 | 0x22–0x23 | PC | R | current `pc` |
 | 0x24 | CSTAT | R | `[0]` run, `[1]` blocked, `[2]` Z, `[3]` C, `[4]` TO, `[5]` ETX, `[6]` ERX, `[7]` DB |
 | 0x28 | DMEM_ADDR | RW | DMEM address |
-| 0x29 | DMEM_DATA | RW | read or write DMEM, then address + 1 |
+| 0x29 | DMEM_DATA | RW | read or write DMEM, then address + 1 (a read is answered one cycle later) |
+| 0x30–0x3F | MBOX | RW | mailbox M0–M7: M[i] low byte at 0x30 + 2i, high byte at 0x31 + 2i |
 
 The IRQ pin is high when any enabled source is active:
 
@@ -463,22 +507,22 @@ The IRQ pin is high when any enabled source is active:
 
 The firmware then sets up the units with `ucfg` by itself.
 
-### 5.4 DMEM maps: the host and firmware agree here
+### 5.4 Mailbox and DMEM maps: the host and firmware agree here
 
-These are conventions set by the firmware, not hardware registers. DMEM-driven programs follow this pattern: the host writes a request, writes DOORBELL, and waits for the IRQ.
+These are conventions set by the firmware, not hardware registers. Request-driven programs follow this pattern: the host writes the request (mailbox registers, and payload in DMEM), writes DOORBELL, and waits for the IRQ; the result is in the mailbox, and received payload in DMEM. Payload to send starts at `dmem[0x00]`, received payload at `dmem[0x80]`. Mailbox names (M0–M7): OP, ADDR, NTX, NRX, PID, HS, STATUS, INFO.
 
 | Program | Request | Result |
 |---|---|---|
-| `spi_master` | `[0]` n, `[1..n]` data | `[0x80..]` replies |
-| `spi_master_words` | `[0]` n, then 2 bytes a word, low first | `[0x80..]` 2 bytes a reply |
-| `spi_master_stream` | `[0]` n, `[1..n]` data | `[0x80..]` replies. `[0x7F]`: 0 ok, 1 SCK paused, 2 reply lost |
-| `spi_master_3wire` | `[0]` writes, `[1]` reads, `[2..]` data | `[0x80..]` replies |
-| `i2c_master` | `[0]` address, `[1]` writes, `[2]` reads, `[3..]` data. With `addr10`, `[0x7E]` is address bits 9:8 | `[0x80..]` read data. `[0x7F]`: 0 ok, 1 address NACK, 2 data NACK, 3 arbitration lost, 4 SDA stuck low |
-| `uart_ex` | `[3]` break length; the doorbell sends a break | `[1]` parity errors, `[2]` breaks |
-| `usb_host` | `[0]` operation (0 transaction, 1 reset, 2 keep-alive, 3 resume), `[1..3]` token, `[4]` data PID (0 for IN), `[5]` data count or low byte of a time count, `[6]` its high byte, `[0x10..]` data | `[0x80]` first byte received, `[7]` status (0 OK, 1 time-out, 2 bad packet), `[8]` bytes received |
-| `usb_device` | `[0]` address, `[4]` IN length (PID + data, 0 = NAK), `[5]` IN PID, `[6]` OUT handshake, `[7]` IN handshake, `[0x10..]` IN data | `[1]` token, `[2]` endpoint, `[3]` length, `[8]` event (1 OUT, 2 IN acked, 3 reset, 4 IN not acked), `[0x80..]` packet received |
+| `spi_master` | NTX = n, `[0..]` data | `[0x80..]` replies (RXM) |
+| `spi_master_words` | NTX = n words, `[0..]` 2 bytes a word, low first | `[0x80..]` 2 bytes a reply (`ld` / `st`: words do not fit the byte FIFOs) |
+| `spi_master_stream` | NTX = n, `[0..]` data | `[0x80..]` replies. STATUS: 0 ok, 1 SCK paused, 2 reply lost |
+| `spi_master_3wire` | NTX writes, NRX reads, `[0..]` write data | `[0x80..]` read data |
+| `i2c_master` | ADDR (7 or 10 bits), NTX writes, NRX reads, `[0..]` write data | `[0x80..]` read data. STATUS: 0 ok, 1 address NACK, 2 data NACK, 3 arbitration lost, 4 SDA stuck low |
+| `uart_ex` | NTX = break length; the doorbell sends a break | INFO = parity errors, STATUS = breaks |
+| `usb_host` | OP (0 transaction, 1 reset, 2 keep-alive, 3 resume), PID = data PID (0 for IN), NTX = data count or time count, `[0..2]` token, `[0x10..]` data | `[0x80..]` packet received (PID first), STATUS (0 OK, 1 time-out, 2 bad packet), INFO = bytes received |
+| `usb_device` | ADDR, NTX = IN length (PID + data, 0 = NAK; the firmware clears it when the IN is acked), PID = IN data PID, HS = OUT handshake [7:0] and IN handshake [15:8], `[0..]` IN data | OP = token PID, NRX = endpoint, INFO = length, STATUS = event (1 OUT, 2 IN acked, 3 reset, 4 IN not acked), `[0x80..]` packet received |
 
-`i2c_slave` uses DMEM as its register space, and general-call data goes to `[0xF0..]`. `uart`, `uart_ex` and the SPI slaves move their data through the FIFOs.
+`i2c_slave` uses DMEM as its register space (the outside master picks the address), and general-call data goes to `[0xF0..]`. `uart`, `uart_ex` and the SPI slaves move their data through the FIFOs.
 
 ### 5.5 Internal state
 
@@ -486,7 +530,7 @@ These cannot be accessed directly, apart from what the status registers show. Th
 
 | Module | Registers |
 |---|---|
-| `pe_ctrl` | `pc`, `r[0:7]`, `z c to db`, `stack`, `sp`, `stall`, `run_q`, `blocked` |
+| `pe_ctrl` | `pc`, `r[0:7]`, `z c to db`, `stack`, `sp`, `stall`, `run_q`, `blocked`, `ld_ph` (second cycle of `ld`) |
 | `pe_txu` | `sh` shift register, `idx` bit index, `o` cycle within the bit, `sw swc` stretch wait, `sp` sample tick pending, `lvl` last NRZI level, `ones` 1s in a row, `eph` EOP phase, `crc_pkt` sending the CRC, `lf` LEAD state, `eprev` last level of the external clock pin |
 | `pe_rxu` | `sh` shift register, `od` word to drive, `data_q` held word, `nbits` bits taken, `wcnt` cycles to the next sample, `wins` windows started, `tq oq` delay lines, `lp` last NRZI sample, `hunting hz` sync hunt, `rones` 1s in a row, `serr` stuff error, `rxrdy`, `overrun`, `eprev iprev` last pin levels |
 | `pe_vote` | `running`, `sel`, `n_l k_l s_l` latched settings, `idx`, `ones`, `scnt` |
@@ -494,8 +538,10 @@ These cannot be accessed directly, apart from what the status registers show. Th
 | `pe_crc` | `crc`, `skip`, `sent` |
 | `pe_pins` | `out_r`, `oe_r`, `filt_out filt_c0 filt_c1` filter state, `owner_err` |
 | `pe_fifo` | `mem`, `wptr`, `rptr`, `cnt`, `overrun` |
-| `pe_regs` | `run`, `start_pc`, `pin_owner`, `pin_od`, `pin_filt`, `dm_addr`, `imaddr`, `stage`, `irq_en`, `imem_err`, `st2` |
-| `pe_host_if` | `r_addr`, `wbuf wphase` write nibbles, `rlow rphase` read nibbles, `stb_q`, `h_dout`, `h_ack` |
+| `pe_regs` | `run`, `start_pc`, `pin_owner`, `pin_od`, `pin_filt`, `dm_addr`, `imaddr`, `stage`, `irq_en`, `imem_err`, `st2`, `mbox[0:7]` |
+| `pe_host_if` | `r_addr`, `wbuf wphase` write nibbles, `rlow rphase` read nibbles, `stb_q`, `h_dout`, `h_ack`, `rpend` (a DMEM read waiting for its byte) |
+| `pe_dmov` | TXM: `t_ptr`, `t_left`, `t_pend` (read in flight), `t_bufv t_buf` (the byte buffer). RXM: `r_ptr`, `r_left`, `r_cnt` |
+| `pe_dmem` | inside the SRAM macro; the flip-flop version has `mem` and the output register `dout` |
 
 ## 6. Three examples, end to end
 
@@ -513,13 +559,13 @@ No instruction runs during the byte.
 
 ### 6.2 An I2C write, single master (`i2c_master`)
 
-1. **Request:** the host writes address and data to DMEM, then DOORBELL.
+1. **Request:** the host writes the address and counts to the mailbox and the data to DMEM, then DOORBELL.
 2. **Check:** the firmware sees `DB` and reads the request. If SDA is already low, it runs the bus clear first.
 3. **START:** SCL and SDA belong to the units, but the units are idle, so the firmware may drive them. It pulls SDA low while SCL is high.
 4. **A byte:** `ustart TX|RX`. TX makes 8 SCL clocks with STRETCH, so a slave can hold the clock. RX in drive mode puts each bit on SDA a little after SCL falls. Both pins are open drain.
 5. **ACK:** `uwait`, then the firmware releases SDA, raises SCL by hand and reads SDA with `jpin`.
 6. **STOP:** after the last byte, SDA rises while SCL is high.
-7. **Result:** the status goes to `dmem[0x7F]`, and `host irq` tells the host.
+7. **Result:** the status goes to the mailbox (STATUS), and `host irq` tells the host.
 
 The units time the bits, and the firmware only acts between bytes.
 
@@ -531,8 +577,8 @@ The hard part is time: the device must answer within 6.5 bit times (26 cycles, o
 2. **Token:** the sync is dropped in hardware and bytes reach the FIFO. SE0 stops the unit in the same cycle.
 3. **Check:** the firmware reads the PID and the address byte, reads the CRC register, and compares it with the CRC5 residual. It checks the address, then sees PID = IN.
 4. **Answer:** it starts sending the sync **before** deciding between data and NAK, since both begin the same way. That buys time.
-5. **Data:** with bytes ready, it sets up the CRC with APPEND, then sends the PID and data through the FIFO. CHAIN sends them with no gap, the unit adds the CRC, and EOP ends the packet. ETX releases the bus.
-6. **Handshake:** it hunts again and waits for K for less than 18 bit times. ACK clears `UD_INLEN`, and the event goes to DMEM with the IRQ.
+5. **Data:** with bytes ready, it sets up the CRC with APPEND and puts the PID (from the mailbox) into the TX FIFO, then starts TXM on the data in DMEM. TXM keeps the FIFO ahead of the line, CHAIN sends the bytes with no gap, the unit adds the CRC once the FIFO is empty and TXM is idle, and EOP ends the packet. ETX releases the bus.
+6. **Handshake:** it hunts again and waits for K for less than 18 bit times. ACK clears `UD_INLEN`, and the event goes to the mailbox with the IRQ.
 
 ## 7. The firmware
 
@@ -580,3 +626,4 @@ All this was digital simulation. No real device or silicon is involved; `docs/pr
 | Each module's rules | the header comment of its file in `src/` |
 | What was wrong and how it was fixed | `docs/protocol_conformance.md`, `docs/problem_log.md` |
 | Area | `docs/area.md` |
+| Why v3 changed DMEM, the mailbox and the movers | `docs/v3_design.md` |

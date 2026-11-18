@@ -128,7 +128,16 @@ class Lockstep:
             ("host.r_addr", up.u_host_if.r_addr, lambda m: m.host.addr, always),
             ("host.wphase", up.u_host_if.wphase, lambda m: m.host.wphase, always),
             ("host.rphase", up.u_host_if.rphase, lambda m: m.host.rphase, always),
+            ("host.rpend", up.u_host_if.rpend, lambda m: m.host.rpend, always),
+            ("ctrl.ld_ph", c.ld_ph, lambda m: m.ctrl.ld_ph, always),
+            ("dmem.rdata", up.u_dmem.rdata, lambda m: m.dmem.dout, always),
         ]
+        dv = up.u_dmov
+        for nm in ("t_ptr", "t_left", "t_pend", "t_bufv", "r_ptr", "r_left", "r_cnt"):
+            h.append((f"dmov.{nm}", getattr(dv, nm), lambda m, nm=nm: getattr(m.dmov, nm), always))
+        h.append(("dmov.t_buf", dv.t_buf, lambda m: m.dmov.t_buf, lambda m: m.dmov.t_bufv))
+        for i in range(8):
+            h.append((f"regs.mbox{i}", up.u_regs.mbox[i], lambda m, i=i: m.regs.mbox[i], always))
         for i in range(8):
             h.append((f"ctrl.r{i}", c.r[i], lambda m, i=i: m.ctrl.r[i], always))
         for nm, d, get in (("etx", etx, lambda m: m.etx), ("erx", erx, lambda m: m.erx)):
@@ -149,7 +158,9 @@ class Lockstep:
         return h
 
     def stop(self):
-        """End the check and the tasks of this run (test_lockstep runs several on one reset chain)."""
+        """End the check and the tasks of this run (test_lockstep runs several on one reset chain).
+        From now on nothing is compared, whoever started run()."""
+        self.armed = False
         for t in (getattr(self, "task", None), getattr(self, "driver", None)):
             if t is not None:
                 t.cancel()
@@ -167,12 +178,24 @@ class Lockstep:
             for i in range(len(mem)):
                 mem[i] = res(rows[i].q)
 
+    def _copy_dmem(self, d, mem):
+        """DMEM's contents, whichever implementation (DMEM_IMPL, MEM_CLOCK_GATE) the RTL was built with."""
+        if hasattr(d, "g_sram"):
+            self._copy_mem(d.g_sram.u_sram.i_SRAM_1P_behavioral_bm_bist.memory, mem)
+        elif hasattr(d.g_ff, "g_cg"):
+            rows = d.g_ff.g_cg.g_row
+            for i in range(len(mem)):
+                mem[i] = res(rows[i].q)
+        else:
+            self._copy_mem(d.g_ff.mem, mem)
+
     def arm(self):
         """Start comparing: the reset is over and both sides are in reset state."""
         up, m = self.up, self.chip
         if self.internal:
             self._copy_rows(up.u_imem, "g_flop_cg", m.imem.mem)
-            self._copy_rows(up.u_dmem, "g_cg", m.dmem.mem)
+            self._copy_dmem(up.u_dmem, m.dmem.mem)
+            m.dmem.dout = res(up.u_dmem.rdata)
             self._copy_mem(up.u_txf.mem, m.txf.mem)
             self._copy_mem(up.u_rxf.mem, m.rxf.mem)
             m.imem.rdata = res(up.u_imem.rdata)

@@ -29,7 +29,10 @@ from cocotb_tools.runner import get_results, get_runner
 
 HERE = Path(__file__).resolve().parent
 SRC = HERE.parents[1] / "src"
-RTL = sorted(str(p) for p in SRC.rglob("*.v"))
+# The SRAM macro's black box (for synthesis) is left out: simulation uses the PDK's model instead.
+RTL = sorted(str(p) for p in SRC.rglob("*.v") if not p.name.startswith("RM_IHPSG13"))
+SRAM_MODELS = [str(HERE.parent / "models" / f) for f in
+               ("RM_IHPSG13_1P_core_behavioral_bm_bist.v", "RM_IHPSG13_1P_256x8_c3_bm_bist.v")]
 COMMON = str(HERE.parent / "common")
 
 # Shared helpers (pe_isa, pe_fw, uart) must be importable inside the simulator.
@@ -48,10 +51,12 @@ CASES = [
     ("pe_imem", "cg_d162_w29", dict(IW=29, DEPTH=162, IMPL=0, CG=1), []),   # the chip's IMEM
     ("pe_imem", "cg_w32", dict(IW=32, DEPTH=64, IMPL=0, CG=1), []),
     ("pe_imem", "flop_d162_w29", dict(IW=29, DEPTH=162, IMPL=0), []),
-    ("pe_dmem", "d256", dict(DEPTH=256), []),
-    ("pe_dmem", "d64", dict(DEPTH=64), []),
-    ("pe_dmem", "cg_d256", dict(DEPTH=256, CG=1), []),                      # the chip's DMEM
-    ("pe_dmem", "cg_d64", dict(DEPTH=64, CG=1), []),
+    ("pe_dmem", "d256", dict(DEPTH=256), SRAM_MODELS),
+    ("pe_dmem", "d64", dict(DEPTH=64), SRAM_MODELS),
+    ("pe_dmem", "cg_d256", dict(DEPTH=256, CG=1), SRAM_MODELS),             # the flip-flop roll-back
+    ("pe_dmem", "cg_d64", dict(DEPTH=64, CG=1), SRAM_MODELS),
+    ("pe_dmem", "sram_d256", dict(DEPTH=256, IMPL=1), SRAM_MODELS),         # the chip's DMEM: the IHP macro
+    ("pe_dmov", "default", dict(), SRAM_MODELS),
     ("pe_pins", "p8", dict(NUM_PINS=8), []),
     ("pe_pins", "p16", dict(NUM_PINS=16), []),
     ("pe_vote", "default", dict(NUM_PINS=8, N_W=4, S_W=16), []),
@@ -90,6 +95,7 @@ def test_module(module, cfg, params, extra):
         sources=RTL + extra,
         hdl_toplevel=module,
         parameters=params,
+        defines={"FUNCTIONAL": 1},
         build_dir=build_dir,
         build_args=build_args,
         always=True,

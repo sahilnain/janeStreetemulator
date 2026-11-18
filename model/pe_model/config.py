@@ -48,7 +48,7 @@ class Config:
     vote_n_w: int = 4
     vote_s_w: int = 16
     chip_id: int = 0x50
-    version: int = 0x02
+    version: int = 0x03
     spi: bool = _env("spi")
     i2c: bool = _env("i2c")
     usb: bool = _env("usb")

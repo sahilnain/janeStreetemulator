@@ -12,7 +12,7 @@ step() first computes every combinational signal from the current state, then
 clocks every block, so block order cannot leak post-edge values.
 """
 
-from .blocks import Crc, Dmem, Fifo, HostIf, Imem, Pins, Regs
+from .blocks import Crc, Dmem, Dmov, Fifo, HostIf, Imem, Pins, Regs
 from .config import Config
 from .ctrl import Ctrl
 from .det import Det
@@ -28,6 +28,7 @@ class Chip:
         self.regs = Regs(cfg)
         self.imem = Imem(cfg.imem_depth, 29)
         self.dmem = Dmem(cfg.dmem_depth)
+        self.dmov = Dmov()
         self.txf = Fifo(cfg.fifo_depth, 8)
         self.rxf = Fifo(cfg.fifo_depth, 8)
         self.ctrl = Ctrl(cfg)
@@ -76,6 +77,8 @@ class Chip:
             return self.erx.stat if idx == 0 else 0
         if unit == 4:
             return self.crc.read(idx)
+        if unit in (5, 6):
+            return self.dmov.read(unit, idx)
         return 0
 
     def step(self, ui_in, uio_in, rst_n=1):
@@ -94,8 +97,10 @@ class Chip:
         # detectors and the TX chain decision do not depend on the controller
         te = etx.trigger(pin_in)
         tr = erx.trigger(pin_in)
-        next_crc = int(txf.empty and crc.app_ok)
-        next_ok = int(not txf.empty or crc.app_ok)
+        dmov = self.dmov
+        # the CRC comes only after the TX mover has pushed its last byte
+        next_crc = int(txf.empty and crc.app_ok and not dmov.txm_busy)
+        next_ok = int(not txf.empty or (crc.app_ok and not dmov.txm_busy))
         next_data = crc.value if txf.empty else (txf.rdata or 0)
         probe = tx.comb(0, 0, 0, next_ok, next_crc, next_data, pin_in)
         chain_raw = probe["chain"] and not next_crc
@@ -104,13 +109,22 @@ class Chip:
         det_pop = (((etx_raw and tx.den) or (erx_raw and rx.need)) and not txf.empty) or chain_raw
         rx_push_early = rx.comb(0, 0, 0, pin_in, probe["stick"], probe["dtick"])["push"]
 
-        dm_rd = self.dmem.rdata(rc["dm_addr"]) if rc["dm_acc"] else None
+        dm_rd = self.dmem.rdata
+        # the movers and the DMEM port; the controller's grant does not depend on the controller
+        mv = lambda c_re, c_we, c_addr, c_wdata: dmov.comb(  # noqa: E731
+            rc["dm_acc"], rc["dm_we"], rc["dm_addr"], rc["dm_wdata"], c_re, c_we, c_addr, c_wdata,
+            rc["txf_wr"], txf.full, rc["rxf_rd"], rxf.empty, rxf.rdata)
+        d0 = mv(0, 0, 0, 0)
+        word = self.imem.rdata
         s = dict(pin_in=pin_in, tx_busy=tx_busy, rx_busy=rx_busy, tx_need=tx.den, rx_need=rx.need,
                  etx=etx.flag, erx=erx.flag, ferr=erx.ferr, rxrdy=rx.rxrdy, txf_empty=txf.empty, txf_full=txf.full,
                  txf_rdata=txf.rdata, rxf_empty=rxf.empty, rxf_full=rxf.full, rxf_rdata=rxf.rdata,
-                 txf_rd_gnt=not det_pop, txf_wr_gnt=not rc["txf_wr"], rxf_rd_gnt=not rc["rxf_rd"],
-                 rxf_wr_gnt=not rx_push_early, dm_gnt=not rc["dm_acc"])
-        e = self.ctrl.comb(self.regs.run, self.imem.rdata, s, self._rd, self.dmem.rdata)
+                 txf_rd_gnt=not det_pop, txf_wr_gnt=not (rc["txf_wr"] or d0["m_txf_wr"]),
+                 rxf_rd_gnt=not (rc["rxf_rd"] or d0["m_rxf_rd"]),
+                 rxf_wr_gnt=not rx_push_early, dm_gnt=d0["c_gnt"],
+                 mb_gnt=Regs.mb_gnt(rc, (word or 0) & 7), txm_busy=dmov.txm_busy, rxm_busy=dmov.rxm_busy)
+        e = self.ctrl.comb(self.regs.run, word, s, self._rd, dm_rd, self.regs.mb_rdata)
+        d = mv(e["dm_re"], e["dm_we"], e["dm_addr"], e["dm_wdata"])
 
         # starts, as in the top level
         sm, stm = e["start_mask"], e["stop_mask"]
@@ -140,17 +154,16 @@ class Chip:
         rd_rx = e["rd_strobe"] and e["rd_unit"] == 1 and e["rd_idx"] == 0
 
         # ---- clock edge
-        self.host.clock(rst, din, op, stb, r_rdata)
+        self.host.clock(rst, din, op, stb, r_rdata, rc["r_late"])
         self.imem.clock(rc["im_we"], rc["im_waddr"], rc["im_wdata"],
                         self.ctrl.fetch_addr(restart, self.regs.start_pc, e))
-        if rc["dm_acc"]:
-            self.dmem.clock(rc["dm_we"], rc["dm_addr"], rc["dm_wdata"])
-        else:
-            self.dmem.clock(e["dm_we"], e["dm_addr"], e["dm_wdata"])
-        txf.clock(rst, rc["txf_wr"] or e["txf_wr"], rc["txf_wdata"] if rc["txf_wr"] else e["fdata"],
+        dmov.clock(rst, restart, e["cfg_we"], e["cfg_unit"], e["cfg_idx"], e["cfg_data"], d, dm_rd)
+        self.dmem.clock(d["m_re"], d["m_we"], d["m_addr"], d["m_wdata"])
+        txf.clock(rst, rc["txf_wr"] or d["m_txf_wr"] or e["txf_wr"],
+                  rc["txf_wdata"] if rc["txf_wr"] else (d["m_txf_wdata"] if d["m_txf_wr"] else e["fdata"]),
                   u_pop or chain_pop or e["txf_rd"], rc["txf_clr"])
         rxf.clock(rst, r["push"] or e["rxf_wr"], r["push_data"] if r["push"] else e["fdata"],
-                  rc["rxf_rd"] or e["rxf_rd"], rc["rxf_clr"])
+                  rc["rxf_rd"] or d["m_rxf_rd"] or e["rxf_rd"], rc["rxf_clr"])
         etx_ack = te["start_req"] and tx_go
         erx_ack = tr["start_req"] and rx_go
         cw = e["cfg_we"]
@@ -171,6 +184,7 @@ class Chip:
                         (r["wm"], r["wv"], 0, 0), tx_busy, rx_busy, self.regs.owner, rc["owner_clr"], uio_in,
                         self.regs.filt)
         self.ctrl.clock(rst, self.regs.run, restart, self.regs.start_pc, rc["db_set"], e)
-        self.regs.clock(rst, h, rc, e["ill"], e["stk"], underrun, e["host_irq"])
+        self.regs.clock(rst, h, rc, e["ill"], e["stk"], underrun, e["host_irq"], e["mb_we"], e["mb_idx"],
+                        e["mb_wdata"])
         self.rst_q = [1 - (rst_n & 1), self.rst_q[0]]
         self.cycle += 1

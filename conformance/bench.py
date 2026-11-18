@@ -123,6 +123,13 @@ class Node:
     def peek(self, addr, n=1):
         return [self.chip.dmem.mem[(addr + i) & 0xFF] for i in range(n)]
 
+    def mb(self, i, v):
+        """Mailbox M[i] = v (backdoor, as dmem() is)."""
+        self.chip.regs.mbox[i] = v & 0xFFFF
+
+    def mbr(self, i):
+        return self.chip.regs.mbox[i]
+
     def doorbell(self):
         self.write(0x0F, 1)
 

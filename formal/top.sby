@@ -18,7 +18,7 @@ cvr: smtbmc yices
 [script]
 read -define PE_CHIP_FORMAL
 read -formal tt_um_sahil_protoemu.v
-read -formal pe_host_if.v pe_regs.v pe_imem.v pe_dmem.v pe_fifo.v pe_sync.v pe_pins.v
+read -formal pe_host_if.v pe_regs.v pe_imem.v pe_dmem.v pe_dmov.v pe_fifo.v pe_sync.v pe_pins.v
 read -formal pe_ctrl.v pe_decode.v pe_vote.v pe_txu.v pe_rxu.v pe_det.v pe_crc.v
 prep -top tt_um_sahil_protoemu
 
@@ -28,6 +28,7 @@ prep -top tt_um_sahil_protoemu
 ../src/host/pe_regs.v
 ../src/mem/pe_imem.v
 ../src/mem/pe_dmem.v
+../src/mem/pe_dmov.v
 ../src/mem/pe_fifo.v
 ../src/io/pe_sync.v
 ../src/io/pe_pins.v

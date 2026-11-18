@@ -144,7 +144,7 @@ async def spi_all_modes(dut, role):
                 await b.bus.write_same(d)
             await b.bus.start()
             await ClockCycles(dut.clk, 40)
-            await a.bus.dmem_write(0, [n] + down)
+            await R.spi_request(a.bus, down)
             await a.bus.write(R.DOORBELL, 0)
             await usb_wait(a, f"{tag}: master", limit=3000)
             assert await a.bus.dmem_read(0x80, n) == up, f"{tag}: master read"
@@ -168,10 +168,10 @@ async def i2c_setup(dut, role, B):
 
 
 async def i2c_request(a, addr, wdata=(), nread=0):
-    await a.bus.dmem_write(0, [addr, len(wdata), nread] + list(wdata))
+    await R.i2c_request(a.bus, addr, wdata, nread)
     await a.bus.write(R.DOORBELL, 0)
     await usb_wait(a, "I2C master", limit=20000)
-    return (await a.bus.dmem_read(0x7F, 1))[0]
+    return await a.bus.mb_read(R.M_STATUS)
 
 
 async def i2c_write_read(dut, role):
@@ -204,12 +204,11 @@ async def i2c_10bit(dut, role):
     await b.bus.start()
     await a.bus.start()
     await ClockCycles(dut.clk, 60)
-    await a.bus.dmem_write(0x7E, [A >> 8])
     data = [random.getrandbits(8) for _ in range(4)]
-    assert await i2c_request(a, A & 0xFF, [0x20] + data) == 0, "write: status"
-    assert await i2c_request(a, A & 0xFF, [0x20], 4) == 0, "read: status"
+    assert await i2c_request(a, A, [0x20] + data) == 0, "write: status"
+    assert await i2c_request(a, A, [0x20], 4) == 0, "read: status"
     assert await a.bus.dmem_read(0x80, 4) == data
-    assert await i2c_request(a, (A & 0xFF) ^ 1, [0x20]) == 1, "wrong low address byte"
+    assert await i2c_request(a, A ^ 1, [0x20]) == 1, "wrong low address byte"
 
 
 async def i2c_two_masters(dut, role):
@@ -239,11 +238,11 @@ async def i2c_two_masters(dut, role):
         await c.bus.start()
     await ClockCycles(dut.clk, 60)
     # a goes to the device at 0x28 (0101000), b to 0x38 (0111000): b reads 0 after sending 1
-    await a.bus.dmem_write(0, [0x28, 3, 0, 0x20, 0xA1, 0xB2])
-    await b.bus.dmem_write(0, [0x38, 1, 0, 0x55])
+    await R.i2c_request(a.bus, 0x28, [0x20, 0xA1, 0xB2])
+    await R.i2c_request(b.bus, 0x38, [0x55])
     await Combine(cocotb.start_soon(a.bus.write(R.DOORBELL, 0)), cocotb.start_soon(b.bus.write(R.DOORBELL, 0)))
     await Combine(cocotb.start_soon(usb_wait(a, "a", limit=20000)), cocotb.start_soon(usb_wait(b, "b", limit=20000)))
-    sa, sb = (await a.bus.dmem_read(0x7F, 1))[0], (await b.bus.dmem_read(0x7F, 1))[0]
+    sa, sb = await a.bus.mb_read(R.M_STATUS), await b.bus.mb_read(R.M_STATUS)
     assert (sa, sb) == (0, 3), f"status a={sa}, b={sb}"
     assert dev.mem[0x20:0x22] == [0xA1, 0xB2], "the winner's data arrives intact"
 
@@ -259,8 +258,7 @@ async def usb_speed(dut, role, name, B, jp, kp):
     await b.bus.load_program(F.usb_device(B=B, jp=jp, kp=kp).words())
     await b.bus.owners(R.owner_map(**own))
     back = [random.getrandbits(8) for _ in range(8)]
-    await b.bus.dmem_write(F.UD_ADDR, [5, 0, 0, 0, len(back) + 1, F.PID_DATA1, F.PID_ACK, F.PID_NAK, 0])
-    await b.bus.dmem_write(F.UD_INDATA, back)
+    await R.usb_dev_config(b.bus, 5, len(back) + 1, F.PID_DATA1, F.PID_ACK, F.PID_NAK, back)
     await b.bus.start()
     await a.bus.start()
     await ClockCycles(dut.clk, 200)
@@ -270,7 +268,7 @@ async def usb_speed(dut, role, name, B, jp, kp):
         await usb_wait(b, f"{name} device")
         r = await R.usb_result(a.bus, 2)
         assert r == [F.PID_ACK, F.UH_OK], f"{name}: host result {r}"
-        m = await b.bus.dmem_read(0, 9)
+        m = await R.mbox_all(b.bus)
         assert m[F.UD_EVENT] == F.EV_OUT and m[F.UD_TOKEN] == pid and m[F.UD_EP] == ep, m
         assert await b.bus.dmem_read(F.UD_RXDATA + 1, 8) == data, name
     await usb_txn(a, b, usb.token(F.PID_IN, 5, 2))
@@ -282,7 +280,7 @@ async def usb_speed(dut, role, name, B, jp, kp):
     await usb_txn(a, b, usb.token(F.PID_IN, 5, 2))
     assert await R.usb_result(a.bus, 2) == [F.PID_NAK, F.UH_OK], name
     await usb_txn(a, b, usb.token(F.PID_IN, 6, 2))
-    assert (await a.bus.dmem_read(F.UH_STATUS, 1))[0] == F.UH_TIMEOUT, name
+    assert await a.bus.mb_read(F.UH_STATUS) == F.UH_TIMEOUT, name
 
 
 async def usb_suspend_resume(dut, role, name, B, jp, kp):
@@ -295,13 +293,12 @@ async def usb_suspend_resume(dut, role, name, B, jp, kp):
     await a.bus.owners(R.owner_map(**own))
     await b.bus.load_program(F.usb_device(B=B, jp=jp, kp=kp).words())
     await b.bus.owners(R.owner_map(**own))
-    await b.bus.dmem_write(F.UD_ADDR, [5, 0, 0, 0, 0, F.PID_DATA1, F.PID_ACK, F.PID_NAK, 0])
+    await R.usb_dev_config(b.bus, 5, 0, F.PID_DATA1, F.PID_ACK, F.PID_NAK)
     await b.bus.start()
     await a.bus.start()
     await ClockCycles(dut.clk, F.USB_IDLE + 300)
     assert await b.bus.read(R.CSTAT) & R.CS_ETX, f"{name}: idle flag"
-    await a.bus.dmem_write(F.UH_OP, [3])
-    await a.bus.dmem_write(F.UH_N, [2, 0])
+    await R.usb_host_request(a.bus, (0, 0, 0), op=3, n=2)
     await a.bus.write(R.DOORBELL, 0)
     await usb_wait(a, f"{name}: resume")
     await ClockCycles(dut.clk, 40 * B)
@@ -348,11 +345,11 @@ async def spi_3wire(dut, role):
             await b.bus.write_same(d)
         await b.bus.start()
         await ClockCycles(dut.clk, 40)
-        await a.bus.dmem_write(0, [2, 0, 0x12, 0x34])
+        await R.spi3_request(a.bus, [0x12, 0x34], 0)
         await a.bus.write(R.DOORBELL, 0)
         await usb_wait(a, f"{role} mode {mode} write", limit=3000)
         assert await b.read_rx(2) == [0x12, 0x34], f"mode {mode}: write"
-        await a.bus.dmem_write(0, [1, 3, 0x81])
+        await R.spi3_request(a.bus, [0x81], 3)
         await a.bus.write(R.DOORBELL, 0)
         await usb_wait(a, f"{role} mode {mode} read", limit=3000)
         assert await a.bus.dmem_read(0x80, 3) == back, f"mode {mode}: read"
@@ -376,10 +373,10 @@ async def spi_stream_cross(dut, role):
         await b.bus.write_same(d)
     await b.bus.start()
     await ClockCycles(dut.clk, 40)
-    await a.bus.dmem_write(0, [n] + down)
+    await R.spi_request(a.bus, down)
     await a.bus.write(R.DOORBELL, 0)
     await usb_wait(a, f"{role}: stream", limit=3000)
-    assert await a.bus.dmem_read(0x7F, 1) == [0]
+    assert await a.bus.mb_read(R.M_STATUS) == 0
     assert await a.bus.dmem_read(0x80, n) == up
     assert await b.read_rx(n) == down
 

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-pe_host: host-bus driver and register map (v2) for top-level tests.
+pe_host: host-bus driver and register map (v3) for top-level tests.
 
 What this file does
 -------------------
@@ -8,7 +8,8 @@ What this file does
 * `HostBus`: drives the 4-bit host bus on ui_in / uo_out the way the RP2040
   will (set op + data, toggle strobe, wait for the ack toggle). On top of
   that it provides byte `write`/`read`, `load_program` (IMEM staging +
-  commit with auto-increment), `start` (RUN/RESTART) and DMEM block access.
+  commit with auto-increment), `start` (RUN/RESTART), DMEM block access and
+  the mailbox (`mb_write` / `mb_read`, M0-M7 of 16 bits).
   A read of an empty RX FIFO returns None (the RTL drives X on the data
   nibble).
 
@@ -25,6 +26,9 @@ TXF, RXF, IMEM_ADDR, PIN_IN, PIN_IN_H, IMEM_ADDR_H, STATUS2, DOORBELL = range(8,
 IMEM_DATA, PIN_OD, PIN_FILT, PIN_OWNER = 0x10, 0x14, 0x16, 0x18
 START_PC, PC, CSTAT = 0x20, 0x22, 0x24
 DMEM_ADDR, DMEM_DATA = 0x28, 0x29
+MBOX = 0x30              # mailbox M0-M7: M[i] low byte at MBOX + 2i, high byte at MBOX + 2i + 1
+# mailbox names (pe_isa.M_*): what the firmware and the host agree on
+M_OP, M_ADDR, M_NTX, M_NRX, M_PID, M_HS, M_STATUS, M_INFO = range(8)
 IMEM_WORDS = 162         # IMEM_DEPTH of tt_um_sahil_protoemu.v
 
 # STATUS bits
@@ -41,7 +45,7 @@ OWN_CTRL, OWN_TX, OWN_RX = 0, 1, 2
 
 async def usb_result(bus, n=3):
     """pe_fw.usb_host: the first byte received, UH_STATUS, UH_RXLEN."""
-    return ([(await bus.dmem_read(0x80, 1))[0]] + await bus.dmem_read(7, 2))[:n]
+    return ([(await bus.dmem_read(0x80, 1))[0], await bus.mb_read(M_STATUS), await bus.mb_read(M_INFO)])[:n]
 
 
 def owner_map(**pins):
@@ -140,3 +144,60 @@ class HostBus:
         await self.write(DMEM_ADDR, addr)
         await self.set_addr(DMEM_DATA)
         return [await self.read_same() for _ in range(n)]
+
+    async def mb_write(self, i, v):
+        """Mailbox M[i] = v (16 bits; low byte first)."""
+        await self.write16(MBOX + 2 * i, v & 0xFFFF)
+
+    async def mb_read(self, i):
+        return await self.read16(MBOX + 2 * i)
+
+
+# ---------------------------------------------------------------- v3 requests (pe_fw programs)
+async def mbox_all(bus):
+    """The 8 mailbox registers, so that m[pe_fw.UD_EVENT] etc. index them by name."""
+    return [await bus.mb_read(i) for i in range(8)]
+
+
+async def spi_request(bus, data):
+    """spi_master / spi_master_stream: M_NTX = n, the bytes at dmem[0]."""
+    await bus.mb_write(M_NTX, len(data))
+    await bus.dmem_write(0, list(data))
+
+
+async def spi3_request(bus, wdata, nread):
+    """spi_master_3wire: M_NTX writes, M_NRX reads, the write bytes at dmem[0]."""
+    await bus.mb_write(M_NTX, len(wdata))
+    await bus.mb_write(M_NRX, nread)
+    if wdata:
+        await bus.dmem_write(0, list(wdata))
+
+
+async def i2c_request(bus, addr, wdata=(), nread=0):
+    """i2c_master: M_ADDR (7 or 10 bits), M_NTX, M_NRX, the write bytes at dmem[0]."""
+    await bus.mb_write(M_ADDR, addr)
+    await bus.mb_write(M_NTX, len(wdata))
+    await bus.mb_write(M_NRX, nread)
+    if wdata:
+        await bus.dmem_write(0, list(wdata))
+
+
+async def usb_dev_config(bus, addr, inlen, inpid, ouths, inhs, indata=()):
+    """usb_device: address, IN length (PID + data, 0 = NAK), IN data PID, handshakes, IN data at dmem[0]."""
+    await bus.mb_write(M_ADDR, addr)
+    await bus.mb_write(M_NTX, inlen)
+    await bus.mb_write(M_PID, inpid)
+    await bus.mb_write(M_HS, ouths | inhs << 8)
+    if indata:
+        await bus.dmem_write(0, list(indata))
+
+
+async def usb_host_request(bus, tok, dpid=0, data=(), op=0, n=None):
+    """usb_host: UH_OP, UH_DPID, UH_N (data bytes, or the time count n), the token at dmem[0],
+    the data at dmem[0x10]."""
+    await bus.mb_write(M_OP, op)
+    await bus.mb_write(M_PID, dpid)
+    await bus.mb_write(M_NTX, len(data) if n is None else n)
+    await bus.dmem_write(0, list(tok))
+    if data:
+        await bus.dmem_write(0x10, list(data))

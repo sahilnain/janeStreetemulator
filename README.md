@@ -1,42 +1,40 @@
 ![](../../workflows/gds/badge.svg) ![](../../workflows/docs/badge.svg) ![](../../workflows/test/badge.svg) ![](../../workflows/fpga/badge.svg)
 
-# Tiny Tapeout Verilog Project Template
+# Protocol Emulator
 
-- [Read the documentation for project](docs/info.md)
+A small programmable I/O processor for Tiny Tapeout (IHP SG13G2, 6x4 tiles, 48 MHz). Hardware units put bits on the wires with exact timing, and a controller running firmware does the protocol rules between packets. UART, SPI, I2C and USB (low and full speed) are all programs; no block is specific to one of them.
 
-## What is Tiny Tapeout?
+- Datasheet: [docs/info.md](docs/info.md)
+- How it works, module by module: [docs/architecture_guide.md](docs/architecture_guide.md)
+- Instruction set: [docs/spec/isa.md](docs/spec/isa.md). Cycle-level block rules: [docs/spec/blocks.md](docs/spec/blocks.md)
+- The v3 changes (SRAM data memory, mailbox, data movers): [docs/v3_design.md](docs/v3_design.md)
+- Area: [docs/area.md](docs/area.md). Conformance to the protocol standards: [docs/protocol_conformance.md](docs/protocol_conformance.md)
 
-Tiny Tapeout is an educational project that aims to make it easier and cheaper than ever to get your digital and analog designs manufactured on a real chip.
+## Layout
 
-To learn more and get started, visit https://tinytapeout.com.
+| Folder | Contents |
+|---|---|
+| `src/` | the RTL, and the Tiny Tapeout flow config (`config.json`, `pdn_cfg.tcl`) |
+| `macro/` | the IHP SRAM macro used for the data memory (LEF, GDS, Liberty, CDL) |
+| `model/` | a cycle-accurate Python model of the chip, and the z3 proofs that each RTL module matches it |
+| `test/` | the chip tests (cocotb), unit benches for each module (`test/unit`), the assembler and all firmware (`test/common`) |
+| `formal/` | SymbiYosys proofs of every module and of the whole chip |
+| `conformance/` | the firmware run on the model against the protocol standards, with sigrok decoders |
+| `docs/` | the documentation above |
 
-## Set up your Verilog project
+## Running the checks
 
-1. Add your Verilog files to the `src` folder.
-2. Edit the [info.yaml](info.yaml) and update information about your project, paying special attention to the `source_files` and `top_module` properties. If you are upgrading an existing Tiny Tapeout project, check out our [online info.yaml migration tool](https://tinytapeout.github.io/tt-yaml-upgrade-tool/).
-3. Edit [docs/info.md](docs/info.md) and add a description of your project.
-4. Adapt the testbench to your design. See [test/README.md](test/README.md) for more information.
+All tools come with the Tiny Tapeout dev container (`.devcontainer/Dockerfile`).
 
-The GitHub action will automatically build the ASIC files using [LibreLane](https://www.zerotoasiccourse.com/terminology/librelane/).
+| Check | Command |
+|---|---|
+| Chip tests | `cd test && make` (options in [test/README.md](test/README.md)) |
+| Chip tests in lockstep with the model | `cd test && make LOCKSTEP=1` |
+| Unit benches | `cd test/unit && pytest` |
+| z3 model-against-RTL proofs | `cd model && pytest tests` |
+| Formal proofs | `cd formal && ./run_formal.sh` |
+| Conformance | `cd conformance && ./run.sh` |
 
-## Enable GitHub actions to build the results page
+## About Tiny Tapeout
 
-- [Enabling GitHub Pages](https://tinytapeout.com/faq/#my-github-action-is-failing-on-the-pages-part)
-
-## Resources
-
-- [FAQ](https://tinytapeout.com/faq/)
-- [Digital design lessons](https://tinytapeout.com/digital_design/)
-- [Learn how semiconductors work](https://tinytapeout.com/siliwiz/)
-- [Join the community](https://tinytapeout.com/discord)
-- [Build your design locally](https://www.tinytapeout.com/guides/local-hardening/)
-
-## What next?
-
-- [Submit your design to the next shuttle](https://app.tinytapeout.com/).
-- Edit [this README](README.md) and explain your design, how it works, and how to test it.
-- Share your project on your social network of choice:
-  - LinkedIn [#tinytapeout](https://www.linkedin.com/search/results/content/?keywords=%23tinytapeout) [@TinyTapeout](https://www.linkedin.com/company/100708654/)
-  - Mastodon [#tinytapeout](https://chaos.social/tags/tinytapeout) [@matthewvenn](https://chaos.social/@matthewvenn)
-  - X (formerly Twitter) [#tinytapeout](https://twitter.com/hashtag/tinytapeout) [@tinytapeout](https://twitter.com/tinytapeout)
-  - Bluesky [@tinytapeout.com](https://bsky.app/profile/tinytapeout.com)
+Tiny Tapeout is an educational project that makes it easier and cheaper to get digital and analog designs manufactured on a real chip. See https://tinytapeout.com.

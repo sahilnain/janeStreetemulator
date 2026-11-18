@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-pe_isa: the v2 instruction set, for the tests (docs/spec/isa.md).
+pe_isa: the v3 instruction set, for the tests (docs/spec/isa.md).
 
 What this file does
 -------------------
@@ -19,20 +19,20 @@ the top 3 bits are not stored.
 OP = dict(nop=0, jmp=1, djnz=2, call=3, ret=4, delay=6, mov=7, add=8, sub=9, and_=10,
           or_=11, xor=12, shl=13, shr=14, cmp=15, set=16, setoe=17, wait=18, jpin=19,
           rdpins=20, bitin=21, bitout=22, fget=23, fput=24, ld=25, st=26, ucfg=27, urd=28,
-          ustart=29, ustop=30, uwait=31, evt=32, host=33, par=34)
+          ustart=29, ustop=30, uwait=31, evt=32, host=33, par=34, mbr=35, mbw=36)
 OP_NAMES = {v: k for k, v in OP.items()}
-RESERVED_OPS = [5] + list(range(35, 64))
+RESERVED_OPS = [5] + list(range(37, 64))
 
 # jump conditions
 (ALWAYS, Z, NZ, C, NC, TO, NTO, ERX, NERX, TXU_BUSY, TXU_IDLE, RXU_BUSY, RXU_IDLE, ETX, NETX,
  FERR, NFERR, TXF_EMPTY, TXF_NEMPTY, TXF_FULL, RXF_EMPTY, RXF_NEMPTY, RXF_FULL, DB, NDB,
- RXRDY, NRXRDY) = range(27)
+ RXRDY, NRXRDY, TXM_BUSY, TXM_IDLE, RXM_BUSY, RXM_IDLE) = range(31)
 
 # set sources
 SRC_0, SRC_1, SRC_C, SRC_NC = range(4)
 
 # units
-TX, RX, ETX_U, ERX_U, CRC = range(5)
+TX, RX, ETX_U, ERX_U, CRC, TXM, RXM = range(7)
 M_TX, M_RX, M_BOTH = 1, 2, 3
 FIFO_TX, FIFO_RX = 0, 1
 
@@ -48,6 +48,11 @@ RX_DATA, RX_STAT = 0, 1
 CRC_CTRL, CRC_POLY, CRC_INIT = range(3)
 CRC_VAL, CRC_STAT = 0, 1
 CRC_OFF, CRC_TX, CRC_RX = range(3)
+# data movers (units TXM, RXM): ucfg index, urd index
+MV_PTR, MV_GO = 0, 1
+MV_RD_PTR, MV_RD_CNT, MV_RD_LEFT = 0, 1, 2      # RXM; TXM: 0 ptr, 1 bytes left
+# mailbox registers (docs/spec/isa.md): the names the firmware and the host agree on
+M_OP, M_ADDR, M_NTX, M_NRX, M_PID, M_HS, M_STATUS, M_INFO = range(8)
 RX_ST_SERR = 1 << 4
 RX_ST_NBITS = 0x1F << 8
 
@@ -248,6 +253,13 @@ class Asm:
 
     def fput(self, rs, fifo, nb=0):
         return self.raw(word(OP["fput"], a=rs, b=fifo, imm=nb))
+
+    # mailbox
+    def mbr(self, rd, i):
+        return self.raw(word(OP["mbr"], a=rd, imm=i & 7))
+
+    def mbw(self, rs, i):
+        return self.raw(word(OP["mbw"], a=rs, imm=i & 7))
 
     def ld(self, rd, ra, inc=0):
         return self.raw(word(OP["ld"], a=rd, b=ra, imm=inc))

@@ -159,18 +159,22 @@ The proof compares the model and the RTL in every state, including states no tes
 | `git push` failed because a branch and a tag were both named `v1-uart` | Tag renamed to `v1.0`, with explicit refspecs |
 | `git push` for v2 failed: no GitHub login in this environment | The user pushes from their own terminal |
 | The image has no OpenROAD or magic | Place and route is still to do |
+| v2 global routing never converged with the clock-tree non-default rule (`CTS_APPLY_NDR` half) | `CTS_APPLY_NDR` none: global routing then took 51 s |
+| v2 detailed routing stalled near 6,000 violations, mostly Metal2 shorts at the pins of the memory flip-flops and their multiplexers | v3: DMEM moved to the IHP SRAM macro (`docs/v3_design.md`) |
+| A host read of an empty RX FIFO returns stale data, which made a v3 test of a lost SPI reply depend on chance | The test forces a host pop for one cycle instead (`test_spi_stream_lost`) |
+| The USB host's answer time-out was 2 cycles short after v3, as `mbr` made the code before the wait loop shorter | Time-out + 1 pass of the loop |
 
 ## 7. Still open
 
 These are known limits, not fixed problems.
 
 **Design and verification**
-- The design needs about 178% of the 6x4 area in synthesis, so it does not fit yet. This is the next task.
+- v2 with memory clock gating placed at 79% of the core but did not route (see the table above). v3 moves DMEM into the SRAM macro; its place and route is the next step.
 - Place and route, pad timing and gate-level simulation have not been run, so every speed comes from simulation with ideal peers.
 - The z3 proof covers each module, not the wiring between them. The chip top (`chip.py` against `tt_um_sahil_protoemu.v`) is still only checked by lockstep and fuzz, for what they run. A few proof assumptions rest on that wiring, such as a unit only getting a start while idle.
 - The IMEM proof covers the flip-flop version. The latch version is not proved against the model, and would need it if the area work moves to latches.
 - One branch is uncovered: `pe_txu.v:377`, which needs a mid-word `EEDGE` change.
-- `docs/modules.md` still describes v1, and `docs/info.md` is an empty template.
+- `docs/modules.md` still describes v1 (it is marked out of date).
 
 **Protocols**
 - **I2C:** `check_timing` assumes ideal edges, so a real bus needs a margin for rise time. High speed tops out at 2.67 MHz because SCL has a roughly even duty cycle. There is no current-source pull-up. A master that loses arbitration does not then answer as a slave. As a slave, the chip is only checked for data setup.

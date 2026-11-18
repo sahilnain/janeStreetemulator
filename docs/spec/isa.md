@@ -1,6 +1,8 @@
-# Protocol Emulator v2: instruction set
+# Protocol Emulator v3: instruction set
 
 Status: **final** (2026-11-03, step 1 of the v2 plan; encodings of config registers follow in the block specs). Extended 2026-11-04 for all UART frames, SPI word sizes and USB (NBITS, CHAIN, line coding, CRC unit, `par`). Architecture: `docs/v2_arch_study.md`.
+
+**v3 (2026-11-16):** DMEM is the IHP SRAM macro and holds payload bytes only; control values go through an 8 × 16-bit mailbox (`mbr` / `mbw`); two data movers (units 5 and 6) copy bytes between DMEM and the FIFOs on their own; `ld` takes 2 cycles. See Sections 1, 3.4 and 3.7, and `docs/v3_design.md`.
 
 Decisions included (2026-10-30):
 - 8 general 16-bit registers and an ALU (optimise after UART, I2C, SPI and USB work).
@@ -18,7 +20,9 @@ One controller executes the instruction stream. Bit-level work is done by four b
 | TX event detector (ETX) | 2 | level/edge (+ duration) on a pin, optionally qualified by a second pin; can start the TX unit; after a TX packet, can drive the pin to an idle level |
 | RX event detector (ERX) | 3 | same trigger logic; can start the RX unit; after an RX packet, can check one more sample (stop bit → FERR) |
 | CRC unit | 4 | 16-bit CRC, any polynomial, over the TX or RX data bits (Section 4) |
-| (reserved) | 5–7 | future units |
+| TX data mover (TXM) | 5 | copies DMEM[ptr..ptr+n-1] to the TX FIFO, on its own (Section 3.7) |
+| RX data mover (RXM) | 6 | copies RX FIFO bytes to DMEM[ptr..], up to n, on its own (Section 3.7) |
+| (reserved) | 7 | future unit |
 
 Controller state:
 
@@ -33,11 +37,11 @@ Controller state:
 | return stack | STACK_DEPTH × AW (default 4) | for `call` / `ret` |
 | stall counter | 16 bits | loaded by `delay`: up to 65535 extra cycles |
 
-Shared resources: TX FIFO, RX FIFO (8-bit entries), data memory (256 × 8), pin fabric.
+Shared resources: TX FIFO, RX FIFO (8-bit entries, 8 deep), data memory (256 × 8, the IHP SRAM macro, payload bytes only), the mailbox (8 × 16 bits, shared with the host), pin fabric.
 
 The host starts and stops the controller with the RUN register, as in v1. The controller has no halt instruction: idle firmware loops, typically blocked in `wait`, `uwait`, `evt wait` or `fget`.
 
-**Timing.** Each instruction takes **1 cycle**: the IMEM read is registered, and the fetch is pipelined (the next pc is fetched while an instruction executes). A delay of d extra cycles costs exactly d + 1. Blocking instructions retry every cycle until their condition is met: `wait`, `fget`/`fput` on an empty or full FIFO, `ustart TX` on an empty TX FIFO, `uwait`, and `evt wait`.
+**Timing.** Each instruction takes **1 cycle**: the IMEM read is registered, and the fetch is pipelined (the next pc is fetched while an instruction executes). The one exception is `ld`, which takes 2 in v3, since the SRAM's read is registered too. A delay of d extra cycles costs exactly d + 1. Blocking instructions retry every cycle until their condition is met: `wait`, `fget`/`fput` on an empty or full FIFO, `ustart TX` on an empty TX FIFO, `uwait`, `evt wait`, `ld` / `st` while the DMEM port is busy, and `mbw` while the host writes the same mailbox register.
 
 ## 2. Instruction word (29 bits)
 
@@ -53,7 +57,7 @@ The host loads a word as 4 bytes (`IMEM_DATA` 0x10-0x13, low byte first); bits 3
 
 | Field | Use |
 |---|---|
-| `opcode` | 64 opcodes: 34 used, 30 reserved |
+| `opcode` | 64 opcodes: 36 used (0–36 except 5), 28 reserved |
 | `A` | destination/source register `rd`/`rs`, or unit id / unit mask |
 | `I` | 1: the operand is `imm16`. 0: the operand is register `rs = imm16[2:0]` |
 | `B` | sub-field: sub-op, second register `ra`, or config register index |
@@ -87,7 +91,9 @@ Jump conditions (5 bits, 32 codes):
 | 7 / 8 | ERX / !ERX | 22 | RX FIFO full |
 | 9 / 10 | TX unit busy / idle | 23 / 24 | DB / !DB (host doorbell) |
 | 11 / 12 | RX unit busy / idle | 25 / 26 | RXRDY / !RXRDY (RX unit holds an unread byte, after the ERX check if enabled; cleared by `urd` of DATA) |
-| 13 / 14 | ETX / !ETX | 27–31 | reserved |
+| 13 / 14 | ETX / !ETX | 27 / 28 | TXM busy / idle (the TX mover has bytes left to read or push) |
+| | | 29 / 30 | RXM busy / idle (the RX mover has room left) |
+| | | 31 | reserved |
 
 ### 3.2 Registers and ALU (all 16-bit)
 
@@ -124,8 +130,12 @@ Jump conditions (5 bits, 32 codes):
 |---|---|---|---|
 | 23 | `fget rd, fifo [,nb]` | A = rd, B[0] = fifo (0 TX, 1 RX), imm[0] = nb | rd ← pop(fifo). Blocks while empty; with nb: C ← 1 and continue if empty, else C ← 0 |
 | 24 | `fput rs, fifo [,nb]` | A = rs | push(fifo, rs[7:0]). Blocks while full; with nb: drop, C ← 1 |
-| 25 | `ld rd, [ra] [,+]` | A = rd, B = ra, imm[0] = post-increment | rd ← dmem[ra[7:0]]; if +: ra ← ra + 1 |
-| 26 | `st rs, [ra] [,+]` | A = rs, B = ra | dmem[ra[7:0]] ← rs[7:0]; if +: ra ← ra + 1 |
+| 25 | `ld rd, [ra] [,+]` | A = rd, B = ra, imm[0] = post-increment | rd ← dmem[ra[7:0]]; if +: ra ← ra + 1. **2 cycles** (v3): DMEM has a registered read. The first cycle sends the read; it waits while the DMEM port is busy (Section 3.7) |
+| 26 | `st rs, [ra] [,+]` | A = rs, B = ra | dmem[ra[7:0]] ← rs[7:0]; if +: ra ← ra + 1. 1 cycle; waits while the DMEM port is busy |
+| 35 | `mbr rd, i` | A = rd, imm[2:0] = i | rd ← mailbox M[i] (16 bits) |
+| 36 | `mbw rs, i` | A = rs, imm[2:0] = i | mailbox M[i] ← rs. Waits for one cycle if the host writes a byte of M[i] in the same cycle |
+
+**Mailbox (v3).** Eight 16-bit registers M0–M7, readable and writable by the host (`MBOX`, 0x30–0x3F) and by the firmware (`mbr` / `mbw`). They carry control values: the request (operation, address, counts, PIDs, handshakes) and the result (status, event, lengths, counters). The names in `test/common/pe_isa.py` (M_OP, M_ADDR, M_NTX, M_NRX, M_PID, M_HS, M_STATUS, M_INFO) are a convention between the host and each program; Section 3.7 of `architecture_guide.md` lists each program's use. The host writes the request, then DOORBELL; the firmware answers with `host irq`.
 
 ### 3.5 Units and events
 
@@ -155,10 +165,26 @@ The unit config and status register indices are defined in the block specificati
 | Opcodes | Planned use |
 |---|---|
 | 5 | (was `halt` in the first draft; not used) |
-| 35–47 | general extensions |
+| 37–47 | general extensions |
 | 48–63 | line-coding and CRC assists (see Section 5) |
 
 A reserved opcode executes as `nop` and sets the sticky STATUS.ill_err bit.
+
+### 3.7 Data movers (v3)
+
+DMEM holds payload bytes only. Two movers carry them between DMEM and the FIFOs without the controller:
+
+| Unit | `ucfg` index 0 (PTR) | `ucfg` index 1 (GO) | `urd` |
+|---|---|---|---|
+| TXM (5) | start address, data[7:0] | n = data[8:0] bytes to send (1–256); 0 stops it | 0 ptr, 1 bytes left |
+| RXM (6) | start address, data[7:0] | n = data[8:0], the most bytes to take (1–256); 0 stops it | 0 ptr, 1 count (bytes stored since GO), 2 room left |
+
+- **TXM** reads DMEM[ptr], takes the byte into a one-byte buffer the next cycle and pushes it into the TX FIFO when the FIFO has room and the host is not writing it. About 3 cycles a byte, far faster than any line (SPI at 24 MHz needs one every 16). It is busy until it has pushed its last byte. A TX unit started without op2 takes its bytes from the FIFO as before (`ustart` waits for the first one), and CHAIN continues with the next.
+- **RXM** pops the RX FIFO whenever it holds a byte (and the host is not popping it in that cycle) and writes it to DMEM[ptr++]. It stops after n bytes, or when GO 0 stops it. Its count is the received length.
+- **The CRC with CHAIN** comes only after the TX mover has pushed its last byte, so a mover a cycle behind cannot end a packet early.
+- **The DMEM port** serves one access a cycle, in this order: host, RXM, TXM, controller (`ld` / `st`). A user that loses waits for the next cycle.
+- **Bytes the firmware must look at** (a USB PID, an I2C address byte) stay with the firmware: it reads them with `fget` and starts RXM for the rest.
+- RESTART and reset stop both movers.
 
 ## 4. Packet format and the after-packet actions
 
@@ -260,6 +286,25 @@ byte:   ustart TX|RX                   ; one byte out and one byte in, together
 ```
 There is a gap of a few instructions between bytes (SCK pauses); SPI allows this.
 
+**SPI master with the data movers (v3, `pe_fw.spi_master`).** The host has put n in mailbox M_NTX and the bytes at dmem[0]; the replies go to dmem[0x80]. The controller never touches a payload byte.
+```asm
+idle:   jmp   !DB, idle                ; wait for the host's doorbell
+        host  dbclr
+        mbr   r2, M_NTX                ; r2 = n
+        ucfg  TXM, PTR, 0              ; TXM: dmem[0..n-1] -> TX FIFO, on its own
+        ucfg  TXM, GO,  r2
+        ucfg  RXM, PTR, 0x80           ; RXM: RX FIFO -> dmem[0x80..], on its own
+        ucfg  RXM, GO,  r2
+        set   CS, 0
+byte:   ustart TX|RX                   ; waits until TXM has put a byte in the TX FIFO
+        uwait  TX|RX
+        djnz  r2, byte
+rxw:    jmp   RXM_BUSY, rxw            ; the last reply is in DMEM
+        set   CS, 1
+        host  irq                      ; tell the host
+        jmp   idle
+```
+
 **I2C master, write one byte, read ACK, STOP.**
 ```asm
         set   SDA, 0
@@ -305,3 +350,14 @@ Ethernet remains open: Manchester (10BASE-T) at 20 Mbaud half-bits is 2.5 cycles
 | `pull`/`push` (FIFO ↔ shift register) | units take/give FIFO bytes; `fget`/`fput` for the controller |
 | `jmp` 3-bit condition | 5-bit condition |
 | — | ALU, `call`/`ret`, data memory, unit/event/host instructions |
+
+## 8. Changes in v3
+
+| v2 | v3 |
+|---|---|
+| DMEM in flip-flops, read in the same cycle | DMEM is the IHP SRAM macro (256 × 8), read registered; `ld` takes 2 cycles |
+| DMEM held requests, results and payload | DMEM holds payload only; requests and results go through the mailbox M0–M7 (`mbr` 35, `mbw` 36) |
+| the controller moved every payload byte with `ld` / `fput` and `fget` / `st` | the TX and RX data movers (units 5 and 6) move them; conditions 27–30 tell when they are done |
+| host DMEM reads answered at once | answered one cycle later (the host waits for the ack anyway) |
+| VERSION 0x02 | VERSION 0x03 |
+

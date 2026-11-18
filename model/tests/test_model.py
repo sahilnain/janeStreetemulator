@@ -60,7 +60,7 @@ def edges(levels):
 
 def test_registers_reset():
     h = host()
-    assert h.read(A_ID) == 0x50 and h.read(A_VERSION) == 0x02 and h.read(A_RUN) == 0
+    assert h.read(A_ID) == 0x50 and h.read(A_VERSION) == 0x03 and h.read(A_RUN) == 0
     assert h.read(A_STATUS) == 0x05, "both FIFOs empty"
     o = h.chip.outputs()
     assert o["uio_oe"] == 0

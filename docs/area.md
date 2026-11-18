@@ -2,6 +2,8 @@
 
 Cell area of the RTL in the process Tiny Tapeout will use, after synthesis and after placement with the clock tree. Routing, hold repair and fill have not been run, so the final number is still to come (see "Does it fit?"). The Python model is not synthesizable, so the RTL stands in for it; the z3 proof and lockstep tests tie the two together.
 
+> **v3 (2026-11-17):** DMEM moved from flip-flops to the IHP SRAM macro (`docs/v3_design.md`), and a mailbox and two data movers were added. The numbers below are for the v2 design with memory clock gating, which placed but did not route. The v3 synthesis and place-and-route results will be added here.
+
 The target is **6x4 tiles**: a die of 1289.28 × 710.64 µm = 916,220 µm², of which about **902,400 µm² is core** for cells.
 
 ## Setup

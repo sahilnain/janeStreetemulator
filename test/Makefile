@@ -10,6 +10,7 @@
 #   make PROTOCOLS=uart          UART only
 #   make PROTOCOLS=uart,i2c      UART and I2C
 #   make MEM_CG=0                memories without clock gating (the roll-back build)
+#   make DMEM_IMPL=0             flip-flop DMEM instead of the SRAM macro (the roll-back build)
 # The RTL gets -DSUPPORT_<P>=0 for each protocol left out, the Python model reads PE_PROTOCOLS, and
 # a test that needs a protocol which is not built is skipped (test/common/pe_build.py).
 PROTOCOLS ?= uart,spi,i2c,usb
@@ -28,8 +29,15 @@ MEM_CG ?= 1
 ifneq ($(filter-out 0 1,$(MEM_CG)),)
 $(error MEM_CG must be 0 or 1)
 endif
-# one build directory per protocol set and gating choice, so a change never reuses a stale build
-BUILD_TAG := $(subst $(comma),_,$(PROTOCOLS))$(if $(filter 0,$(MEM_CG)),_nocg,)
+# DMEM (DMEM_IMPL in src/tt_um_sahil_protoemu.v): 1 = the IHP SRAM macro, simulated with the PDK's
+# behavioural model (test/models, FUNCTIONAL); 0 = flip-flops.
+DMEM_IMPL ?= 1
+ifneq ($(filter-out 0 1,$(DMEM_IMPL)),)
+$(error DMEM_IMPL must be 0 or 1)
+endif
+SRAM_MODELS := $(PWD)/models/RM_IHPSG13_1P_core_behavioral_bm_bist.v $(PWD)/models/RM_IHPSG13_1P_256x8_c3_bm_bist.v
+# one build directory per protocol set, gating and DMEM choice, so a change never reuses a stale build
+BUILD_TAG := $(subst $(comma),_,$(PROTOCOLS))$(if $(filter 0,$(MEM_CG)),_nocg,)$(if $(filter 0,$(DMEM_IMPL)),_ffdm,)
 
 # defaults
 SIM ?= icarus
@@ -38,7 +46,7 @@ TOPLEVEL_LANG ?= verilog
 SRC_DIR = $(PWD)/../src
 PROJECT_SOURCES = tt_um_sahil_protoemu.v \
                   host/pe_host_if.v host/pe_regs.v \
-                  mem/pe_icg.v mem/pe_imem.v mem/pe_fifo.v mem/pe_dmem.v \
+                  mem/pe_icg.v mem/pe_imem.v mem/pe_fifo.v mem/pe_dmem.v mem/pe_dmov.v \
                   io/pe_sync.v io/pe_pins.v \
                   core/pe_ctrl.v core/pe_decode.v core/pe_vote.v \
                   unit/pe_txu.v unit/pe_rxu.v unit/pe_det.v unit/pe_crc.v
@@ -47,8 +55,8 @@ ifneq ($(GATES),yes)
 
 # RTL simulation:
 SIM_BUILD				?= sim_build/rtl_$(BUILD_TAG)
-VERILOG_SOURCES += $(addprefix $(SRC_DIR)/,$(PROJECT_SOURCES))
-COMPILE_ARGS    += $(PROTOCOL_DEFINES) -DMEM_CLOCK_GATE=$(MEM_CG)
+VERILOG_SOURCES += $(addprefix $(SRC_DIR)/,$(PROJECT_SOURCES)) $(SRAM_MODELS)
+COMPILE_ARGS    += $(PROTOCOL_DEFINES) -DMEM_CLOCK_GATE=$(MEM_CG) -DDMEM_IMPL=$(DMEM_IMPL) -DFUNCTIONAL
 
 else
 
@@ -59,6 +67,7 @@ COMPILE_ARGS    += -DFUNCTIONAL
 COMPILE_ARGS    += -DSIM
 VERILOG_SOURCES += $(PDK_ROOT)/ihp-sg13g2/libs.ref/sg13g2_io/verilog/sg13g2_io.v
 VERILOG_SOURCES += $(PDK_ROOT)/ihp-sg13g2/libs.ref/sg13g2_stdcell/verilog/sg13g2_stdcell.v
+VERILOG_SOURCES += $(SRAM_MODELS)
 
 # this gets copied in by the GDS action workflow
 VERILOG_SOURCES += $(PWD)/gate_level_netlist.v

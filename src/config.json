@@ -13,6 +13,47 @@
 
   "//": "PL_TARGET_DENSITY_PCT - You can increase this if Global Placement fails with error GPL-0302.",
   "//": "Users have reported that values up to 80 worked well for them.",
+  "//": "DMEM SRAM macro (docs/v3_design.md). Integration as in Tiny Tapeout's urish/ttihp-sram-test.",
+  "MACROS": {
+    "RM_IHPSG13_1P_256x8_c3_bm_bist": {
+      "instances": {
+        "u_dmem.g_sram.u_sram": {
+          "location": [60, 20],
+          "orientation": "N"
+        }
+      },
+      "gds": ["dir::../macro/RM_IHPSG13_1P_256x8_c3_bm_bist/RM_IHPSG13_1P_256x8_c3_bm_bist.gds"],
+      "lef": ["dir::../macro/RM_IHPSG13_1P_256x8_c3_bm_bist/RM_IHPSG13_1P_256x8_c3_bm_bist.lef"],
+      "lib": {
+        "nom_*": ["dir::../macro/RM_IHPSG13_1P_256x8_c3_bm_bist/RM_IHPSG13_1P_256x8_c3_bm_bist_typ_1p20V_25C.lib"],
+        "min_*": ["dir::../macro/RM_IHPSG13_1P_256x8_c3_bm_bist/RM_IHPSG13_1P_256x8_c3_bm_bist_fast_1p32V_m55C.lib"],
+        "max_*": ["dir::../macro/RM_IHPSG13_1P_256x8_c3_bm_bist/RM_IHPSG13_1P_256x8_c3_bm_bist_slow_1p08V_125C.lib"],
+        "*": ["dir::../macro/RM_IHPSG13_1P_256x8_c3_bm_bist/RM_IHPSG13_1P_256x8_c3_bm_bist_typ_1p20V_25C.lib"]
+      },
+      "nl": ["dir::mem/RM_IHPSG13_1P_256x8_c3_bm_bist.v"],
+      "spice": ["dir::../macro/RM_IHPSG13_1P_256x8_c3_bm_bist/RM_IHPSG13_1P_256x8_c3_bm_bist.cdl"]
+    }
+  },
+  "PDN_MACRO_CONNECTIONS": [
+    "u_dmem.g_sram.u_sram VPWR VGND VDD! VSS!",
+    "u_dmem.g_sram.u_sram VPWR VGND VDDARRAY! VSS!"
+  ],
+
+  "//": "Custom PDN config: the SRAM power pins are on Metal4, and need a Metal4 to TopMetal1 connection",
+  "PDN_CFG": "dir::pdn_cfg.tcl",
+
+  "//": "The SRAM GDS has no PR boundary layer: read the full GDS instead of a black box",
+  "MAGIC_MACRO_STD_CELL_SOURCE": "PDK",
+
+  "//": "The SRAM macro's internals give many DRC errors in Magic: skip (KLayout DRC is skipped too)",
+  "ERROR_ON_MAGIC_DRC": false,
+
+  "//": "Black-box the SRAM macro in SPICE extraction for LVS: the macro is not LVS clean",
+  "MAGIC_EXT_ABSTRACT_CELLS": ["RM_IHPSG13_.*"],
+
+  "//": "Clock nets without the 2x-spacing rule: with it, global routing never converged (docs/area.md)",
+  "CTS_APPLY_NDR": "none",
+
   "PL_TARGET_DENSITY_PCT": 60,
 
   "//": "CLOCK_PERIOD - Increase this in case you are getting setup time violations.",

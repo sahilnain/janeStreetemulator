@@ -8,6 +8,7 @@ import itertools
 import random
 
 import pe_fw as F
+import pe_isa as I
 import pytest
 import sigrok
 from bench import OWN_TX, Bench, Script, fw_wait, owners
@@ -48,7 +49,8 @@ def test_master_bytes(cpol, cpha, msb, B):
     dev = SpecSlave(cpol, cpha, msb, tx=back)
     b.devices.append(dev)
     start = len(b.samples)
-    nd.dmem(0, [len(out)] + out)
+    nd.mb(I.M_NTX, len(out))
+    nd.dmem(0, out)
     nd.doorbell()
     fw_wait(b, nd)
     b.run(20)
@@ -68,7 +70,8 @@ def test_master_every_word_size(cpol, cpha, msb, bits):
     dev = SpecSlave(cpol, cpha, msb, bits, tx=back)
     b.devices.append(dev)
     start = len(b.samples)
-    nd.dmem(0, [len(out)] + [x for w in out for x in (w & 0xFF, w >> 8)])
+    nd.mb(I.M_NTX, len(out))
+    nd.dmem(0, [x for w in out for x in (w & 0xFF, w >> 8)])
     nd.doorbell()
     fw_wait(b, nd)
     b.run(20)
@@ -88,14 +91,15 @@ def test_master_stream(cpol, cpha, msb, B):
     out, back = mdata(n, B), mdata(n, B + 3)
     b.devices.append(SpecSlave(cpol, cpha, msb, tx=back))
     start = len(b.samples)
-    nd.dmem(0, [n] + out)
+    nd.mb(I.M_NTX, n)
+    nd.dmem(0, out)
     nd.doorbell()
     fw_wait(b, nd)
     b.run(40)
     s = b.samples[start:]
     d = dec(s, cpol, cpha, msb)
     assert d["mosi"] == out and d["miso"] == back
-    assert nd.peek(0x7F) == [0] and nd.peek(0x80, n) == back
+    assert nd.mbr(I.M_STATUS) == 0 and nd.peek(0x80, n) == back
     check_frames(s, cpol, cpha, 16 * n, min_phase=B // 2, min_lead=B // 2, min_lag=B // 2)
     # no pause anywhere in the stream
     e = [t for t in range(1, len(s)) if (s[t] ^ s[t - 1]) & (1 << SCK)]
@@ -144,7 +148,9 @@ def test_master_3wire(cpol, cpha, msb, B):
     dev = Three(cpol, cpha, msb, B, rd)
     b.devices.append(dev)
     start = len(b.samples)
-    nd.dmem(0, [4, 4] + wr)
+    nd.mb(I.M_NTX, 4)
+    nd.mb(I.M_NRX, 4)
+    nd.dmem(0, wr)
     nd.doorbell()
     fw_wait(b, nd)
     b.run(20)
@@ -354,7 +360,8 @@ def test_two_chips(B):
         for w in back:
             sl.write(A_TXF, w)
         start = len(b.samples)
-        m.dmem(0, [8] + out)
+        m.mb(I.M_NTX, 8)
+        m.dmem(0, out)
         m.doorbell()
         fw_wait(b, m)
         b.run(10)

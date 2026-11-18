@@ -23,6 +23,14 @@ RXD = F.UD_RXDATA + 1       # the PID comes first
 WAIT = 40                   # bit times: the longest answer starts by 7.5, a handshake takes 19
 
 
+
+def ud_config(nd, addr, inlen, inpid, ouths, inhs):
+    """usb_device mailbox: our address, the IN length (PID + data, 0 = NAK), the IN data PID, the handshakes."""
+    nd.mb(F.UD_ADDR, addr)
+    nd.mb(F.UD_INLEN, inlen)
+    nd.mb(F.UD_INPID, inpid)
+    nd.mb(F.UD_HS, ouths | inhs << 8)
+
 def payload(n, seed=0):
     r = random.Random(n * 7 + seed)
     return [r.randint(0, 255) for _ in range(n)]
@@ -32,7 +40,7 @@ def device(speed, inlen=0, inpid=DATA1, indata=(), ouths=ACK, inhs=NAK, **kw):
     sp = SPEEDS[speed]
     b = U.bench(speed)
     nd = b.nodes[0]
-    nd.dmem(F.UD_ADDR, [ADDR, 0, 0, 0, inlen, inpid, ouths, inhs, 0])
+    ud_config(nd, ADDR, inlen, inpid, ouths, inhs)
     nd.dmem(F.UD_INDATA, list(indata))
     nd.load(F.usb_device(B=sp["B"], jp=sp["jp"], kp=sp["kp"], **kw),
             own=owners(**{f"p{sp['jp']}": OWN_TX, f"p{sp['kp']}": OWN_TX}))
@@ -93,7 +101,7 @@ def test_device_out(speed, n):
     b.run(2 * B)
     t = send(b, speed, encode(data_packet(DATA1, d)))
     b.run(WAIT * B)
-    b.until(lambda: nd.peek(F.UD_EVENT)[0] == F.EV_OUT, limit=4000, what="event")
+    b.until(lambda: nd.mbr(F.UD_EVENT) == F.EV_OUT, limit=4000, what="event")
     assert nd.peek(RXD, n) == d
     s = b.samples
     turn_ok(bits_after(s, speed, t), speed)
@@ -101,8 +109,8 @@ def test_device_out(speed, n):
     assert names(x) == ["OUT", "DATA1", "ACK"], names(x)
     check_eops(s, speed, t)
     assert not b.contention
-    assert nd.peek(F.UD_TOKEN)[0] == OUT and nd.peek(F.UD_EP)[0] == EP
-    assert nd.peek(F.UD_RXLEN)[0] == n + 3     # PID, data, CRC
+    assert nd.mbr(F.UD_TOKEN) == OUT and nd.mbr(F.UD_EP) == EP
+    assert nd.mbr(F.UD_RXLEN) == n + 3     # PID, data, CRC
 
 
 @pytest.mark.parametrize("speed", BOTH)
@@ -179,7 +187,7 @@ def test_device_stuff_bit_before_eop(speed):
     b.run(2 * B)
     t = send(b, speed, encode(data_packet(DATA0, d)))
     b.run(WAIT * B)
-    assert nd.peek(F.UD_EVENT)[0] == F.EV_OUT, "device refused it"
+    assert nd.mbr(F.UD_EVENT) == F.EV_OUT, "device refused it"
     t = send(b, speed, encode(token(IN, ADDR, EP)))
     b.run((len(d) * 12 + 40) * B)
     x = clean(b.samples[s0:], speed)
@@ -205,7 +213,7 @@ def test_device_in(speed, pid, n):
     b.run(2 * B)
     send(b, speed, encode([ACK]))
     b.run(10 * B)
-    assert nd.peek(F.UD_EVENT)[0] == F.EV_IN_ACK, nd.peek(F.UD_EVENT)
+    assert nd.mbr(F.UD_EVENT) == F.EV_IN_ACK, [nd.mbr(F.UD_EVENT)]
     x = clean(b.samples[s0:], speed)
     assert names(x) == ["IN", "DATA0" if pid == DATA0 else "DATA1", "ACK"], names(x)
     assert "crc16-ok" in x["crc_ok"]
@@ -236,8 +244,8 @@ def test_device_in_no_ack_keeps_the_data(speed):
     B = SPEEDS[speed]["B"]
     send(b, speed, encode(token(IN, ADDR, EP)))
     b.run(150 * B)
-    assert nd.peek(F.UD_EVENT)[0] == F.EV_IN_NOACK
-    assert nd.peek(F.UD_INLEN)[0] == 4
+    assert nd.mbr(F.UD_EVENT) == F.EV_IN_NOACK
+    assert nd.mbr(F.UD_INLEN) == 4
 
 
 @pytest.mark.parametrize("speed", BOTH)
@@ -252,7 +260,7 @@ def test_device_waits_for_the_handshake_as_long_as_it_must(speed):
     b.run(15 * B - 2)
     send(b, speed, encode([ACK]))
     b.run(10 * B)
-    assert nd.peek(F.UD_EVENT)[0] == F.EV_IN_ACK, "timed out before 16 bit times"
+    assert nd.mbr(F.UD_EVENT) == F.EV_IN_ACK, "timed out before 16 bit times"
 
 
 # ---------------------------------------------------------------- device: what must get no answer
@@ -306,7 +314,7 @@ def test_device_data_with_bad_crc16(speed):
     send(b, speed, encode(data_packet(DATA0, [1, 2, 3], bad_crc=True)))
     b.run(WAIT * B)
     assert len(packets(b.samples, speed, s0)) == 2
-    assert nd.peek(F.UD_EVENT)[0] != F.EV_OUT
+    assert nd.mbr(F.UD_EVENT) != F.EV_OUT
 
 
 @pytest.mark.parametrize("pid", (OUT ^ 0x10, IN ^ 0x40, SETUP ^ 0x01, 0xFF, 0x00), ids=lambda p: f"{p:02x}")
@@ -319,7 +327,7 @@ def test_device_ignores_a_bad_pid(speed, pid):
     send(b, speed, encode(token(pid, ADDR, EP)))
     b.run(WAIT * B)
     assert len(packets(b.samples, speed, s0)) == 1, "answered a packet with a bad PID"
-    assert nd.peek(F.UD_EVENT)[0] == 0
+    assert nd.mbr(F.UD_EVENT) == 0
     s1 = len(b.samples)
     send(b, speed, encode(token(IN, ADDR, EP)))
     b.run(60 * B)
@@ -370,7 +378,7 @@ def test_device_data_with_a_bad_pid(speed, pid):
     send(b, speed, encode(data_packet(pid, [1, 2, 3])))
     b.run(WAIT * B)
     assert len(packets(b.samples, speed, s0)) == 2, "answered it"
-    assert nd.peek(F.UD_EVENT)[0] != F.EV_OUT
+    assert nd.mbr(F.UD_EVENT) != F.EV_OUT
 
 
 @pytest.mark.parametrize("gap", (18, 19, 20, 25))
@@ -419,7 +427,7 @@ def test_device_clock_tolerance(speed, pct):
     send(b, speed, encode(data_packet(DATA0, d)), bit=bit)
     b.run(WAIT * B)
     assert nd.peek(RXD, 8) == d
-    assert nd.peek(F.UD_EVENT)[0] == F.EV_OUT
+    assert nd.mbr(F.UD_EVENT) == F.EV_OUT
 
 
 @pytest.mark.parametrize("seed", range(5))
@@ -436,7 +444,7 @@ def test_device_jitter(speed, seed):
     b.run(2 * B)
     t = send(b, speed, encode(data_packet(DATA0, d)), next_j=j, rnd=r)
     b.run(WAIT * B)
-    assert nd.peek(RXD, len(d)) == d and nd.peek(F.UD_EVENT)[0] == F.EV_OUT
+    assert nd.peek(RXD, len(d)) == d and nd.mbr(F.UD_EVENT) == F.EV_OUT
     turn_ok(bits_after(b.samples, speed, t), speed)
 
 
@@ -461,7 +469,7 @@ def test_device_accepts_dribble(speed):
     b.run(2 * B)
     send(b, speed, encode(data_packet(DATA0, d), dribble=True))
     b.run(WAIT * B)
-    assert nd.peek(F.UD_EVENT)[0] == F.EV_OUT and nd.peek(RXD, len(d)) == d, "dribble refused"
+    assert nd.mbr(F.UD_EVENT) == F.EV_OUT and nd.peek(RXD, len(d)) == d, "dribble refused"
 
 
 @pytest.mark.parametrize("speed", BOTH)
@@ -474,7 +482,7 @@ def test_device_accepts_shortest_eop(speed):
     b.run(2 * B)
     t = send(b, speed, encode(data_packet(DATA0, [1, 2, 3])), se0_cycles=c)
     b.run(WAIT * B)
-    assert nd.peek(F.UD_EVENT)[0] == F.EV_OUT, "short EOP not accepted"
+    assert nd.mbr(F.UD_EVENT) == F.EV_OUT, "short EOP not accepted"
 
 
 @pytest.mark.parametrize("speed", BOTH)
@@ -490,7 +498,7 @@ def test_device_ignores_se0_in_transitions(speed):
     b.run(2 * B)
     send(b, speed, encode(data_packet(DATA0, [0xA5, 0x5A, 0x00])), glitch=g)
     b.run(WAIT * B)
-    assert nd.peek(F.UD_EVENT)[0] == F.EV_OUT and nd.peek(RXD, 3) == [0xA5, 0x5A, 0x00]
+    assert nd.mbr(F.UD_EVENT) == F.EV_OUT and nd.peek(RXD, 3) == [0xA5, 0x5A, 0x00]
 
 
 @pytest.mark.parametrize("gap", (2.0, 2.5, 3.0, 4.0, 8.0, 40.0))
@@ -533,11 +541,11 @@ def test_device_reset_detect(speed):
     b, nd = device(speed)
     send(b, speed, [U.SE0, U.SE0, U.J])          # a keep-alive
     b.run(400)
-    assert nd.peek(F.UD_EVENT)[0] == 0, "an EOP was taken for a reset"
+    assert nd.mbr(F.UD_EVENT) == 0, "an EOP was taken for a reset"
     c = U.TDETRST_NS / U.NS
     send(b, speed, [U.SE0, U.J], se0_cycles=int(c))
     b.run(400)
-    assert nd.peek(F.UD_EVENT)[0] == F.EV_RESET
+    assert nd.mbr(F.UD_EVENT) == F.EV_RESET
     s1 = len(b.samples)
     send(b, speed, encode(token(IN, ADDR, EP)))
     b.run(WAIT * B)
@@ -551,7 +559,7 @@ def test_device_long_reset(speed):
     b, nd = device(speed)
     send(b, speed, [U.SE0, U.J], se0_cycles=480000)
     b.run(400)
-    assert nd.peek(F.UD_EVENT)[0] == F.EV_RESET
+    assert nd.mbr(F.UD_EVENT) == F.EV_RESET
     s1 = len(b.samples)
     send(b, speed, encode(token(IN, ADDR, EP)))
     b.run(WAIT * B)
@@ -577,8 +585,11 @@ def test_device_suspend_and_resume(speed):
 
 # ---------------------------------------------------------------- host
 def htok(nd, t, dpid=0, data=(), op=0):
-    nd.dmem(0, [op] + list(t) + [dpid, len(data)])
-    nd.dmem(0x10, list(data))
+    nd.mb(F.UH_OP, op)
+    nd.mb(F.UH_DPID, dpid)
+    nd.mb(F.UH_N, len(data))
+    nd.dmem(F.UH_TOK, list(t))
+    nd.dmem(F.UH_DATA, list(data))
     nd.doorbell()
 
 
@@ -610,7 +621,7 @@ def test_host_out(speed, n):
     b.run(int(3 * B))
     send(b, speed, encode([ACK]))
     hwait(b, nd)
-    assert nd.peek(F.UH_RPID)[0] == ACK and nd.peek(F.UH_STATUS)[0] == F.UH_OK
+    assert nd.peek(F.UH_RPID)[0] == ACK and nd.mbr(F.UH_STATUS) == F.UH_OK
     x = clean(b.samples[s0:], speed)
     assert names(x) == ["OUT", "DATA1", "ACK"], names(x)
     gap = bits_after(b.samples, speed, t1)
@@ -634,7 +645,7 @@ def test_host_in(speed, n, turn):
     t = send(b, speed, encode(data_packet(DATA1, d)))
     hwait(b, nd, limit=40 * B + 2000)
     b.run(4 * B)
-    assert nd.peek(F.UH_STATUS)[0] == F.UH_OK and nd.peek(F.UH_RPID)[0] == DATA1
+    assert nd.mbr(F.UH_STATUS) == F.UH_OK and nd.peek(F.UH_RPID)[0] == DATA1
     assert nd.peek(0x81, n) == d
     x = clean(b.samples[s0:], speed)
     assert names(x) == ["IN", "DATA1", "ACK"], names(x)
@@ -654,7 +665,7 @@ def test_host_in_all_lengths_and_a_stuff_bit_at_the_end(speed):
             b.run(2 * B)
             send(b, speed, encode(data_packet(DATA0, d)))
             hwait(b, nd, limit=40 * B + 2000)
-            assert nd.peek(F.UH_STATUS)[0] == F.UH_OK and nd.peek(0x81, n) == d
+            assert nd.mbr(F.UH_STATUS) == F.UH_OK and nd.peek(0x81, n) == d
 
 
 @pytest.mark.parametrize("speed", BOTH)
@@ -669,7 +680,7 @@ def test_host_timeout(speed):
     b.until(lambda: not nd.chip.rx.busy, limit=400 * B, what="time-out")     # it stops listening
     at = (len(b.samples) - t) / B
     hwait(b, nd, limit=4000)
-    assert nd.peek(F.UH_STATUS)[0] == F.UH_TIMEOUT
+    assert nd.mbr(F.UH_STATUS) == F.UH_TIMEOUT
     assert U.TIMEOUT[0] <= at, f"timed out after {at:.1f} bit times: under 16"
     assert at <= U.TIMEOUT[1], f"timed out after {at:.1f} bit times: over 18"
 
@@ -684,7 +695,7 @@ def test_host_accepts_a_late_answer(speed):
     b.run(15 * B - 2)                 # send() takes 2 cycles to its first K: it starts at 16 bit times
     send(b, speed, encode(data_packet(DATA1, [1, 2])))
     hwait(b, nd, limit=60 * B + 2000)
-    assert nd.peek(F.UH_STATUS)[0] == F.UH_OK and nd.peek(0x81, 2) == [1, 2]
+    assert nd.mbr(F.UH_STATUS) == F.UH_OK and nd.peek(0x81, 2) == [1, 2]
 
 
 @pytest.mark.parametrize("speed", BOTH)
@@ -698,7 +709,7 @@ def test_host_bad_crc_no_ack(speed):
     send(b, speed, encode(data_packet(DATA1, [1, 2, 3], bad_crc=True)))
     hwait(b, nd, limit=40 * B + 2000)
     b.run(WAIT * B)
-    assert nd.peek(F.UH_STATUS)[0] == F.UH_BADPKT
+    assert nd.mbr(F.UH_STATUS) == F.UH_BADPKT
     assert len(packets(b.samples, speed, s0)) == 2, "ACK to a corrupted packet"
 
 
@@ -716,7 +727,7 @@ def test_host_bad_pid_no_ack(speed, pid):
     hwait(b, nd, limit=40 * B + 2000)
     b.run(WAIT * B)
     assert len(packets(b.samples, speed, s0)) == 2, "ACK to a packet with a bad PID"
-    assert nd.peek(F.UH_STATUS)[0] == F.UH_BADPKT
+    assert nd.mbr(F.UH_STATUS) == F.UH_BADPKT
 
 
 @pytest.mark.parametrize("speed", BOTH)
@@ -731,7 +742,7 @@ def test_host_stuff_error_no_ack(speed):
     hwait(b, nd, limit=40 * B + 2000)
     b.run(WAIT * B)
     assert len(packets(b.samples, speed, s0)) == 2
-    assert nd.peek(F.UH_STATUS)[0] == F.UH_BADPKT
+    assert nd.mbr(F.UH_STATUS) == F.UH_BADPKT
 
 
 @pytest.mark.parametrize("speed", BOTH)
@@ -744,7 +755,7 @@ def test_host_accepts_dribble(speed):
     b.run(2 * B)
     send(b, speed, encode(data_packet(DATA1, d), dribble=True))
     hwait(b, nd, limit=40 * B + 2000)
-    assert nd.peek(F.UH_STATUS)[0] == F.UH_OK, "dribble refused"
+    assert nd.mbr(F.UH_STATUS) == F.UH_OK, "dribble refused"
     assert nd.peek(0x81, len(d)) == d
 
 
@@ -761,7 +772,7 @@ def test_host_ignores_se0_in_transitions(speed):
     b.run(2 * B)
     send(b, speed, encode(data_packet(DATA1, d)), glitch=g)
     hwait(b, nd, limit=40 * B + 2000)
-    assert nd.peek(F.UH_STATUS)[0] == F.UH_OK and nd.peek(0x81, 3) == d
+    assert nd.mbr(F.UH_STATUS) == F.UH_OK and nd.peek(0x81, 3) == d
 
 
 @pytest.mark.parametrize("speed", BOTH)
@@ -771,7 +782,8 @@ def test_host_reset_is_long_enough(speed):
     want = U.TDRST_MS * CLOCK_HZ // 1000
     n = want // 256 + 1
     s0 = len(b.samples)
-    nd.dmem(0, [1, 0, 0, 0, 0, n & 0xFF, n >> 8])
+    nd.mb(F.UH_OP, 1)
+    nd.mb(F.UH_N, n)
     nd.doorbell()
     hwait(b, nd, limit=want * 2)
     b.run(200)
@@ -787,7 +799,7 @@ def test_host_keep_alive(speed):
     """Table 7-2: a keep-alive is a low-speed EOP: SE0 for 1.25 to 1.5 us, then J."""
     b, nd = host(speed)
     s0 = len(b.samples)
-    nd.dmem(0, [2])
+    nd.mb(F.UH_OP, 2)
     nd.doorbell()
     hwait(b, nd, limit=4000)
     b.run(100)
@@ -807,7 +819,8 @@ def test_host_resume_is_long_enough(speed):
     want = U.TDRSMDN_MS * CLOCK_HZ // 1000
     n = want // 256 + 1
     s0 = len(b.samples)
-    nd.dmem(0, [3, 0, 0, 0, 0, n & 0xFF, n >> 8])
+    nd.mb(F.UH_OP, 3)
+    nd.mb(F.UH_N, n)
     nd.doorbell()
     hwait(b, nd, limit=want * 2)
     b.run(300)
@@ -830,7 +843,7 @@ def test_chip_to_chip_control_transfer(speed):
     h, d = b.nodes
     own = owners(**{f"p{sp['jp']}": OWN_TX, f"p{sp['kp']}": OWN_TX})
     desc = [0x12, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x08]
-    d.dmem(F.UD_ADDR, [ADDR, 0, 0, 0, len(desc) + 1, DATA1, ACK, NAK, 0])
+    ud_config(d, ADDR, len(desc) + 1, DATA1, ACK, NAK)
     d.dmem(F.UD_INDATA, desc)
     d.load(F.usb_device(B=B, jp=sp["jp"], kp=sp["kp"]), own=own)
     h.load(F.usb_host(B=B, jp=sp["jp"], kp=sp["kp"]), own=own)
@@ -839,16 +852,16 @@ def test_chip_to_chip_control_transfer(speed):
     setup = [0x80, 6, 0, 1, 0, 0, 8, 0]
     htok(h, token(SETUP, ADDR, 0), DATA0, setup)
     hwait(b, h, limit=40000 * (B // 4))
-    assert h.peek(F.UH_RPID)[0] == ACK and h.peek(F.UH_STATUS)[0] == F.UH_OK
+    assert h.peek(F.UH_RPID)[0] == ACK and h.mbr(F.UH_STATUS) == F.UH_OK
     assert d.peek(RXD, 8) == setup
     b.run(40 * B)
     htok(h, token(IN, ADDR, 0))
     hwait(b, h, limit=40000 * (B // 4))
-    assert h.peek(F.UH_STATUS)[0] == F.UH_OK and h.peek(F.UH_RPID)[0] == DATA1
+    assert h.mbr(F.UH_STATUS) == F.UH_OK and h.peek(F.UH_RPID)[0] == DATA1
     assert h.peek(0x81, 8) == desc
     b.run(60 * B)
-    assert d.peek(F.UD_EVENT)[0] == F.EV_IN_ACK
-    d.dmem(F.UD_EVENT, [0])
+    assert d.mbr(F.UD_EVENT) == F.EV_IN_ACK
+    d.mb(F.UD_EVENT, 0)
     htok(h, token(OUT, ADDR, 0), DATA1, [])
     hwait(b, h, limit=40000 * (B // 4))
     assert h.peek(F.UH_RPID)[0] == ACK
@@ -886,7 +899,7 @@ def test_host_keeps_the_last_byte(speed):
                 pkt = data_packet(DATA1, d)
                 send(b, speed, encode(pkt))
                 hwait(b, nd, limit=40 * B + 2000)
-                got = nd.peek(F.UH_STATUS)[0], nd.peek(F.UH_RXLEN)[0], nd.peek(0x80, 11)
+                got = nd.mbr(F.UH_STATUS), nd.mbr(F.UH_RXLEN), nd.peek(0x80, 11)
                 assert got == (F.UH_OK, 11, pkt), (bytes(d).hex(), phase, rep, got)
                 b.run(8 * B)
 
@@ -905,7 +918,7 @@ def test_host_handshake_at_any_phase(speed, hs):
         b.run(2 * B + phase)
         send(b, speed, encode([hs]))
         hwait(b, nd, limit=40 * B + 2000)
-        got = nd.peek(F.UH_STATUS)[0], nd.peek(F.UH_RXLEN)[0], nd.peek(F.UH_RPID)[0]
+        got = nd.mbr(F.UH_STATUS), nd.mbr(F.UH_RXLEN), nd.peek(F.UH_RPID)[0]
         assert got == (F.UH_OK, 1, hs), (phase, got)
 
 
@@ -921,8 +934,8 @@ def test_device_keeps_the_last_byte(speed):
             pkt = data_packet(DATA1, d)
             send(b, speed, encode(pkt))
             b.run(WAIT * B)
-            b.until(lambda: nd.peek(F.UD_EVENT)[0] == F.EV_OUT, limit=4000, what="event")
-            got = nd.peek(F.UD_RXLEN)[0], nd.peek(F.UD_RXDATA, 11)
+            b.until(lambda: nd.mbr(F.UD_EVENT) == F.EV_OUT, limit=4000, what="event")
+            got = nd.mbr(F.UD_RXLEN), nd.peek(F.UD_RXDATA, 11)
             assert got == (11, pkt), (bytes(d).hex(), phase, got)
 
 
@@ -945,7 +958,7 @@ def test_last_byte_handshake_and_response_time_with_jitter(speed, seed):
         t = send(b, speed, encode(pkt), next_j=j, rnd=r)
         hwait(b, nd, limit=40 * B + 2000)
         b.run(4 * B)
-        got = nd.peek(F.UH_STATUS)[0], nd.peek(F.UH_RXLEN)[0], nd.peek(0x80, 11)
+        got = nd.mbr(F.UH_STATUS), nd.mbr(F.UH_RXLEN), nd.peek(0x80, 11)
         assert got == (F.UH_OK, 11, pkt), (i, got)
         g = bits_after(b.samples, speed, t)
         assert g is not None and U.TIPD <= g <= U.TRSPIPD2, f"the host's ACK after {g} bit times"
@@ -957,7 +970,7 @@ def test_last_byte_handshake_and_response_time_with_jitter(speed, seed):
         b.run(2 * B + i % 16)
         send(b, speed, encode([ACK]), next_j=j, rnd=r)
         hwait(b, nd, limit=40 * B + 2000)
-        got = nd.peek(F.UH_STATUS)[0], nd.peek(F.UH_RXLEN)[0], nd.peek(F.UH_RPID)[0]
+        got = nd.mbr(F.UH_STATUS), nd.mbr(F.UH_RXLEN), nd.peek(F.UH_RPID)[0]
         assert got == (F.UH_OK, 1, ACK), (i, got)
 
         b, nd = device(speed)
@@ -965,7 +978,7 @@ def test_last_byte_handshake_and_response_time_with_jitter(speed, seed):
         b.run(2 * B + i % 16)
         t = send(b, speed, encode(pkt), next_j=j, rnd=r)
         b.run(WAIT * B)
-        b.until(lambda: nd.peek(F.UD_EVENT)[0] == F.EV_OUT, limit=4000, what="event")
-        got = nd.peek(F.UD_RXLEN)[0], nd.peek(F.UD_RXDATA, 11)
+        b.until(lambda: nd.mbr(F.UD_EVENT) == F.EV_OUT, limit=4000, what="event")
+        got = nd.mbr(F.UD_RXLEN), nd.peek(F.UD_RXDATA, 11)
         assert got == (11, pkt), (i, got)
         turn_ok(bits_after(b.samples, speed, t), speed)

@@ -66,7 +66,8 @@ async def master_setup(dut, **kw):
 
 async def master_xfer(chip, data):
     bus = chip.bus
-    await bus.dmem_write(0, [len(data)] + list(data))
+    await bus.mb_write(R.M_NTX, len(data))
+    await bus.dmem_write(0, list(data))
     await bus.write(R.DOORBELL, 0)
     for _ in range(2000):
         if await bus.read(R.STATUS2) & R.S2_IRQ:

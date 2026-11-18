@@ -208,7 +208,7 @@ Fixing U13 by reading the FIFO once more on the way to the handshake was tried f
 Changes to how firmware is used:
 
 - `UH_RPID` is now `0x80`, the first byte received. The separate copy was removed to fit IMEM. The RTL tests use the new `pe_host.usb_result`.
-- `dmem[UH_NH]` is the high byte of the reset and resume count.
+- `dmem[UH_NH]` was the high byte of the reset and resume count. In v3 the whole 16-bit count is the mailbox register `UH_N` (M2), and every other control value of the USB programs moved to the mailbox too (`docs/v3_design.md`); the packet data stays in DMEM. In v3 the RX mover stores every byte after the PID, and the end of a packet waits until the RX FIFO is empty, so the U13 race cannot drop a byte.
 - A one-byte packet in the host, whatever its PID, is now reported as `UH_OK` with `UH_RXLEN` = 1, and gets no ACK. A lone DATA PID used to give `UH_BADPKT`. Software must look at `UH_RPID`, as it already must for handshakes.
 - The I2C master's status 4 means SDA is stuck low (I7).
 - A device now needs a sync of at least 6 bits at full speed, where the old firmware took 4 when the packets were 6 bit times apart. The standard gives no shorter figure for full speed, so this is not a violation, but the margin is smaller.
@@ -252,5 +252,5 @@ Known limits of what is implemented:
 
 - **SCL stuck low is not cleared.** The standard offers only a hardware reset or a power cycle for that case (3.1.16), and the master waits.
 - **Bus clear in the multi-master build** waits about 8 ms before acting. Another controller that pauses for longer than that with SDA low and SCL high could be clocked over.
-- **I2C multi-master with 10-bit addressing does not fit**: 167 words against 162. The other builds fit: single 126, 10-bit 138, multi-master 155, Hs 132, Hs with 10-bit 144.
+- **I2C multi-master with 10-bit addressing** did not fit (167 words against 162). Since v3 (the mailbox replaced `mov` + `ld` pairs) it is exactly 162 words and fits, but it has no test yet. The other builds: single 125, 10-bit 133, multi-master 154, Hs 131, Hs with 10-bit 139.
 - **Bug U13 depended on timing that random tests hit only sometimes.** The phase sweeps now cover it, but other timing races could remain outside what was swept.

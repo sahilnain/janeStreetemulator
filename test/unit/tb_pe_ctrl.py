@@ -5,8 +5,8 @@ tb_pe_ctrl: unit test for src/core/pe_ctrl.v (the controller).
 What is checked
 ---------------
 `Ctrl` is a cycle model of docs/spec/isa.md + blocks.md Section 2: one
-issue per cycle with a pipelined fetch (im_raddr = next pc), stall counter, blocking (no side effects), all 35
-opcodes, the 27 jump conditions, reserved opcodes (ill_err), stack
+issue per cycle with a pipelined fetch (im_raddr = next pc), stall counter, blocking (no side effects), all 37
+opcodes (v3: `ld` in 2 cycles, `mbr` / `mbw`), the 31 jump conditions, reserved opcodes (ill_err), stack
 overflow / underflow (stk_err), restart, RUN and the doorbell. The
 testbench emulates pe_imem's registered read (im_rdata = prog[im_raddr of
 the previous cycle]) and compares EVERY output port of pe_ctrl in EVERY
@@ -41,9 +41,10 @@ PM = (1 << NP) - 1
 INS = ("run", "restart", "start_pc", "db_set", "pin_in", "txf_empty", "txf_full", "txf_rdata",
        "rxf_empty", "rxf_full", "rxf_rdata", "txf_rd_gnt", "txf_wr_gnt", "rxf_rd_gnt",
        "rxf_wr_gnt", "dm_rdata", "dm_gnt", "rd_data", "tx_busy", "rx_busy", "tx_need",
-       "rx_need", "etx_flag", "erx_flag", "ferr", "rxrdy")
+       "rx_need", "etx_flag", "erx_flag", "ferr", "rxrdy", "mb_rdata", "mb_gnt", "txm_busy", "rxm_busy")
 OUTS = ("im_raddr", "pw_mask", "pw_val", "po_mask", "po_val", "txf_rd", "rxf_rd", "txf_wr",
-        "rxf_wr", "f_wdata", "dm_addr", "dm_we", "dm_wdata", "cfg_we", "cfg_unit", "cfg_idx",
+        "rxf_wr", "f_wdata", "dm_addr", "dm_we", "dm_re", "dm_wdata", "mb_idx", "mb_we", "mb_wdata",
+        "cfg_we", "cfg_unit", "cfg_idx",
         "cfg_data", "rd_unit", "rd_idx", "rd_strobe", "start_mask", "start_imm", "start_data",
         "stop_mask", "det_sel", "det_clr", "det_arm", "det_disarm", "host_irq", "ill_err",
         "stk_err", "pc", "z_o", "c_o", "to_o", "db_o", "blocked")
@@ -58,6 +59,7 @@ class Ctrl:
         self.stack = []
         self.stall = 0
         self.blocked = 0
+        self.ld_ph = 0
 
     def cond(self, k, e):
         t = {0: 1, 1: self.z, 2: not self.z, 3: self.c, 4: not self.c, 5: self.to, 6: not self.to,
@@ -65,7 +67,8 @@ class Ctrl:
              11: e["rx_busy"], 12: not e["rx_busy"], 13: e["etx_flag"], 14: not e["etx_flag"],
              15: e["ferr"], 16: not e["ferr"], 17: e["txf_empty"], 18: not e["txf_empty"],
              19: e["txf_full"], 20: e["rxf_empty"], 21: not e["rxf_empty"], 22: e["rxf_full"],
-             23: self.db, 24: not self.db, 25: e["rxrdy"], 26: not e["rxrdy"]}
+             23: self.db, 24: not self.db, 25: e["rxrdy"], 26: not e["rxrdy"],
+             27: e["txm_busy"], 28: not e["txm_busy"], 29: e["rxm_busy"], 30: not e["rxm_busy"]}
         return int(bool(t.get(k, 0)))
 
     def comb(self, w, e):
@@ -81,6 +84,7 @@ class Ctrl:
         ready = e["run"] and self.run_q and self.stall == 0
         o = {k: 0 for k in OUTS}
         o.update(im_raddr=self.pc, f_wdata=r[a] & 0xFF, dm_addr=r[b] & 0xFF, dm_wdata=r[a] & 0xFF,
+                 mb_idx=imm & 7, mb_wdata=r[a],
                  cfg_unit=a, cfg_idx=b, cfg_data=op2, rd_unit=b, rd_idx=imm & 7, start_imm=b & 1,
                  start_data=op2, det_sel=a & 1, pc=self.pc, z_o=self.z, c_o=self.c,
                  to_o=self.to, db_o=self.db, blocked=self.blocked)
@@ -185,16 +189,28 @@ class Ctrl:
                     wr(e["rxf_rdata"] if rx else e["txf_rdata"])
                 if imm & 1:
                     x["c"] = 0
-        elif op in (25, 26):
+        elif op == 25:                             # ld: the read, then the write a cycle later
+            if not self.ld_ph:
+                x["done"] = 0
+                fx["dm_re"] = int(bool(e["dm_gnt"]))
+            else:
+                wr(e["dm_rdata"])
+                if imm & 1:
+                    x["wb"] = (b, (r[b] + 1) & 0xFFFF)
+        elif op == 26:
             if not e["dm_gnt"]:
                 x["done"] = 0
             else:
-                if op == 26:
-                    fx["dm_we"] = 1
-                else:
-                    wr(e["dm_rdata"])
+                fx["dm_we"] = 1
                 if imm & 1:
                     x["wb"] = (b, (r[b] + 1) & 0xFFFF)
+        elif op == 35:                             # mbr
+            wr(e["mb_rdata"])
+        elif op == 36:                             # mbw
+            if not e["mb_gnt"]:
+                x["done"] = 0
+            else:
+                fx["mb_we"] = 1
         elif op == 27:
             fx["cfg_we"] = 1
         elif op == 28:
@@ -233,7 +249,7 @@ class Ctrl:
             x["ill"] = 1
         if not x["done"]:
             # blocked: no side effects; only a timed-out wait's counter may change
-            for k in ("pw_mask", "po_mask", "txf_rd", "rxf_rd", "txf_wr", "rxf_wr", "dm_we",
+            for k in ("pw_mask", "po_mask", "txf_rd", "rxf_rd", "txf_wr", "rxf_wr", "dm_we", "mb_we",
                       "start_mask", "det_clr"):
                 fx.pop(k, None)
             x.update(z=self.z, c=self.c, to=self.to, push=0, pop=0, wb=None)
@@ -242,7 +258,7 @@ class Ctrl:
         if ready:
             o.update(fx)
             o["ill_err"], o["stk_err"] = x["ill"], x["stk"]
-        x.update(ready=ready, op=op, a=a, op2=op2, tgt=tgt)
+        x.update(ready=ready, op=op, a=a, op2=op2, tgt=tgt, dm_re=o["dm_re"])
         o["im_raddr"] = e["start_pc"] if e["restart"] else (self.next_pc(x) if ready else self.pc)
         return o, x
 
@@ -262,6 +278,7 @@ class Ctrl:
         elif x["ready"] and x["dbclr"]:
             self.db = 0
         self.run_q = int(bool(e["run"]))
+        self.ld_ph = int(bool(x["dm_re"]) and not restart)
         if restart:
             self.pc = e["start_pc"]
             self.z = self.c = self.to = 0
@@ -278,7 +295,7 @@ class Ctrl:
                 self.stack.pop()
             self.z, self.c, self.to = x["z"], x["c"], x["to"]
             self.stall = (x["op2"] if x["op"] == 6 else 0) if done else 0
-            self.blocked = int(not done)
+            self.blocked = int(not done and not x["dm_re"])
             if x["wb"] is not None:
                 self.r[x["wb"][0]] = x["wb"][1]
             if x["wa"] is not None:
@@ -348,7 +365,7 @@ class Harness:
 def quiet_env(**kw):
     e = {k: 0 for k in INS}
     e.update(run=1, txf_empty=1, rxf_empty=1, txf_rd_gnt=1, txf_wr_gnt=1, rxf_rd_gnt=1,
-             rxf_wr_gnt=1, dm_gnt=1)
+             rxf_wr_gnt=1, dm_gnt=1, mb_gnt=1)
     e.update(kw)
     return e
 
@@ -359,8 +376,8 @@ def rand_env(t):
              start_pc=random.randrange(DEPTH), db_set=int(random.random() < 0.02),
              pin_in=random.getrandbits(NP), txf_rdata=random.getrandbits(8),
              rxf_rdata=random.getrandbits(8), dm_rdata=random.getrandbits(8),
-             rd_data=random.getrandbits(16))
-    for g in ("txf_rd_gnt", "txf_wr_gnt", "rxf_rd_gnt", "rxf_wr_gnt", "dm_gnt"):
+             rd_data=random.getrandbits(16), mb_rdata=random.getrandbits(16))
+    for g in ("txf_rd_gnt", "txf_wr_gnt", "rxf_rd_gnt", "rxf_wr_gnt", "dm_gnt", "mb_gnt"):
         e[g] = int(random.random() < 0.8)
     return e
 

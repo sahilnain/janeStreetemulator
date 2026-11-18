@@ -9,6 +9,7 @@ import random
 
 import i2c_lib as L
 import pe_fw as F
+import pe_isa as I
 import pytest
 import sigrok
 from bench import OWN_RX, OWN_TX, Bench, Script, fw_wait, owners
@@ -31,12 +32,20 @@ def master(B=None, mode="FM", edges=None, target=None, **kw):
     return b, nd
 
 
+def post(nd, addr, wdata=(), nread=0):
+    """An i2c_master request: M_ADDR, M_NTX, M_NRX and the write data at dmem[0] (no doorbell)."""
+    nd.mb(I.M_ADDR, addr)
+    nd.mb(I.M_NTX, len(wdata))
+    nd.mb(I.M_NRX, nread)
+    nd.dmem(0, list(wdata))
+
+
 def request(b, nd, addr, wdata=(), nread=0):
-    nd.dmem(0, [addr, len(wdata), nread] + list(wdata))
+    post(nd, addr, wdata, nread)
     nd.doorbell()
     fw_wait(b, nd, limit=3_000_000)
     b.run(200)
-    return nd.peek(0x7F)[0], nd.peek(0x80, nread)
+    return nd.mbr(I.M_STATUS), nd.peek(0x80, nread)
 
 
 def events(s):
@@ -68,7 +77,7 @@ def test_master_data_hold(mode):
     """Table 11 note 2: the controller's SDA must not move until SCL is below its low level, so at
     least the fall time after it pulled SCL down. Only the chip's own SDA edges count here."""
     b, nd = master(mode=mode, target=Target())
-    nd.dmem(0, [0x50, 3, 0, 0x20, 0xAA, 0x55])
+    post(nd, 0x50, [0x20, 0xAA, 0x55])
     nd.doorbell()
     worst, fall, ps, pd = None, None, 1, nd.outs["uio_oe"] >> SDA & 1
     for _ in range(200000):
@@ -149,10 +158,9 @@ def test_master_10bit(A):
     t = Target(addr10=A)
     b, nd = master(mode="FM", target=t, addr10=True)
     s0 = len(b.samples)
-    nd.dmem(0x7E, [A >> 8])
-    st, got = request(b, nd, A & 0xFF, [0x20, 0x77], 0)
+    st, got = request(b, nd, A, [0x20, 0x77], 0)
     assert st == 0 and t.mem[0x20] == 0x77
-    st, got = request(b, nd, A & 0xFF, [0x20], 1)
+    st, got = request(b, nd, A, [0x20], 1)
     assert st == 0 and got == [0x77]
     ev = events(b.samples[s0:])
     hi = 0x78 | (A >> 8)
@@ -191,8 +199,8 @@ def two_masters(BA=64, BB=64):
 
 
 def both_go(b, A, Bb, ra, rb, skew=0):
-    A.dmem(0, ra)
-    Bb.dmem(0, rb)
+    post(A, ra[0], ra[3:3 + ra[1]], ra[2])
+    post(Bb, rb[0], rb[3:3 + rb[1]], rb[2])
     A.chip.ctrl.db = 1
     b.run(skew)
     Bb.chip.ctrl.db = 1
@@ -217,7 +225,7 @@ def test_arbitration_on_address(skew):
     b, A, Bb, t = two_masters()
     s0 = len(b.samples)
     both_go(b, A, Bb, [0x50, 2, 0, 0x10, 0xAA], [0x58, 2, 0, 0x10, 0xBB], skew)
-    assert A.peek(0x7F)[0] == 0 and Bb.peek(0x7F)[0] == 3, (A.peek(0x7F), Bb.peek(0x7F))
+    assert A.mbr(I.M_STATUS) == 0 and Bb.mbr(I.M_STATUS) == 3, (A.mbr(I.M_STATUS), Bb.mbr(I.M_STATUS))
     assert t.mem[0x10] == 0xAA
     assert events(b.samples[s0:]) == expect_write(0x50, [0x10, 0xAA])
 
@@ -228,7 +236,7 @@ def test_arbitration_on_data(skew):
     b, A, Bb, t = two_masters()
     s0 = len(b.samples)
     both_go(b, A, Bb, [0x50, 2, 0, 0x10, 0x55], [0x50, 2, 0, 0x10, 0x57], skew)
-    assert A.peek(0x7F)[0] == 0 and Bb.peek(0x7F)[0] == 3
+    assert A.mbr(I.M_STATUS) == 0 and Bb.mbr(I.M_STATUS) == 3
     assert t.mem[0x10] == 0x55
     assert events(b.samples[s0:]) == expect_write(0x50, [0x10, 0x55])
 
@@ -239,7 +247,7 @@ def test_clock_synchronization(BA, BB):
     b, A, Bb, t = two_masters(BA, BB)
     s0 = len(b.samples)
     both_go_sync(b, A, Bb, BA, BB, [0x50, 2, 0, 0x10, 0xAA], [0x50, 2, 0, 0x10, 0xAA])
-    assert A.peek(0x7F)[0] == 0 and Bb.peek(0x7F)[0] == 0, (A.peek(0x7F), Bb.peek(0x7F))
+    assert A.mbr(I.M_STATUS) == 0 and Bb.mbr(I.M_STATUS) == 0, (A.mbr(I.M_STATUS), Bb.mbr(I.M_STATUS))
     assert t.mem[0x10] == 0xAA
     s = b.samples[s0:]
     assert events(s) == expect_write(0x50, [0x10, 0xAA]), "not one transfer: they did not start together"
@@ -255,7 +263,7 @@ def test_clock_synchronization_read(BA, BB):
     b, A, Bb, t = two_masters(BA, BB)
     t.mem[0x30:0x33] = [0xA5, 0x5A, 0xFF]
     both_go_sync(b, A, Bb, BA, BB, [0x50, 1, 3, 0x30], [0x50, 1, 3, 0x30])
-    assert A.peek(0x7F)[0] == 0 and Bb.peek(0x7F)[0] == 0, (A.peek(0x7F), Bb.peek(0x7F))
+    assert A.mbr(I.M_STATUS) == 0 and Bb.mbr(I.M_STATUS) == 0, (A.mbr(I.M_STATUS), Bb.mbr(I.M_STATUS))
     assert A.peek(0x80, 3) == [0xA5, 0x5A, 0xFF] and Bb.peek(0x80, 3) == [0xA5, 0x5A, 0xFF]
 
 
@@ -279,7 +287,7 @@ def test_master_waits_for_a_free_bus():
     b.devices.append(scr)
     b.run(20000)                     # the slow controller is in the middle of its transfer
     assert not scr.done
-    nd.dmem(0, [0x50, 2, 0, 0x20, 0xCC])
+    post(nd, 0x50, [0x20, 0xCC])
     nd.doorbell()
     fw_wait(b, nd, limit=3_000_000)
     b.run(200)
@@ -714,10 +722,10 @@ def test_bus_clear_not_in_a_short_pause():
     scr.gen = gen()
     s0 = len(b.samples)
     b.devices.append(scr)
-    nd.dmem(0, [0x50, 2, 0, 0x40, 0xCC])
+    post(nd, 0x50, [0x40, 0xCC])
     nd.doorbell()
     fw_wait(b, nd, limit=3_000_000)
-    assert nd.peek(0x7F)[0] == 0 and t.mem[0x20] == 0x77 and t.mem[0x40] == 0xCC
+    assert nd.mbr(I.M_STATUS) == 0 and t.mem[0x20] == 0x77 and t.mem[0x40] == 0xCC
     assert not b.contention
     assert events(b.samples[s0:]) == expect_write(0x50, [0x20, 0x77]) + expect_write(0x50, [0x40, 0xCC])
 
@@ -728,7 +736,7 @@ def test_bus_clear_wait_of_the_multi_master():
     b, nd = master(mode="FM", target=t, arb=True)
     b.devices.append(holder())
     b.run(50)
-    nd.dmem(0, [0x50, 2, 0, 0x10, 0xA5])
+    post(nd, 0x50, [0x10, 0xA5])
     t0 = len(b.samples)
     nd.doorbell()
     b.until(lambda: not (b.line >> SCL) & 1, limit=2_000_000, what="the first clock")

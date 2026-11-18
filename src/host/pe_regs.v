@@ -5,7 +5,7 @@
  * pe_regs: host register map, v2 (docs/spec/blocks.md Section 9).
  *
  *   0x00 ID        R   constant ID
- *   0x01 VERSION   R   0x02
+ *   0x01 VERSION   R   0x03
  *   0x02 RUN       RW  [0] controller runs
  *   0x03 RESTART   W   [0] = 1: restart the controller, units and detectors
  *   0x04 STATUS    R   [0] txf_empty [1] txf_full [2] rxf_empty [3] rxf_full
@@ -30,7 +30,13 @@
  *   0x18-0x1B PIN_OWNER RW 2 bits per pin, pin 0 at bit 0
  *   0x20-0x21 START_PC RW  0x22-0x23 PC R
  *   0x24 CSTAT     R   [0] run [1] blocked [2] Z [3] C [4] TO [5] ETX [6] ERX [7] DB
- *   0x28 DMEM_ADDR RW  0x29 DMEM_DATA RW (each access: DMEM_ADDR + 1)
+ *   0x28 DMEM_ADDR RW  0x29 DMEM_DATA RW (each access: DMEM_ADDR + 1). A read
+ *                      of DMEM_DATA is answered one cycle later (r_late): DMEM
+ *                      has a registered read.
+ *   0x30-0x3F MBOX     RW  mailbox M0-M7, 16 bits each: M[i] low byte at
+ *                      0x30 + 2i, high byte at 0x31 + 2i. The controller reads
+ *                      them (`mbr`) and writes them (`mbw`); a host write to a
+ *                      byte of M[i] blocks an `mbw` to M[i] in the same cycle.
  *
  * Unmapped addresses read 0. Limits: AW <= 10, NUM_PINS <= 16, FIFO count
  * <= 4 bits shown.
@@ -44,7 +50,7 @@ module pe_regs #(
     parameter NUM_PINS   = 8,
     parameter FIFO_CW    = 4,
     parameter ID         = 8'h50,
-    parameter VERSION    = 8'h02,
+    parameter VERSION    = 8'h03,
     // derived, do not override
     parameter AW         = (IMEM_DEPTH > 1) ? $clog2(IMEM_DEPTH) : 1
 ) (
@@ -112,7 +118,15 @@ module pe_regs #(
     output wire       dm_we,
     output reg  [7:0] dm_addr,
     output wire [7:0] dm_wdata,
-    input  wire [7:0] dm_rdata
+    input  wire [7:0] dm_rdata,
+    output wire       r_late,      // this read is answered next cycle (DMEM_DATA)
+
+    // mailbox, controller side
+    input  wire [ 2:0] mb_idx,
+    output wire [15:0] mb_rdata,
+    input  wire        mb_we,
+    input  wire [15:0] mb_wdata,
+    output wire        mb_gnt
 );
 
   localparam A_ID = 'h00;
@@ -170,6 +184,14 @@ module pe_regs #(
   assign dm_acc          = (wr | r_re) & (addr == A_DMDATA);
   assign dm_we           = wr & (addr == A_DMDATA);
   assign dm_wdata        = r_wdata;
+  assign r_late          = (addr == A_DMDATA);
+
+  // mailbox
+  reg [15:0] mbox[0:7];
+  wire mb_host = wr & (addr[7:4] == 4'h3);  // a host write to the mailbox
+  wire [2:0] mb_hi = addr[3:1];  // its register
+  assign mb_rdata = mbox[mb_idx];
+  assign mb_gnt   = ~(mb_host & (mb_hi == mb_idx));
 
   always @(*) im_wdata = {r_wdata, stage};
 
@@ -214,7 +236,13 @@ module pe_regs #(
       imem_err  <= 1'b0;
       st2       <= 5'd0;
       dm_addr   <= 8'd0;
+      for (b = 0; b < 8; b = b + 1) mbox[b] <= 16'd0;
     end else begin
+      if (mb_we && mb_gnt) mbox[mb_idx] <= mb_wdata;
+      if (mb_host) begin
+        if (addr[0]) mbox[mb_hi][15:8] <= r_wdata;
+        else mbox[mb_hi][7:0] <= r_wdata;
+      end
       if (wr) begin
         if (addr == A_RUN) run <= r_wdata[0];
         if (addr == A_IRQ_EN) irq_en <= r_wdata[3:0];
@@ -287,6 +315,7 @@ module pe_regs #(
       A_DMDATA: r_rdata = dm_rdata;
       default: ;
     endcase
+    if (addr[7:4] == 4'h3) r_rdata = addr[0] ? mbox[addr[3:1]][15:8] : mbox[addr[3:1]][7:0];
     for (rb = 0; rb < CW4; rb = rb + 1) begin
       if (addr == A_FIFO_CNT) begin
         r_rdata[rb]   = txf_count[rb];

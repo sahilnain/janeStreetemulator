@@ -58,7 +58,7 @@ async def test_registers(dut):
     assert int(dut.uio_oe.value) == 0, "no protocol pin may drive after reset"
     assert (int(dut.uo_out.value) >> 6) == 0
     assert await bus.read(R.ID) == 0x50
-    assert await bus.read(R.VERSION) == 0x02
+    assert await bus.read(R.VERSION) == 0x03
     assert await bus.read(R.STATUS) == R.ST_TXF_EMPTY | R.ST_RXF_EMPTY
     assert await bus.read(R.STATUS2) == 0
     assert await bus.read(R.CSTAT) == 0

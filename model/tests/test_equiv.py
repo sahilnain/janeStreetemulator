@@ -29,6 +29,7 @@ CASES = [
     ("pe_fifo d3", lambda: H.fifo(8, 3)),
     ("pe_imem", H.imem),
     ("pe_dmem", H.dmem),
+    ("pe_dmov", H.dmov),
     ("pe_pins", H.pins),
     ("pe_vote", H.vote),
     ("pe_crc", H.crc),

@@ -3,7 +3,7 @@ project:
   title:        "Protocol Emulator"      # Project title
   author:       "Sahil"      # Your name
   discord:      ""      # Your discord username, for communication and automatically assigning you a Tapeout role (optional)
-  description:  "Tiny programmable I/O CPU that runs UART/I2C/SPI as firmware"      # One line description of what your project does
+  description:  "Tiny programmable I/O CPU that runs UART, SPI, I2C and USB as firmware"      # One line description of what your project does
   language:     "Verilog" # other examples include SystemVerilog, Amaranth, VHDL, etc
   clock_hz:     48000000       # Clock frequency in Hz (or 0 if not applicable)
 
@@ -24,6 +24,8 @@ project:
     - "mem/pe_imem.v"
     - "mem/pe_fifo.v"
     - "mem/pe_dmem.v"
+    - "mem/pe_dmov.v"
+    - "mem/RM_IHPSG13_1P_256x8_c3_bm_bist.v"
     - "io/pe_sync.v"
     - "io/pe_pins.v"
     - "core/pe_ctrl.v"

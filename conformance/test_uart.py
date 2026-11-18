@@ -12,6 +12,7 @@ import itertools
 import random
 
 import pe_fw as F
+import pe_isa as I
 import pytest
 import sigrok
 from bench import A_STATUS, CLOCK_HZ, OWN_TX, Bench, Script, owners
@@ -62,7 +63,7 @@ def test_rx_every_frame_format(bits, parity, stop, inv, msb):
     d = decode(b.samples[start:], 1, B, bits, parity, stop, inv, msb)
     assert d["data"] == words and not d["warn"] and not d["perr"], "the stimulus itself is wrong"
     assert rx_words(got, bits) == words
-    assert nd.peek(1)[0] in (None, 0), "parity errors counted on good frames"
+    assert nd.mbr(I.M_INFO) == 0, "parity errors counted on good frames"
 
 
 BAUDS = [(9600, 5000), (19200, 2500), (38400, 1250), (57600, 833), (115200, 417), (230400, 208), (460800, 104),
@@ -171,7 +172,7 @@ def test_rx_parity_error_detected(B, parity):
     b.devices.append(Script(play(1, seg, B, lead=20)))
     assert transfer(b, nd, n_rx=1, limit=30 * B + 20000) == [0x36]
     assert sigrok.uart(b.samples[start:], 1, CLOCK_HZ // B, parity=PARITY[parity])["perr"]
-    assert nd.peek(1)[0] == 1
+    assert nd.mbr(I.M_INFO) == 1
 
 
 @pytest.mark.parametrize("B", (52, 104, 417))
@@ -183,7 +184,7 @@ def test_rx_break_counted_once(B):
     start = len(b.samples)
     b.devices.append(Script(play(1, seg, B, lead=20)))
     assert transfer(b, nd, n_rx=1, limit=60 * B + 20000) == [0x77]
-    assert nd.peek(2)[0] == 1, f"break count {nd.peek(2)[0]}"
+    assert nd.mbr(I.M_STATUS) == 1, f"break count {nd.mbr(I.M_STATUS)}"
     assert nd.irq() == 1
     assert sigrok.uart(b.samples[start:], 1, CLOCK_HZ // B)["brk"], "the decoder must call it a break"
 
@@ -191,7 +192,7 @@ def test_rx_break_counted_once(B):
 @pytest.mark.parametrize("B", (52, 104, 417))
 def test_tx_break_is_a_break(B):
     b, nd = boot(B)
-    nd.dmem(3, [14])
+    nd.mb(I.M_NTX, 14)
     start = len(b.samples)
     nd.doorbell()
     b.run(20 * B)

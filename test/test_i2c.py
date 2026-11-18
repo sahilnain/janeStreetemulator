@@ -66,7 +66,11 @@ async def master_setup(dut, B=126, **dev_kw):
 
 async def request(chip, addr, wdata=(), nread=0, limit=20000):
     bus = chip.bus
-    await bus.dmem_write(0, [addr, len(wdata), nread] + list(wdata))
+    await bus.mb_write(R.M_ADDR, addr)
+    await bus.mb_write(R.M_NTX, len(wdata))
+    await bus.mb_write(R.M_NRX, nread)
+    if wdata:
+        await bus.dmem_write(0, list(wdata))
     await bus.write(R.DOORBELL, 0)
     for _ in range(limit):
         if await bus.read(R.STATUS2) & R.S2_IRQ:
@@ -79,7 +83,7 @@ async def request(chip, addr, wdata=(), nread=0, limit=20000):
                              f"SDA edges={sum(1 for x, y in zip(tr_sda, tr_sda[1:]) if x != y)} "
                              f"now SCL={tr_scl[-1]} SDA={tr_sda[-1]}")
     await bus.write(R.STATUS2, R.S2_IRQ)
-    status = (await bus.dmem_read(0x7F, 1))[0]
+    status = await bus.mb_read(R.M_STATUS)
     return status, (await bus.dmem_read(0x80, nread) if nread else [])
 
 

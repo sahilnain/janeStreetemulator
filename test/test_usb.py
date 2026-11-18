@@ -55,6 +55,11 @@ def tok(pid, addr=ADDR, ep=EP):
     return usb.token(pid, addr, ep)
 
 
+
+async def mbox_all(bus):
+    """The 8 mailbox registers, so that m[F.UD_EVENT] etc. read like the old DMEM map."""
+    return [await bus.mb_read(i) for i in range(8)]
+
 async def device(dut, speed, inlen=0, inpid=F.PID_DATA1, indata=(), ouths=F.PID_ACK, inhs=F.PID_NAK):
     B, jp, kp = SPEEDS[speed]
     chip = Chip(dut)
@@ -65,7 +70,8 @@ async def device(dut, speed, inlen=0, inpid=F.PID_DATA1, indata=(), ouths=F.PID_
     words = F.usb_device(B=B, jp=jp, kp=kp).words()
     await chip.bus.load_program(words)
     await chip.bus.owners(R.owner_map(**{f"p{jp}": R.OWN_TX, f"p{kp}": R.OWN_TX}))
-    await chip.bus.dmem_write(F.UD_ADDR, [ADDR, 0, 0, 0, inlen, inpid, ouths, inhs, 0])
+    for i, v in ((F.UD_ADDR, ADDR), (F.UD_INLEN, inlen), (F.UD_INPID, inpid), (F.UD_HS, ouths | inhs << 8)):
+        await chip.bus.mb_write(i, v)
     if indata:
         await chip.bus.dmem_write(F.UD_INDATA, list(indata))
     await chip.bus.start()
@@ -117,7 +123,7 @@ async def test_dev_out(dut):
         assert pk and pk[0]["data"] == [F.PID_ACK], f"{speed}: {pk}"
         assert 2 <= turn <= 7.5, f"{speed}: turnaround {turn} bits"
         await stopped(chip)
-        m = await chip.bus.dmem_read(0, 9)
+        m = await mbox_all(chip.bus)
         assert m[F.UD_EVENT] == F.EV_OUT and m[F.UD_TOKEN] == F.PID_OUT and m[F.UD_EP] == EP
         assert m[F.UD_RXLEN] == len(data) + 3, m
         got = await chip.bus.dmem_read(F.UD_RXDATA, len(data) + 1)
@@ -133,7 +139,7 @@ async def test_dev_setup(dut):
         await send_token_data(chip, peer, B, [(tok(F.PID_SETUP, ep=0), {}), (usb.data_packet(F.PID_DATA0, setup), {})])
         assert await irq(chip)
         await stopped(chip)
-        m = await chip.bus.dmem_read(0, 9)
+        m = await mbox_all(chip.bus)
         assert m[F.UD_TOKEN] == F.PID_SETUP and m[F.UD_EP] == 0
         assert await chip.bus.dmem_read(F.UD_RXDATA + 1, 8) == setup
 
@@ -199,7 +205,7 @@ async def test_dev_in(dut):
             await peer.idle()
             assert await irq(chip), f"{speed} n={n}"
             await stopped(chip)
-            m = await chip.bus.dmem_read(0, 9)
+            m = await mbox_all(chip.bus)
             assert m[F.UD_EVENT] == F.EV_IN_ACK and m[F.UD_INLEN] == 0, m
             dut._log.info(f"{speed} n={n}: DATA {turn} bit times after EOP")
 
@@ -228,7 +234,7 @@ async def test_dev_in_no_ack(dut):
         chip, peer, B, pk, _, _ = await in_txn(dut, speed, data)
         assert await irq(chip, 200 * B)
         await stopped(chip)
-        m = await chip.bus.dmem_read(0, 9)
+        m = await mbox_all(chip.bus)
         assert m[F.UD_EVENT] == F.EV_IN_NOACK and m[F.UD_INLEN] == 4, m
 
 
@@ -346,9 +352,12 @@ async def host(dut, speed):
 
 async def go(chip, t, dpid=0, data=(), op=0):
     await chip.bus.write(R.RUN, 1)
-    await chip.bus.dmem_write(0, [op] + list(t) + [dpid, len(data), 0])
+    await chip.bus.mb_write(F.UH_OP, op)
+    await chip.bus.mb_write(F.UH_DPID, dpid)
+    await chip.bus.mb_write(F.UH_N, len(data))
+    await chip.bus.dmem_write(F.UH_TOK, list(t))
     if data:
-        await chip.bus.dmem_write(0x10, list(data))
+        await chip.bus.dmem_write(F.UH_DATA, list(data))
     t0 = len(chip.samples)
     await chip.bus.write(R.DOORBELL, 0)
     return t0
@@ -416,7 +425,7 @@ async def test_host_timeout(dut):
         await go(chip, tok(F.PID_IN))
         assert await irq(chip), speed
         await stopped(chip)
-        assert (await chip.bus.dmem_read(F.UH_STATUS, 1))[0] == F.UH_TIMEOUT
+        assert await chip.bus.mb_read(F.UH_STATUS) == F.UH_TIMEOUT
 
 
 @pe_build.test("usb")
@@ -434,7 +443,7 @@ async def test_host_bad_crc(dut):
         await ClockCycles(dut.clk, 15 * B)
         assert not usb.decode(chip.samples[peer.ends[-1]:], jp, kp, B), "ACK for a corrupt packet"
         await stopped(chip)
-        assert (await chip.bus.dmem_read(F.UH_STATUS, 1))[0] == F.UH_BADPKT
+        assert await chip.bus.mb_read(F.UH_STATUS) == F.UH_BADPKT
 
 
 @pe_build.test("usb")

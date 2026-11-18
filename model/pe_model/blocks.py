@@ -88,18 +88,100 @@ class Imem:
 
 # --------------------------------------------------------------- DMEM
 class Dmem:
-    """Combinational read, one write per cycle, no reset. The host has priority."""
+    """pe_dmem: one port, registered read (rdata = the byte of the last read), no reset.
+    The SRAM macro and the flip-flop version behave the same. Arbitration is in Dmov."""
 
     def __init__(self, depth):
         self.depth = depth
         self.mem = [None] * depth
+        self.dout = None                   # unknown until the first read
 
-    def rdata(self, addr):
-        return self.mem[addr % self.depth]
+    @property
+    def rdata(self):
+        return self.dout
 
-    def clock(self, we, addr, wdata):
+    def clock(self, re, we, addr, wdata):
+        if re:
+            self.dout = self.mem[addr % self.depth]
         if we:
             self.mem[addr % self.depth] = wdata & 0xFF
+
+
+class Dmov:
+    """pe_dmov: the DMEM port arbitration (host, RX mover, TX mover, controller) and the two
+    data movers (docs/spec/blocks.md Section 14). Units 5 (TXM) and 6 (RXM)."""
+    U_TXM, U_RXM = 5, 6
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.t_ptr = self.t_left = self.t_pend = self.t_bufv = self.t_buf = 0
+        self.r_ptr = self.r_left = self.r_cnt = 0
+
+    @property
+    def txm_busy(self):
+        return int(bool(self.t_left != 0) or bool(self.t_pend) or bool(self.t_bufv))
+
+    @property
+    def rxm_busy(self):
+        return int(self.r_left != 0)
+
+    def comb(self, h_acc, h_we, h_addr, h_wdata, c_re, c_we, c_addr, c_wdata, h_txf_wr, txf_full,
+             h_rxf_rd, rxf_empty, rxf_rdata):
+        r_req = (self.r_left != 0) & (rxf_empty ^ 1) & (h_rxf_rd ^ 1)
+        r_go = r_req & (h_acc ^ 1)
+        t_req = (self.t_left != 0) & (self.t_pend ^ 1) & (self.t_bufv ^ 1)
+        t_go = t_req & (h_acc ^ 1) & (r_req ^ 1)
+        c_gnt = (h_acc ^ 1) & (r_req ^ 1) & (t_req ^ 1)
+        return dict(
+            r_go=r_go, t_go=t_go, c_gnt=c_gnt,
+            m_re=mux(h_acc, h_we ^ 1, t_go | (c_gnt & c_re)),
+            m_we=mux(h_acc, h_we, r_go | (c_gnt & c_we)),
+            m_addr=mux(h_acc, h_addr, mux(r_req, self.r_ptr, mux(t_req, self.t_ptr, c_addr))),
+            m_wdata=mux(h_acc, h_wdata, mux(r_req, rxf_rdata, c_wdata)),
+            m_rxf_rd=r_go,
+            m_txf_wr=self.t_bufv & (txf_full ^ 1) & (h_txf_wr ^ 1),
+            m_txf_wdata=self.t_buf,
+        )
+
+    def read(self, unit, idx):
+        if unit == self.U_TXM:
+            return self.t_ptr if idx == 0 else (self.t_left if idx == 1 else 0)
+        if unit == self.U_RXM:
+            return self.r_ptr if idx == 0 else (self.r_cnt if idx == 1 else (self.r_left if idx == 2 else 0))
+        return 0
+
+    def clock(self, rst, restart, cfg_we, cfg_unit, cfg_idx, cfg_data, d, m_rdata):
+        if rst or restart:
+            self.reset()
+            return
+        cfg_t = cfg_we and cfg_unit == self.U_TXM
+        cfg_r = cfg_we and cfg_unit == self.U_RXM
+        if cfg_t and cfg_idx == 0:
+            self.t_ptr = cfg_data & 0xFF
+        elif d["t_go"]:
+            self.t_ptr = (self.t_ptr + 1) & 0xFF
+        if cfg_t and cfg_idx == 1:
+            self.t_left, self.t_pend, self.t_bufv = cfg_data & 0x1FF, 0, 0
+        else:
+            if d["t_go"]:
+                self.t_left -= 1
+            pend = self.t_pend
+            self.t_pend = int(bool(d["t_go"]))
+            if pend:
+                self.t_buf, self.t_bufv = m_rdata, 1
+            elif d["m_txf_wr"]:
+                self.t_bufv = 0
+        if cfg_r and cfg_idx == 0:
+            self.r_ptr = cfg_data & 0xFF
+        elif d["r_go"]:
+            self.r_ptr = (self.r_ptr + 1) & 0xFF
+        if cfg_r and cfg_idx == 1:
+            self.r_left, self.r_cnt = cfg_data & 0x1FF, 0
+        elif d["r_go"]:
+            self.r_left -= 1
+            self.r_cnt = (self.r_cnt + 1) & 0x1FF
 
 
 # --------------------------------------------------------------- pins
@@ -261,6 +343,7 @@ class HostIf:
         self.stb_q = self.ack = 0
         self.dout = 0
         self.addr = self.wbuf = self.wphase = self.rlow = self.rphase = 0
+        self.rpend = 0
 
     def comb(self, din, op):
         ev = self.s2 ^ self.stb_q
@@ -268,16 +351,27 @@ class HostIf:
                     r_we=int(ev and op == self.OP_WRITE and self.wphase),
                     r_re=int(ev and op == self.OP_READ and not self.rphase))
 
-    def clock(self, rst, din, op, stb, r_rdata):
+    def clock(self, rst, din, op, stb, r_rdata, r_late):
+        """r_late: this read is answered one cycle later (DMEM_DATA, a registered read)."""
         if rst:
             self.reset()
             return
         ev = self.s2 ^ self.stb_q
         self.stb_q = self.s2
         self.s1, self.s2 = stb, self.s1
+        pend = self.rpend
+        self.rpend = 0
+        if pend:
+            self.ack ^= 1
+            self.dout = None if r_rdata is None else r_rdata >> 4
+            self.rlow = None if r_rdata is None else r_rdata & 0xF
+            self.rphase = 1
+            return
         if not ev:
             return
-        self.ack ^= 1
+        late = op == self.OP_READ and not self.rphase and r_late
+        if not late:
+            self.ack ^= 1
         if op == self.OP_ADDR:
             self.addr = ((self.addr << 4) | din) & 0xFF
         elif op == self.OP_WRITE:
@@ -286,11 +380,15 @@ class HostIf:
             self.wphase ^= 1
         elif op == self.OP_READ:
             if not self.rphase:
-                self.dout = None if r_rdata is None else r_rdata >> 4
-                self.rlow = None if r_rdata is None else r_rdata & 0xF
+                if late:
+                    self.rpend = 1
+                else:
+                    self.dout = None if r_rdata is None else r_rdata >> 4
+                    self.rlow = None if r_rdata is None else r_rdata & 0xF
+                    self.rphase = 1
             else:
                 self.dout = self.rlow
-            self.rphase ^= 1
+                self.rphase = 0
         else:
             self.wphase = self.rphase = 0
 
@@ -300,6 +398,7 @@ A_ID, A_VERSION, A_RUN, A_RESTART, A_STATUS, A_ERR_CLR, A_IRQ_EN, A_FIFO_CNT = r
 A_TXF, A_RXF, A_IMADDR, A_PIN_IN, A_PIN_IN_H, A_IMADDR_H, A_STATUS2, A_DOORBELL = range(8, 16)
 A_IMDATA, A_PIN_OD, A_OWNER, A_START_PC, A_PC, A_CSTAT = 0x10, 0x14, 0x18, 0x20, 0x22, 0x24
 A_DMADDR, A_DMDATA = 0x28, 0x29
+A_MBOX = 0x30            # mailbox M0-M7: low byte at 0x30 + 2i, high byte at 0x31 + 2i
 A_PIN_FILT = 0x16        # 2 bytes, as PIN_OD: input filter per pin (Pins.clock)
 
 
@@ -314,6 +413,7 @@ class Regs:
         self.run = self.start_pc = self.owner = self.od = self.filt = 0
         self.imaddr = self.stage = self.irq_en = self.imem_err = 0
         self.st2 = self.dm_addr = 0
+        self.mbox = [0] * 8
 
     def comb(self, h):
         """h: the host interface's combinational outputs."""
@@ -330,7 +430,17 @@ class Regs:
             db_set=we & (a == A_DOORBELL),
             rx_ovr_clr=we & (a == A_STATUS2) & (wd >> 2),
             dm_acc=(we | re) & (a == A_DMDATA), dm_we=we & (a == A_DMDATA), dm_addr=self.dm_addr, dm_wdata=wd,
+            r_late=int(a == A_DMDATA),
+            mb_host=we & ((a >> 4) == 3), mb_hi=(a >> 1) & 7,
         )
+
+    def mb_rdata(self, idx):
+        return self.mbox[idx]
+
+    @staticmethod
+    def mb_gnt(rc, idx):
+        """An `mbw` to M[idx] waits while the host writes a byte of M[idx]."""
+        return (rc["mb_host"] & (rc["mb_hi"] == idx)) ^ 1
 
     def status2(self, rx_overrun):
         return (self.st2 & 0x03) | (rx_overrun << 2) | (self.st2 & 0x18)
@@ -386,12 +496,23 @@ class Regs:
             return self.dm_addr
         if a == A_DMDATA:
             return st["dm_rdata"]
+        if (a >> 4) == 3:
+            return (self.mbox[(a >> 1) & 7] >> (8 * (a & 1))) & 0xFF
         return 0
 
-    def clock(self, rst, h, rc, ill, stk, underrun, ctrl_irq):
+    def clock(self, rst, h, rc, ill, stk, underrun, ctrl_irq, mb_we=0, mb_idx=0, mb_wdata=0):
         if rst:
             self.reset()
             return
+        # mailbox: the controller's write (only when granted), then the host's byte
+        cw = mb_we & self.mb_gnt(rc, mb_idx)
+        for k in range(8):
+            self.mbox[k] = mux(cw & (mb_idx == k), mb_wdata, self.mbox[k])
+        for k in range(8):
+            hk = rc["mb_host"] & (rc["mb_hi"] == k)
+            old = self.mbox[k]
+            new = mux(h["r_addr"] & 1, (old & 0xFF) | (h["r_wdata"] << 8), (old & 0xFF00) | h["r_wdata"])
+            self.mbox[k] = mux(hk, new, old)
         c = self.cfg
         a, wd, we = h["r_addr"], h["r_wdata"], h["r_we"]
 

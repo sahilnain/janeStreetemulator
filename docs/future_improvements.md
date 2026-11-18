@@ -69,5 +69,6 @@ With the first two, the USB device would be about 140 words: IMEM 162 → 140 sa
 ## 3. Other parked ideas
 - `assist` opcode (15) for CRC, NRZI/Manchester and bit stuffing: needed for the stretch goals (low-speed USB, 10BASE-T).
 - Timestamp counter and capture FIFO.
-- SRAM-based instruction memory instead of flip-flops (area).
+- SRAM-based instruction memory instead of flip-flops (area). v3 did this for DMEM (`docs/v3_design.md`); IMEM would need a macro of 162 × 29 or a wider one, and its read already overlaps execution, so the latency would fit.
+- With the mailbox (v3), `ld` / `st` with an absolute address (Section 2) matters less: control values no longer go through DMEM.
 - Symbolic proof of the chip composition. Each module is proved against the model (`model/tests/test_equiv.py`), but the wiring is covered by lockstep simulation only.

@@ -51,7 +51,7 @@ module pe_decode #(
   wire [9:0] tgt10 = ir[9:0];
   assign target = tgt10[AW-1:0];
 
-  assign illegal = (opcode == 6'd5) || (opcode > 6'd34);
+  assign illegal = (opcode == 6'd5) || (opcode > 6'd36);
 
   wire _unused = &{1'b0, tgt10};
 
@@ -63,7 +63,7 @@ module pe_decode #(
     assert ({opcode, fa, fi, fb, imm} == ir);
     assert (cond == imm[15:11] && pin == imm[15:12] && lvl == imm[11] && rs == imm[2:0]);
     assert (target == ir[AW-1:0]);
-    assert (illegal == !(opcode <= 6'd4 || (opcode >= 6'd6 && opcode <= 6'd34)));
+    assert (illegal == !(opcode <= 6'd4 || (opcode >= 6'd6 && opcode <= 6'd36)));
   end
 `endif
 

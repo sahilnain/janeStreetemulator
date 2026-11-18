@@ -14,7 +14,9 @@
  *   0 ADDR : addr <= {addr[3:0], din}        (two ops: high nibble, then low)
  *   1 WRITE: first nibble = high half; second nibble -> r_we with {hi, din}
  *   2 READ : first read -> r_re, latch r_rdata, dout = high half;
- *            second read -> dout = low half
+ *            second read -> dout = low half. If r_late is 1 at the first read
+ *            (DMEM_DATA: a registered read), r_rdata is latched and h_ack
+ *            toggles one cycle later (rpend).
  *   3 SYNC : reset the write/read nibble phase (resynchronise)
  *
  * The address does not auto-increment. FIFO and IMEM data registers are
@@ -41,6 +43,7 @@ module pe_host_if (
     output wire       r_we,
     output wire       r_re,
     input  wire [7:0] r_rdata,
+    input  wire       r_late,
     input  wire       irq
 );
 
@@ -67,6 +70,7 @@ module pe_host_if (
   reg       wphase;
   reg [3:0] rlow;
   reg       rphase;
+  reg       rpend;  // a late read: latch r_rdata and ack this cycle
 
   assign r_wdata = {wbuf, h_din};
   assign r_we    = ev & (h_op == OP_WRITE) & wphase;
@@ -83,10 +87,17 @@ module pe_host_if (
       wphase <= 1'b0;
       rlow   <= 4'd0;
       rphase <= 1'b0;
+      rpend  <= 1'b0;
     end else begin
       stb_q <= stb_s;
-      if (ev) begin
-        h_ack <= ~h_ack;
+      rpend <= 1'b0;
+      if (rpend) begin
+        h_ack  <= ~h_ack;
+        h_dout <= r_rdata[7:4];
+        rlow   <= r_rdata[3:0];
+        rphase <= 1'b1;
+      end else if (ev) begin
+        if (!(r_re && r_late)) h_ack <= ~h_ack;
         case (h_op)
           OP_ADDR: r_addr <= {r_addr[3:0], h_din};
           OP_WRITE: begin
@@ -95,12 +106,16 @@ module pe_host_if (
           end
           OP_READ: begin
             if (!rphase) begin
-              h_dout <= r_rdata[7:4];
-              rlow   <= r_rdata[3:0];
+              if (r_late) rpend <= 1'b1;
+              else begin
+                h_dout <= r_rdata[7:4];
+                rlow   <= r_rdata[3:0];
+                rphase <= 1'b1;
+              end
             end else begin
               h_dout <= rlow;
+              rphase <= 1'b0;
             end
-            rphase <= ~rphase;
           end
           OP_SYNC: begin
             wphase <= 1'b0;
@@ -118,7 +133,8 @@ module pe_host_if (
   // to toggle, keeping h_stb, h_op and h_din stable meanwhile.
   // * h_ack == stb_q: the chip acks every strobe edge exactly once, and
   //   never acks without an outstanding request.
-  // * Bounded response: once h_stb has been stable for 3 cycles, h_ack == h_stb.
+  // * Bounded response: once h_stb has been stable for 4 cycles, h_ack == h_stb
+  //   (3 for every op, 4 for a late read).
   // * r_we only on the 2nd write nibble, r_re only on the 1st read nibble,
   //   never both; r_addr changes only on an ADDR op, h_dout only on READ.
 `ifdef PE_HOST_IF_TOP
@@ -138,15 +154,16 @@ module pe_host_if (
       assume (h_stb == $past(h_stb) && h_op == $past(h_op) && h_din == $past(h_din));
   end
 
-  reg [1:0] f_stable;
+  reg [2:0] f_stable;
   always @(posedge clk) begin
-    if (rst || (f_pv && h_stb != $past(h_stb))) f_stable <= 2'd0;
-    else if (f_stable != 2'd3) f_stable <= f_stable + 1'b1;
+    if (rst || (f_pv && h_stb != $past(h_stb))) f_stable <= 3'd0;
+    else if (f_stable != 3'd4) f_stable <= f_stable + 1'b1;
   end
 
   always @(*) begin
     if (f_ok) begin
-      assert (h_ack == stb_q);
+      assert (h_ack == (stb_q ^ rpend));
+      if (rpend) assert (rphase == 1'b0 && h_op == OP_READ);
       assert (!(r_we && r_re));
       if (r_we) assert (ev && h_op == OP_WRITE && wphase);
       if (r_re) assert (ev && h_op == OP_READ && !rphase);
@@ -159,10 +176,11 @@ module pe_host_if (
 
   always @(posedge clk) begin
     if (f_past_ok && f_ok) begin
-      if (f_stable == 2'd3 && h_stb == $past(h_stb)) assert (h_ack == h_stb);
+      if (f_stable == 3'd4 && h_stb == $past(h_stb)) assert (h_ack == h_stb);
       if (h_ack != $past(h_ack)) assert ($past(h_stb != h_ack));
+      if (rpend) assert ($past(r_re && r_late));
       if (r_addr != $past(r_addr)) assert ($past(ev && h_op == OP_ADDR));
-      if (h_dout != $past(h_dout)) assert ($past(ev && h_op == OP_READ));
+      if (h_dout != $past(h_dout)) assert ($past((ev && h_op == OP_READ) || rpend));
     end
   end
 `endif

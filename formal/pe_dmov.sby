@@ -1,0 +1,23 @@
+# pe_dmov: the DMEM port arbitration (host > RXM > TXM > controller, one access a
+# cycle, never a read and a write together), the movers' FIFO handshakes (pop
+# only a non-empty RXF the host is not popping, push only into a TXF that is not
+# full and that the host is not writing), one TX byte in flight, and the RX count.
+[tasks]
+prf
+cvr
+
+[options]
+prf: mode prove
+prf: depth 6
+cvr: mode cover
+cvr: depth 20
+
+[engines]
+smtbmc yices
+
+[script]
+read -formal -DPE_DMOV_TOP pe_dmov.v
+prep -top pe_dmov
+
+[files]
+../src/mem/pe_dmov.v

@@ -23,6 +23,12 @@
  * Stall: `delay` n loads the stall counter with n, which counts down every
  * cycle; the next issue is at E + 1 + n.
  *
+ * `ld` takes 2 cycles, because pe_dmem has a registered read (an SRAM
+ * macro reads that way): in the first it sends the read (dm_re, when granted)
+ * and sets ld_ph; in the second it writes the byte from dm_rdata. The first
+ * cycle is not "blocked", but like a blocked cycle it keeps pc. ld_ph clears
+ * whenever the second cycle does not issue, so the read is sent again.
+ *
  * restart (host RESTART): pc <- start_pc, registers/flags/stack cleared.
  * IMEM is addressed with start_pc in the same cycle, so the first word is
  * ready the cycle after. DB is a host doorbell: set by db_set, cleared by
@@ -82,8 +88,18 @@ module pe_ctrl #(
     output wire [7:0] dm_addr,
     input  wire [7:0] dm_rdata,
     output reg        dm_we,
+    output reg        dm_re,
     output wire [7:0] dm_wdata,
     input  wire       dm_gnt,
+
+    // mailbox (pe_regs) and data movers (pe_dmov)
+    output wire [ 2:0] mb_idx,
+    input  wire [15:0] mb_rdata,
+    output reg         mb_we,
+    output wire [15:0] mb_wdata,
+    input  wire        mb_gnt,
+    input  wire        txm_busy,
+    input  wire        rxm_busy,
 
     // units and detectors
     output reg         cfg_we,
@@ -141,6 +157,7 @@ module pe_ctrl #(
   localparam [5:0] OP_FGET = 6'd23, OP_FPUT = 6'd24, OP_LD = 6'd25, OP_ST = 6'd26;
   localparam [5:0] OP_UCFG = 6'd27, OP_URD = 6'd28, OP_USTART = 6'd29, OP_USTOP = 6'd30;
   localparam [5:0] OP_UWAIT = 6'd31, OP_EVT = 6'd32, OP_HOST = 6'd33, OP_PAR = 6'd34;
+  localparam [5:0] OP_MBR = 6'd35, OP_MBW = 6'd36;
 
   // ---------------------------------------------------------------- state
   reg                run_q;  // RUN in the previous cycle: the word at pc is fetched
@@ -149,6 +166,7 @@ module pe_ctrl #(
   reg  [   AW-1:0]   stack    [0:STACK_DEPTH-1];
   reg  [   SP_W-1:0] sp;
   reg  [STALL_W-1:0] stall;
+  reg                ld_ph;  // `ld`: the read was sent last cycle, dm_rdata holds the byte
 
   wire               ready = run & run_q & (stall == {STALL_W{1'b0}});
 
@@ -227,6 +245,10 @@ module pe_ctrl #(
       5'd24: cond_ok = ~db;
       5'd25: cond_ok = rxrdy;
       5'd26: cond_ok = ~rxrdy;
+      5'd27: cond_ok = txm_busy;
+      5'd28: cond_ok = ~txm_busy;
+      5'd29: cond_ok = rxm_busy;
+      5'd30: cond_ok = ~rxm_busy;
       default: cond_ok = 1'b0;
     endcase
   end
@@ -250,6 +272,8 @@ module pe_ctrl #(
   assign f_wdata    = ra_v[7:0];
   assign dm_addr    = rb_v[7:0];
   assign dm_wdata   = ra_v[7:0];
+  assign mb_idx     = imm[2:0];
+  assign mb_wdata   = ra_v;
 
   wire       f_rx = fb[0];  // fifo select: 0 TX, 1 RX
   wire       nb = imm[0];
@@ -294,6 +318,8 @@ module pe_ctrl #(
     txf_wr     = 1'b0;
     rxf_wr     = 1'b0;
     dm_we      = 1'b0;
+    mb_we      = 1'b0;
+    dm_re      = 1'b0;
     cfg_we     = 1'b0;
     rd_strobe  = 1'b0;
     start_mask = 2'b00;
@@ -416,12 +442,20 @@ module pe_ctrl #(
           if (nb) c_n = 1'b0;
         end
       end
-      OP_LD, OP_ST: begin
+      OP_LD: begin
+        if (!ld_ph) begin
+          done  = 1'b0;  // the read goes out now; the byte is written next cycle
+          dm_re = dm_gnt;
+        end else begin
+          we_a = 1'b1;
+          wa_v = {8'd0, dm_rdata};
+          we_b = imm[0];
+        end
+      end
+      OP_ST: begin
         if (!dm_gnt) done = 1'b0;
         else begin
-          dm_we = (opcode == OP_ST);
-          we_a  = (opcode == OP_LD);
-          wa_v  = {8'd0, dm_rdata};
+          dm_we = 1'b1;
           we_b  = imm[0];
         end
       end
@@ -455,6 +489,14 @@ module pe_ctrl #(
         db_clr   = (fb == 3'd1);
       end
       OP_PAR: c_n = ^ra_v;
+      OP_MBR: begin
+        we_a = 1'b1;
+        wa_v = mb_rdata;
+      end
+      OP_MBW: begin
+        if (!mb_gnt) done = 1'b0;
+        else mb_we = 1'b1;
+      end
       default: ill_n = 1'b1;
     endcase
 
@@ -473,6 +515,7 @@ module pe_ctrl #(
       txf_wr     = 1'b0;
       rxf_wr     = 1'b0;
       dm_we      = 1'b0;
+      mb_we      = 1'b0;
       start_mask = 2'b00;
       det_clr    = 1'b0;
       we_b       = 1'b0;
@@ -486,6 +529,8 @@ module pe_ctrl #(
     // Gate every effect with the issue condition.
     if (!ready) begin
       pw_mask    = {NUM_PINS{1'b0}};
+      dm_re      = 1'b0;
+      mb_we      = 1'b0;
       po_mask    = {NUM_PINS{1'b0}};
       txf_rd     = 1'b0;
       rxf_rd     = 1'b0;
@@ -504,6 +549,8 @@ module pe_ctrl #(
     ill_err = ready & ill_n;
     stk_err = ready & stk_n;
   end
+
+  wire ld_go = dm_re;  // ld's read is sent this cycle (dm_re is already gated by ready)
 
   wire [AW-1:0] pc_inc = pc + 1'b1;
   wire [SP_W-1:0] sp_dec = sp - 1'b1;
@@ -525,8 +572,10 @@ module pe_ctrl #(
       sp      <= {SP_W{1'b0}};
       stall   <= {STALL_W{1'b0}};
       blocked <= 1'b0;
+      ld_ph   <= 1'b0;
       for (i = 0; i < 8; i = i + 1) r[i] <= 16'd0;
     end else begin
+      ld_ph <= ld_go & ~restart;
       run_q <= run;
       if (db_set) db <= 1'b1;
       else if (ready && db_clr) db <= 1'b0;
@@ -545,7 +594,7 @@ module pe_ctrl #(
         c       <= c_n;
         to      <= to_n;
         stall   <= stall_n;
-        blocked <= ~done;
+        blocked <= ~done & ~ld_go;
         if (we_b) r[wb_i] <= wb_v;
         if (we_a) r[wa_i] <= wa_v;  // rd wins over the post-increment of ra
         if (push) begin
@@ -575,7 +624,9 @@ module pe_ctrl #(
   // * No effect without an issue. Fetch: pc is always the previous cycle's
   //   im_raddr (so im_rdata = IMEM[pc]); no issue unless RUN was 1 before.
   // * A blocked instruction has no side effects, keeps pc and flags, loads no
-  //   stall; only wait / fget / fput / ld / st / ustart / uwait / evt can block.
+  //   stall; only wait / fget / fput / ld / st / ustart / uwait / evt / mbw can
+  //   block. ld's first cycle is not "done" either, but sends the DMEM read.
+  // * ld writes its register only in its second cycle, right after its read.
   // * FIFO, DMEM requests only when allowed (never pop empty, never lose an
   //   arbitration); ustart never starts a busy unit, or without a needed byte.
   // * Reserved opcodes: ill_err and nothing else. Stack: sp <= STACK_DEPTH;
@@ -597,11 +648,11 @@ module pe_ctrl #(
   reg  f_past_ok = 1'b0;
   always @(posedge clk) f_past_ok <= f_ok;
 
-  wire f_any_fx = (|pw_mask) | (|po_mask) | txf_rd | rxf_rd | txf_wr | rxf_wr | dm_we | cfg_we |
+  wire f_any_fx = (|pw_mask) | (|po_mask) | txf_rd | rxf_rd | txf_wr | rxf_wr | dm_we | dm_re | mb_we | cfg_we |
                   rd_strobe | (|start_mask) | (|stop_mask) | det_clr | det_arm | det_disarm | host_irq;
   wire f_can_block = (opcode == OP_WAIT) | (opcode == OP_FGET) | (opcode == OP_FPUT) |
                      (opcode == OP_LD) | (opcode == OP_ST) | (opcode == OP_USTART) |
-                     (opcode == OP_UWAIT) | (opcode == OP_EVT);
+                     (opcode == OP_UWAIT) | (opcode == OP_EVT) | (opcode == OP_MBW);
 
   always @(*) begin
     if (f_ok) begin
@@ -620,7 +671,9 @@ module pe_ctrl #(
       if (txf_wr) assert (!txf_full && txf_wr_gnt && opcode == OP_FPUT);
       if (rxf_wr) assert (!rxf_full && rxf_wr_gnt && opcode == OP_FPUT);
       if (dm_we) assert (dm_gnt && opcode == OP_ST);
-      if (ready && opcode == OP_LD && done) assert (dm_gnt);
+      if (ready && opcode == OP_LD && done) assert (ld_ph);
+      if (dm_re) assert (ready && dm_gnt && opcode == OP_LD && !ld_ph && !done);
+      if (mb_we) assert (ready && mb_gnt && opcode == OP_MBW && done);
       if (start_mask[0]) assert (!tx_busy && (!tx_need || start_imm || !txf_empty));
       if (start_mask[1]) assert (!rx_busy && (!rx_need || start_imm || !txf_empty));
       if (ready && illegal) begin
@@ -639,6 +692,10 @@ module pe_ctrl #(
       cover (ill_err);
 `endif
     end
+  end
+
+  always @(posedge clk) begin
+    if (f_past_ok && f_ok && ld_ph) assert ($past(dm_re) && !$past(restart));
   end
 
   // Register file: a solver-chosen register only changes on a write to it.
@@ -677,7 +734,7 @@ module pe_ctrl #(
       end else if ($past(ready)) begin
         assert (pc == $past(pc_n) && z == $past(z_n) && c == $past(c_n) && to == $past(to_n));
         assert (stall == $past(stall_n));
-        assert (blocked == !$past(done));
+        assert (blocked == (!$past(done) && !$past(dm_re)));  // ld's first cycle is not blocked
         if (!(($past(we_a) && $past(wa_i) == f_ri) || ($past(we_b) && $past(wb_i) == f_ri)))
           assert (r[f_ri] == f_rv);
         if ($past(we_a) && $past(wa_i) == f_ri) assert (r[f_ri] == $past(wa_v));

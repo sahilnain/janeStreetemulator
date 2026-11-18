@@ -129,7 +129,7 @@ async def test_uart_bad_parity(dut):
         assert await chip.read_rx(2) == [good1, good2], f"parity {parity}"
         assert await chip.bus.read(R.STATUS) & R.ST_RXF_EMPTY, "bad frame was kept"
         await chip.bus.write(R.RUN, 0)
-        assert (await chip.bus.dmem_read(1, 1))[0] == 1, "parity error not counted"
+        assert await chip.bus.mb_read(R.M_INFO) == 1, "parity error not counted"
 
 
 @cocotb.test()
@@ -181,9 +181,10 @@ async def test_uart_8bit_compat(dut):
 
 
 async def master_words(chip, words):
-    data = [len(words)]
+    data = []
     for w in words:
         data += [w & 0xFF, w >> 8]
+    await chip.bus.mb_write(R.M_NTX, len(words))
     await chip.bus.dmem_write(0, data)
     await chip.bus.write(R.DOORBELL, 0)
     for _ in range(4000):
@@ -261,7 +262,8 @@ async def test_tx_inv_spi(dut):
     await ClockCycles(dut.clk, 30)
     dev = spi.SpiSlave(SCK, MOSI, MISO, CS, tx=[0xA5])
     chip.devices.append(dev)
-    await chip.bus.dmem_write(0, [1, 0x3C])
+    await chip.bus.mb_write(R.M_NTX, 1)
+    await chip.bus.dmem_write(0, [0x3C])
     await chip.bus.write(R.DOORBELL, 0)
     for _ in range(2000):
         if await chip.bus.read(R.STATUS2) & R.S2_IRQ:
