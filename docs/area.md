@@ -36,6 +36,19 @@ The core is 902,417 µm². Fill cells cover the rest after routing; they are not
 | Fast, 1.32 V −40 °C | +10.21 ns | +0.10 ns |
 | Slow, 1.08 V 125 °C | **−1.15 ns**, 18 paths | +0.59 ns |
 
+**All six PDK corners** (OpenSTA by hand on the routed netlist and the extracted parasitics, with the SRAM's own library at each corner; slightly more pessimistic than the flow's own sign-off, which gives typical +6.73 ns where this gives +6.59):
+
+| Corner | Setup slack | Hold slack | Note |
+|---|---:|---:|---|
+| typical, 1.20 V, 25 °C | +6.59 ns | +0.29 ns | nominal supply |
+| fast, 1.32 V, −40 °C | +10.21 ns | +0.10 ns | |
+| slow, 1.08 V, 125 °C | **−1.69 ns** (23 endpoints) | +0.62 ns | with the SRAM's slow library; −1.15 with its typical one |
+| typical, 1.50 V, 25 °C | +10.02 ns | +0.11 ns | high-voltage library set (no SRAM library at 1.5 V: its 1.2 V one used) |
+| fast, 1.65 V, −40 °C | +12.15 ns | **+0.001 ns** | hold met with no margin |
+| slow, 1.35 V, 125 °C | +6.37 ns | +0.30 ns | |
+
+The SRAM's own paths have +10.9 ns of setup slack even at the slow corner. Until 2026-11-18 the config gave the SRAM its typical library at every corner (its keys matched the parasitics corner, `nom_*`, which all three flow corners share); it now maps `*_fast_*`, `*_slow_*` and `*_typ_*` to the matching library.
+
 All 18 slow-corner paths are the one-cycle fetch: they start at `pin_filt[4]` and end at `im_rdata`. The pin input (filtered or not) decides whether a `jpin`, `wait` or conditional jump is taken, that picks the next pc, and the next pc selects one of 162 IMEM words through the 29-bit read multiplexer, all in one cycle; about half the delay is the decision, half the IMEM read. At the slow corner the chip would run at about 46 MHz. The fixes all change the fetch pipeline (`docs/problem_log.md`, Section 7), so this is accepted for now. The SRAM macro has a typical-corner timing library only, which the flow uses at every corner, so its paths at the slow corner are optimistic.
 
 **Flow settings** added in v3 (`src/config.json`):

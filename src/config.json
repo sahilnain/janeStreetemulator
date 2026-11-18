@@ -25,11 +25,10 @@
       "gds": ["dir::../macro/RM_IHPSG13_1P_256x8_c3_bm_bist/RM_IHPSG13_1P_256x8_c3_bm_bist.gds"],
       "lef": ["dir::../macro/RM_IHPSG13_1P_256x8_c3_bm_bist/RM_IHPSG13_1P_256x8_c3_bm_bist.lef"],
       "lib": {
-        "nom_*": ["dir::../macro/RM_IHPSG13_1P_256x8_c3_bm_bist/RM_IHPSG13_1P_256x8_c3_bm_bist_typ_1p20V_25C.lib"],
-        "min_*": ["dir::../macro/RM_IHPSG13_1P_256x8_c3_bm_bist/RM_IHPSG13_1P_256x8_c3_bm_bist_fast_1p32V_m55C.lib"],
-        "max_*": ["dir::../macro/RM_IHPSG13_1P_256x8_c3_bm_bist/RM_IHPSG13_1P_256x8_c3_bm_bist_slow_1p08V_125C.lib"],
-        "*": ["dir::../macro/RM_IHPSG13_1P_256x8_c3_bm_bist/RM_IHPSG13_1P_256x8_c3_bm_bist_typ_1p20V_25C.lib"]
-      },
+          "*_fast_*": ["dir::../macro/RM_IHPSG13_1P_256x8_c3_bm_bist/RM_IHPSG13_1P_256x8_c3_bm_bist_fast_1p32V_m55C.lib"],
+          "*_slow_*": ["dir::../macro/RM_IHPSG13_1P_256x8_c3_bm_bist/RM_IHPSG13_1P_256x8_c3_bm_bist_slow_1p08V_125C.lib"],
+          "*_typ_*": ["dir::../macro/RM_IHPSG13_1P_256x8_c3_bm_bist/RM_IHPSG13_1P_256x8_c3_bm_bist_typ_1p20V_25C.lib"]
+        },
       "nl": ["dir::mem/RM_IHPSG13_1P_256x8_c3_bm_bist.v"],
       "spice": ["dir::../macro/RM_IHPSG13_1P_256x8_c3_bm_bist/RM_IHPSG13_1P_256x8_c3_bm_bist.cdl"]
     }
